@@ -1,0 +1,13 @@
+{
+  "name": "wechat-codex-multi-channel",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "start": "python3 -m wechat_codex_multi start",
+    "setup": "python3 -m wechat_codex_multi add-account",
+    "status": "python3 -m wechat_codex_multi status"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  }
+}

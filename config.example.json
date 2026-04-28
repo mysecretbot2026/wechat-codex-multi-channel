@@ -1,0 +1,65 @@
+{
+  "stateDir": "~/.wechat-codex-multi",
+  "defaultAgent": "codex",
+  "wechat": {
+    "baseUrl": "https://ilinkai.weixin.qq.com",
+    "botType": "3",
+    "routeTag": null
+  },
+  "codex": {
+    "bin": "codex",
+    "workingDirectory": ".",
+    "model": "",
+    "reasoningEffort": "",
+    "modelOptions": [],
+    "timeoutMs": 7200000,
+    "bypassApprovalsAndSandbox": true,
+    "defaultAccount": "main",
+    "accounts": [
+      {
+        "name": "main",
+        "codexHome": "~/.codex"
+      },
+      {
+        "name": "backup",
+        "codexHome": "~/.codex-accounts/backup"
+      },
+      {
+        "name": "work",
+        "codexHome": "~/.codex-accounts/work"
+      }
+    ],
+    "extraPrompt": ""
+  },
+  "concurrency": {
+    "maxWorkers": 4,
+    "commandWorkers": 2,
+    "perConversationSerial": true
+  },
+  "state": {
+    "saveDebounceMs": 1000
+  },
+  "media": {
+    "enabled": true,
+    "maxFileBytes": 52428800,
+    "maxConcurrentTransfers": 1,
+    "generators": [
+      {
+        "name": "image",
+        "kind": "image",
+        "command": "",
+        "description": "Optional command. Receives prompt on stdin and must print an output file path."
+      },
+      {
+        "name": "video",
+        "kind": "video",
+        "command": "",
+        "description": "Optional command. Receives prompt on stdin and must print an output file path."
+      }
+    ]
+  },
+  "allowedUsers": [],
+  "adminUsers": [],
+  "textChunkLimit": 4000,
+  "logLevel": "INFO"
+}
