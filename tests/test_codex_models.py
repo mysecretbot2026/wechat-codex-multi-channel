@@ -20,15 +20,21 @@ class CodexModelTests(unittest.TestCase):
             "gpt-5.5:high (GPT-5.5)",
         )
 
-    def test_default_model_options_match_supported_matrix(self):
+    def test_model_options_discovers_models_when_not_configured(self):
         with patch("wechat_codex_multi.codex_models.discover_model_options") as discover:
-            options = model_options({"codex": {"modelOptions": []}})
+            discover.return_value = [{"model": "gpt-live", "reasoningEffort": "medium"}]
+            options = model_options({"codex": {"bin": "codex-dev", "modelOptions": []}})
+
+        discover.assert_called_once_with("codex-dev")
+        self.assertEqual(options, [{"model": "gpt-live", "reasoningEffort": "medium"}])
+
+    def test_configured_model_options_skip_discovery(self):
+        configured = [{"model": "gpt-fixed", "reasoningEffort": "high"}]
+        with patch("wechat_codex_multi.codex_models.discover_model_options") as discover:
+            options = model_options({"codex": {"modelOptions": configured}})
 
         discover.assert_not_called()
-        self.assertEqual(len(options), 24)
-        self.assertEqual(format_model_option(options[0]), "gpt-5.5:low")
-        self.assertEqual(format_model_option(options[3]), "gpt-5.5:xhigh")
-        self.assertEqual(format_model_option(options[-1]), "codex-auto-review:xhigh")
+        self.assertEqual(options, configured)
 
 
 if __name__ == "__main__":

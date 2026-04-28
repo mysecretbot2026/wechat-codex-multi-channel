@@ -114,7 +114,8 @@ def model_options(config):
     configured = configured_model_options(config)
     if configured:
         return configured
-    return default_model_options()
+    codex = config.get("codex") or {}
+    return discover_model_options(codex.get("bin") or "codex")
 
 
 def find_model_option(options, selector):

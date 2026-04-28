@@ -1,4 +1,5 @@
 import concurrent.futures
+import os
 import threading
 import time
 
@@ -180,7 +181,18 @@ class MultiWechatCodexService:
     def _can_run_without_conversation_lock(text):
         command = text.strip()
         first = command.split()[0] if command else ""
-        return first in {"/help", "/accounts", "/status", "/usage", "/codex-accounts", "/codex", "/model", "/models", "/cwd"}
+        return first in {
+            "/help",
+            "/accounts",
+            "/status",
+            "/usage",
+            "/codex-accounts",
+            "/codex",
+            "/model",
+            "/models",
+            "/cwd",
+            "/restart",
+        }
 
     def _handle_message(self, account, user_id, conversation_key, text):
         command = text.strip()
@@ -264,6 +276,13 @@ class MultiWechatCodexService:
             self.state.upsert_account(new_account)
             self._start_account_monitor(new_account)
             self._send_text(account, user_id, f"新增账号已连接: {new_account['accountId']}")
+            return
+        if command == "/restart":
+            if not self._is_admin(user_id):
+                self._send_text(account, user_id, "只有 adminUsers 可以通过微信触发 /restart。")
+                return
+            self._send_text(account, user_id, "正在重启服务，稍后可发送 /status 确认。")
+            self._schedule_restart()
             return
         if command == "/reset":
             self.state.reset_session(conversation_key)
@@ -358,9 +377,9 @@ class MultiWechatCodexService:
         )
 
     def _available_model_options(self):
-        if self._model_options is None:
-            self._model_options = model_options(self.config)
-        return self._model_options
+        if self._model_options is not None:
+            return self._model_options
+        return model_options(self.config)
 
     @staticmethod
     def _format_model_options_for_wechat(options):
@@ -377,7 +396,11 @@ class MultiWechatCodexService:
         return "\n".join(lines)
 
     def _handle_model_switch(self, account, user_id, conversation_key, selector, list_only=False):
-        options = self._available_model_options()
+        try:
+            options = self._available_model_options()
+        except Exception as exc:
+            self._send_text(account, user_id, f"无法获取模型列表：{exc}")
+            return
         session = self._get_session(conversation_key)
         current = resolve_session_model(self.config, session)
         if not options:
@@ -467,6 +490,17 @@ class MultiWechatCodexService:
         for chunk in split_text(text, int(self.config.get("textChunkLimit") or 4000)):
             client.send_text(user_id, context_token, chunk)
 
+    def _schedule_restart(self):
+        def restart():
+            time.sleep(1)
+            log.info("restart requested; exiting for supervisor restart")
+            try:
+                self.stop()
+            finally:
+                os._exit(0)
+
+        threading.Thread(target=restart, daemon=True).start()
+
     def _is_allowed(self, user_id):
         allowed = set(self.config.get("allowedUsers") or [])
         return not allowed or user_id in allowed
@@ -489,6 +523,7 @@ class MultiWechatCodexService:
                 "/cwd <path> 切换当前会话工作目录",
                 "/accounts 查看已连接 Bot 账号",
                 "/login 新增 Bot 账号（adminUsers only）",
+                "/restart 重启后台服务（adminUsers only）",
                 "/help 查看帮助",
                 "",
                 f"当前 bot accountId: {account_id}",

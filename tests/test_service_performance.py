@@ -127,6 +127,58 @@ class ServicePerformanceTests(unittest.TestCase):
                 "可切换模型（发送 /model 编号 切换）：\ngpt-5.5\n1. gpt-5.5:low\n2. gpt-5.5:medium",
             )
 
+    def test_model_options_are_loaded_for_each_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            with patch("wechat_codex_multi.service.model_options") as options:
+                options.side_effect = [
+                    [{"model": "gpt-live-a", "reasoningEffort": "low"}],
+                    [{"model": "gpt-live-b", "reasoningEffort": "high"}],
+                ]
+
+                service._handle_model_switch(account, "user-1", conversation_key, "", list_only=True)
+                service._handle_model_switch(account, "user-1", conversation_key, "", list_only=True)
+
+            self.assertEqual(options.call_count, 2)
+            self.assertIn("gpt-live-a:low", sent[0])
+            self.assertIn("gpt-live-b:high", sent[1])
+
+    def test_restart_requires_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._schedule_restart = lambda: sent.append("scheduled")
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/restart")
+
+            self.assertEqual(sent, ["只有 adminUsers 可以通过微信触发 /restart。"])
+
+    def test_restart_schedules_restart_for_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            config["adminUsers"] = ["user-1"]
+            service = MultiWechatCodexService(config)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._schedule_restart = lambda: sent.append("scheduled")
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/restart")
+
+            self.assertEqual(sent, ["正在重启服务，稍后可发送 /status 确认。", "scheduled"])
+
+    def test_restart_can_run_without_conversation_lock(self):
+        self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/restart"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -151,7 +151,7 @@ cp config.example.json config.json
 - `codex.workingDirectory`：默认工作目录，微信中可用 `/cwd <path>` 覆盖当前会话。
 - `codex.model`：默认模型，非空时传给 `codex -m`。
 - `codex.reasoningEffort`：默认 reasoning level，非空时传 `-c model_reasoning_effort="<level>"`。
-- `codex.modelOptions`：固定 `/models` 展示的模型选项；为空时使用内置默认模型列表。
+- `codex.modelOptions`：固定 `/models` 展示的模型选项；为空时每次通过 `codex debug models` 实时查询 Codex CLI 可用模型。
 - `codex.timeoutMs`：单次 Codex 执行超时，默认 2 小时。
 - `codex.bypassApprovalsAndSandbox`：为 true 时传 `--dangerously-bypass-approvals-and-sandbox`。
 - `codex.defaultAccount`：默认 Codex 账号名。
@@ -188,6 +188,7 @@ cp config.example.json config.json
 | `/cwd <path>` | 修改当前会话工作目录 |
 | `/reset` | 重置当前会话；如果 Codex 正在运行，会先取消进程 |
 | `/login` | 新增微信 Bot 账号，仅 `adminUsers` 可用 |
+| `/restart` | 重启后台服务，仅 `adminUsers` 可用 |
 
 常见用法：
 
@@ -532,7 +533,7 @@ accountId:userId
 
 同一个微信用户在不同 Bot 账号里聊天，会进入不同 Codex thread。
 
-当同一个 conversation 有任务正在运行时，新的普通消息会立即收到“上一条消息还在处理中”的提示，不会继续排队卡住。`/status`、`/usage`、`/codex-accounts`、`/codex`、`/model`、`/models`、`/accounts`、`/help`、`/cwd` 可在任务运行中直接响应；`/reset` 可取消当前运行中的 Codex 并重置会话。
+当同一个 conversation 有任务正在运行时，新的普通消息会立即收到“上一条消息还在处理中”的提示，不会继续排队卡住。`/status`、`/usage`、`/codex-accounts`、`/codex`、`/model`、`/models`、`/accounts`、`/help`、`/cwd`、`/restart` 可在任务运行中直接响应；`/reset` 可取消当前运行中的 Codex 并重置会话。
 
 超时、服务停止或 `/reset` 取消时，服务会清理 Codex 进程组，避免残留进程继续占用会话。
 
@@ -540,7 +541,7 @@ accountId:userId
 
 ### `/models` 显示哪些模型？
 
-如果 `config.json` 没有配置 `codex.modelOptions`，服务使用内置默认列表。需要固定可选范围时，配置 `codex.modelOptions`。
+如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。需要固定可选范围时，配置 `codex.modelOptions`；配置后不会再实时查询。
 
 ### `/model 1` 切换后为什么要重置 thread？
 
@@ -556,7 +557,13 @@ python3 -m wechat_codex_multi add-account
 
 ### 修改代码后如何让后台服务生效？
 
-如果使用 `launchd` 且配置了 `KeepAlive=true`，可以终止当前服务进程，让它自动重启；也可以执行：
+如果使用 `launchd` 且配置了 `KeepAlive=true`，管理员可以在微信里发送：
+
+```text
+/restart
+```
+
+服务会先回复确认消息，然后退出当前进程，由 `launchd` 自动拉起新版本。也可以在机器上执行：
 
 ```bash
 launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
