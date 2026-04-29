@@ -30,6 +30,20 @@ class StateStoreTests(unittest.TestCase):
             data = json.loads(state.file.read_text(encoding="utf-8"))
             self.assertEqual(data["contextTokens"]["acct-1:user-1"], "token-1")
 
+    def test_workspace_state_is_scoped_to_base_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(tmp, save_debounce_ms=0)
+            base = state.conversation_key("acct-1", "user-1")
+
+            state.upsert_workspace(base, "a", "/tmp/project-a")
+            state.upsert_workspace(base, "b", "/tmp/project-b")
+            state.set_active_workspace(base, "b")
+
+            self.assertEqual(state.get_active_workspace(base), "b")
+            self.assertEqual(state.workspace_conversation_key(base, "a"), "acct-1:user-1:a")
+            self.assertEqual([item["name"] for item in state.list_workspaces(base)], ["a", "b"])
+            self.assertEqual(state.get_workspace(base, "a")["cwd"], "/tmp/project-a")
+
 
 if __name__ == "__main__":
     unittest.main()

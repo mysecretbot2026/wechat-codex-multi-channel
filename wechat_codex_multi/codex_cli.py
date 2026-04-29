@@ -182,6 +182,11 @@ class CodexCliRunner:
             if self.process_by_conversation.get(conversation_key) is process:
                 self.process_by_conversation.pop(conversation_key, None)
 
+    def is_running(self, conversation_key):
+        with self.processes_lock:
+            process = self.process_by_conversation.get(conversation_key)
+        return bool(process and process.poll() is None)
+
     def cancel(self, conversation_key):
         with self.processes_lock:
             process = self.process_by_conversation.get(conversation_key)

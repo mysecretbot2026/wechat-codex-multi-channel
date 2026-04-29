@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from wechat_codex_multi.service import MultiWechatCodexService
@@ -87,6 +88,46 @@ class ServicePerformanceTests(unittest.TestCase):
 
             self.assertEqual(len(service.executor.submissions), 0)
             self.assertEqual(len(service.command_executor.submissions), 1)
+
+    def test_workspace_run_uses_codex_worker_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(test_config(tmp))
+            service.executor = CapturingExecutor()
+            service.command_executor = CapturingExecutor()
+            account = {"accountId": "acct-1"}
+            msg = {
+                "message_type": MESSAGE_TYPE_USER,
+                "from_user_id": "user-1",
+                "context_token": "token-1",
+                "item_list": [{"type": ITEM_TEXT, "text_item": {"text": "/ws run a hello"}}],
+            }
+
+            service._submit_message(account, msg)
+
+            self.assertEqual(len(service.executor.submissions), 1)
+            self.assertEqual(len(service.command_executor.submissions), 0)
+
+    def test_workspace_commands_add_use_list_and_run_by_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_a = Path(tmp) / "project-a"
+            project_a.mkdir()
+            service = MultiWechatCodexService(test_config(tmp))
+            sent = []
+            calls = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._run_codex_and_reply = lambda account, user_id, key, text: calls.append((key, text))
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", base, f"/ws add a {project_a}")
+            service._handle_message(account, "user-1", base, "/ws use a")
+            service._handle_message(account, "user-1", base, "/ws")
+            service._handle_message(account, "user-1", base, "/ws run a fix readme")
+
+            self.assertEqual(service.state.get_active_workspace(base), "a")
+            self.assertIn("a [idle]", sent[-1])
+            self.assertIn(str(project_a), sent[-1])
+            self.assertEqual(calls, [("acct-1:user-1:a", "fix readme")])
 
     def test_model_switch_updates_session_and_resets_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,6 +219,10 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_restart_can_run_without_conversation_lock(self):
         self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/restart"))
+
+    def test_workspace_run_needs_conversation_lock(self):
+        self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/ws"))
+        self.assertFalse(MultiWechatCodexService._can_run_without_conversation_lock("/ws run a hello"))
 
 
 if __name__ == "__main__":

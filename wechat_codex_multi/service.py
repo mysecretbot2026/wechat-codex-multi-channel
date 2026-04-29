@@ -1,7 +1,9 @@
 import concurrent.futures
 import os
+import re
 import threading
 import time
+from pathlib import Path
 
 from . import logging as log
 from .actions import execute_actions, extract_actions
@@ -24,6 +26,8 @@ from .wechat import MESSAGE_TYPE_USER, TYPING_STATUS_CANCEL, TYPING_STATUS_TYPIN
 
 
 class MultiWechatCodexService:
+    WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
     def __init__(self, config):
         self.config = config
         self.state = StateStore(
@@ -119,12 +123,12 @@ class MultiWechatCodexService:
         if not self._is_allowed(user_id):
             log.warn(f"user not allowed: {user_id}")
             return
-        conversation_key = self.state.conversation_key(account_id, user_id)
-        log.info(f"inbound accountId={account_id} user={user_id} conversation={conversation_key} len={len(text)}")
-        if self._is_command(text):
-            self.command_executor.submit(self._handle_message_safe, account, user_id, conversation_key, text, None)
+        base_conversation_key = self.state.conversation_key(account_id, user_id)
+        log.info(f"inbound accountId={account_id} user={user_id} conversation={base_conversation_key} len={len(text)}")
+        if self._is_command(text) and not self._is_workspace_run_command(text):
+            self.command_executor.submit(self._handle_message_safe, account, user_id, base_conversation_key, text, None)
         else:
-            self.executor.submit(self._handle_message_safe, account, user_id, conversation_key, text, msg)
+            self.executor.submit(self._handle_message_safe, account, user_id, base_conversation_key, text, msg)
 
     def _conversation_lock(self, key):
         with self.conversation_locks_guard:
@@ -132,17 +136,18 @@ class MultiWechatCodexService:
                 self.conversation_locks[key] = threading.Lock()
             return self.conversation_locks[key]
 
-    def _handle_message_safe(self, account, user_id, conversation_key, text, msg=None):
+    def _handle_message_safe(self, account, user_id, base_conversation_key, text, msg=None):
         try:
+            conversation_key = self._conversation_key_for_text(base_conversation_key, text)
             if self._can_run_without_conversation_lock(text):
-                self._handle_message(account, user_id, conversation_key, text)
+                self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
                 return
             if self.config.get("concurrency", {}).get("perConversationSerial", True):
                 lock = self._conversation_lock(conversation_key)
                 if not lock.acquire(blocking=False):
                     if text.strip() == "/reset":
                         killed = self.codex.cancel(conversation_key)
-                        message = "已取消正在运行的 Codex 并重置当前会话。" if killed else "已重置当前会话。"
+                        message = "已取消正在运行的 Codex 并重置当前工作区。" if killed else "已重置当前工作区。"
                         self._send_text(account, user_id, message)
                         return
                     self._send_text(account, user_id, "上一条消息还在处理中，请稍后再试。需要放弃当前 Codex 会话时可发送 /reset。")
@@ -152,7 +157,7 @@ class MultiWechatCodexService:
                         text = self._extract_message_text(account, user_id, msg)
                         if not text:
                             return
-                    self._handle_message(account, user_id, conversation_key, text)
+                    self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
                 finally:
                     lock.release()
             else:
@@ -160,11 +165,11 @@ class MultiWechatCodexService:
                     text = self._extract_message_text(account, user_id, msg)
                     if not text:
                         return
-                self._handle_message(account, user_id, conversation_key, text)
+                self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
         except CodexCancelled:
-            log.info(f"handler cancelled conversation={conversation_key}")
+            log.info(f"handler cancelled conversation={base_conversation_key}")
         except Exception as err:
-            log.error(f"handler error conversation={conversation_key}: {err}")
+            log.error(f"handler error conversation={base_conversation_key}: {err}")
             self._send_text(account, user_id, f"执行失败：{err}")
 
     def _extract_message_text(self, account, user_id, msg):
@@ -178,9 +183,30 @@ class MultiWechatCodexService:
         return command.startswith("/")
 
     @staticmethod
+    def _workspace_run_parts(text):
+        parts = text.strip().split(maxsplit=3)
+        if len(parts) >= 2 and parts[0] == "/ws" and parts[1].lower() == "run":
+            return parts
+        return []
+
+    @classmethod
+    def _is_workspace_run_command(cls, text):
+        return bool(cls._workspace_run_parts(text))
+
+    def _conversation_key_for_text(self, base_conversation_key, text):
+        parts = self._workspace_run_parts(text)
+        if len(parts) >= 3:
+            return self.state.workspace_conversation_key(base_conversation_key, parts[2])
+        active = self.state.get_active_workspace(base_conversation_key)
+        return self.state.workspace_conversation_key(base_conversation_key, active)
+
+    @staticmethod
     def _can_run_without_conversation_lock(text):
         command = text.strip()
         first = command.split()[0] if command else ""
+        if first == "/ws":
+            parts = command.split(maxsplit=2)
+            return len(parts) < 2 or parts[1].lower() != "run"
         return first in {
             "/help",
             "/accounts",
@@ -194,7 +220,8 @@ class MultiWechatCodexService:
             "/restart",
         }
 
-    def _handle_message(self, account, user_id, conversation_key, text):
+    def _handle_message(self, account, user_id, base_conversation_key, text, conversation_key=None):
+        conversation_key = conversation_key or base_conversation_key
         command = text.strip()
         if command == "/help":
             self._send_text(account, user_id, self._help_text(account["accountId"]))
@@ -206,10 +233,14 @@ class MultiWechatCodexService:
                 "已连接账号：\n" + "\n".join(a["accountId"] for a in self.state.list_accounts()),
             )
             return
+        if command == "/ws" or command.startswith("/ws "):
+            self._handle_workspace_command(account, user_id, base_conversation_key, conversation_key, command)
+            return
         if command == "/status":
             session = self._get_session(conversation_key)
             codex_account = resolve_session_codex_account(self.config, session)
             model_selection = resolve_session_model(self.config, session)
+            workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
             self._send_text(
                 account,
                 user_id,
@@ -217,6 +248,7 @@ class MultiWechatCodexService:
                     [
                         f"accountId: {account['accountId']}",
                         f"conversation: {conversation_key}",
+                        f"workspace: {workspace_name}",
                         f"cwd: {session.get('cwd')}",
                         f"codexAccount: {codex_account.get('name')}",
                         f"codexHome: {codex_account.get('codexHome')}",
@@ -286,7 +318,7 @@ class MultiWechatCodexService:
             return
         if command == "/reset":
             self.state.reset_session(conversation_key)
-            self._send_text(account, user_id, "已重置当前会话。")
+            self._send_text(account, user_id, "已重置当前工作区会话。")
             return
         if command.startswith("/cwd"):
             arg = command[4:].strip()
@@ -294,10 +326,22 @@ class MultiWechatCodexService:
             if not arg:
                 self._send_text(account, user_id, f"当前 CWD: {session.get('cwd')}")
             else:
-                self.state.update_session(conversation_key, cwd=arg)
-                self._send_text(account, user_id, f"已切换 CWD: {arg}")
+                cwd, error = self._resolve_cwd(arg, session.get("cwd"))
+                if error:
+                    self._send_text(account, user_id, error)
+                    return
+                workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
+                if workspace_name != self.state.DEFAULT_WORKSPACE:
+                    self.state.upsert_workspace(base_conversation_key, workspace_name, cwd)
+                self.state.update_session(conversation_key, cwd=cwd, codexThreadId="")
+                self._send_text(account, user_id, f"已切换 CWD: {cwd}\n已重置当前 Codex thread。")
             return
 
+        workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
+        self.state.touch_workspace(base_conversation_key, workspace_name)
+        self._run_codex_and_reply(account, user_id, conversation_key, text)
+
+    def _run_codex_and_reply(self, account, user_id, conversation_key, text):
         stop_typing = self._start_typing_loop(account, user_id)
         try:
             result = self.codex.run(conversation_key, text)
@@ -321,6 +365,182 @@ class MultiWechatCodexService:
                 transfer_semaphore=self.media_semaphore,
             )
             log.info(f"sent media conversation={conversation_key} count={len(sent)}")
+
+    def _workspace_name_from_key(self, base_conversation_key, conversation_key):
+        if conversation_key == base_conversation_key:
+            return self.state.DEFAULT_WORKSPACE
+        prefix = f"{base_conversation_key}:"
+        if conversation_key.startswith(prefix):
+            return conversation_key[len(prefix):] or self.state.DEFAULT_WORKSPACE
+        return self.state.DEFAULT_WORKSPACE
+
+    def _validate_workspace_name(self, name, allow_default=False):
+        value = str(name or "").strip()
+        if allow_default and value == self.state.DEFAULT_WORKSPACE:
+            return ""
+        if value == self.state.DEFAULT_WORKSPACE:
+            return "default 是保留工作区名，不能用 /ws add 创建。"
+        if not self.WORKSPACE_NAME_RE.match(value):
+            return "工作区名称只能包含字母、数字、点、下划线和中划线，长度 1-64，且必须以字母或数字开头。"
+        return ""
+
+    def _resolve_cwd(self, value, base_cwd=None):
+        raw = str(value or "").strip()
+        if not raw:
+            return "", "目录不能为空。"
+        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not path.is_absolute():
+            path = Path(base_cwd or self.config["codex"]["workingDirectory"]) / path
+        resolved = path.resolve()
+        if not resolved.exists():
+            return "", f"目录不存在: {resolved}"
+        if not resolved.is_dir():
+            return "", f"不是目录: {resolved}"
+        return str(resolved), ""
+
+    def _workspace_key(self, base_conversation_key, workspace_name):
+        return self.state.workspace_conversation_key(base_conversation_key, workspace_name)
+
+    def _format_workspace_list(self, base_conversation_key):
+        active = self.state.get_active_workspace(base_conversation_key)
+        lines = ["工作区：", f"当前: {active}", ""]
+        entries = [
+            {
+                "name": self.state.DEFAULT_WORKSPACE,
+                "cwd": self._get_session(base_conversation_key).get("cwd"),
+            }
+        ]
+        entries.extend(self.state.list_workspaces(base_conversation_key))
+        for item in entries:
+            name = item.get("name") or self.state.DEFAULT_WORKSPACE
+            key = self._workspace_key(base_conversation_key, name)
+            session = self._get_session(key)
+            cwd = session.get("cwd") or item.get("cwd") or self.config["codex"]["workingDirectory"]
+            marker = "*" if name == active else "-"
+            status = "running" if self.codex.is_running(key) else "idle"
+            thread_id = (session.get("codexThreadId") or "")[:12] or "-"
+            lines.append(f"{marker} {name} [{status}]")
+            lines.append(f"  cwd: {cwd}")
+            lines.append(f"  thread: {thread_id}")
+        if len(entries) == 1:
+            lines.extend(["", "还没有添加项目工作区。"])
+        lines.extend(
+            [
+                "",
+                "用法：",
+                "/ws add <名称> <路径>",
+                "/ws use <名称>",
+                "/ws run <名称> <任务>",
+                "/ws reset <名称>",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _workspace_help_text(self):
+        return "\n".join(
+            [
+                "工作区命令：",
+                "/ws 或 /ws list 查看当前微信用户的项目工作区",
+                "/ws add <名称> <路径> 添加项目工作区",
+                "/ws use <名称> 切换当前工作区",
+                "/ws run <名称> <任务> 在指定工作区派发任务",
+                "/ws reset <名称> 取消运行中的任务并重置该工作区 thread",
+                "名称示例：a、project-a、work_1",
+            ]
+        )
+
+    def _handle_workspace_command(self, account, user_id, base_conversation_key, conversation_key, command):
+        parts = command.split(maxsplit=3)
+        action = parts[1].lower() if len(parts) >= 2 else "list"
+        if action in {"list", "ls"}:
+            self._send_text(account, user_id, self._format_workspace_list(base_conversation_key))
+            return
+        if action in {"help", "-h", "--help"}:
+            self._send_text(account, user_id, self._workspace_help_text())
+            return
+        if action == "add":
+            if len(parts) < 4:
+                self._send_text(account, user_id, "用法：/ws add <名称> <路径>")
+                return
+            name = parts[2].strip()
+            error = self._validate_workspace_name(name)
+            if error:
+                self._send_text(account, user_id, error)
+                return
+            cwd, error = self._resolve_cwd(parts[3], self.config["codex"]["workingDirectory"])
+            if error:
+                self._send_text(account, user_id, error)
+                return
+            self.state.upsert_workspace(base_conversation_key, name, cwd)
+            workspace_key = self._workspace_key(base_conversation_key, name)
+            self.state.update_session(workspace_key, cwd=cwd, codexThreadId="")
+            self._send_text(
+                account,
+                user_id,
+                f"已添加工作区: {name}\nCWD: {cwd}\n发送 /ws use {name} 切换，或 /ws run {name} <任务> 直接派活。",
+            )
+            return
+        if action == "use":
+            if len(parts) < 3:
+                self._send_text(account, user_id, "用法：/ws use <名称>")
+                return
+            name = parts[2].strip()
+            error = self._validate_workspace_name(name, allow_default=True)
+            if error:
+                self._send_text(account, user_id, error)
+                return
+            item = self.state.get_workspace(base_conversation_key, name)
+            if name != self.state.DEFAULT_WORKSPACE and not item:
+                self._send_text(account, user_id, f"未知工作区: {name}\n发送 /ws 查看已添加工作区。")
+                return
+            self.state.set_active_workspace(base_conversation_key, name)
+            if item and item.get("cwd"):
+                self.state.update_session(self._workspace_key(base_conversation_key, name), cwd=item["cwd"])
+            cwd = self._get_session(self._workspace_key(base_conversation_key, name)).get("cwd")
+            self._send_text(account, user_id, f"已切换当前工作区: {name}\nCWD: {cwd}")
+            return
+        if action == "run":
+            if len(parts) < 4:
+                self._send_text(account, user_id, "用法：/ws run <名称> <任务>")
+                return
+            name = parts[2].strip()
+            prompt = parts[3].strip()
+            error = self._validate_workspace_name(name, allow_default=True)
+            if error:
+                self._send_text(account, user_id, error)
+                return
+            if not prompt:
+                self._send_text(account, user_id, "任务内容不能为空。")
+                return
+            item = self.state.get_workspace(base_conversation_key, name)
+            if name != self.state.DEFAULT_WORKSPACE and not item:
+                self._send_text(account, user_id, f"未知工作区: {name}\n请先发送 /ws add {name} <路径>。")
+                return
+            workspace_key = self._workspace_key(base_conversation_key, name)
+            if item and item.get("cwd"):
+                self.state.update_session(workspace_key, cwd=item["cwd"])
+            self.state.touch_workspace(base_conversation_key, name)
+            self._run_codex_and_reply(account, user_id, workspace_key, prompt)
+            return
+        if action in {"reset", "cancel"}:
+            if len(parts) < 3:
+                self._send_text(account, user_id, "用法：/ws reset <名称>")
+                return
+            name = parts[2].strip()
+            error = self._validate_workspace_name(name, allow_default=True)
+            if error:
+                self._send_text(account, user_id, error)
+                return
+            item = self.state.get_workspace(base_conversation_key, name)
+            if name != self.state.DEFAULT_WORKSPACE and not item:
+                self._send_text(account, user_id, f"未知工作区: {name}")
+                return
+            workspace_key = self._workspace_key(base_conversation_key, name)
+            killed = self.codex.cancel(workspace_key)
+            message = "已取消正在运行的 Codex 并重置该工作区。" if killed else "已重置该工作区。"
+            self._send_text(account, user_id, message)
+            return
+        self._send_text(account, user_id, self._workspace_help_text())
 
     def _typing_ticket(self, account, user_id, context_token):
         if not context_token:
@@ -514,13 +734,16 @@ class MultiWechatCodexService:
         return "\n".join(
             [
                 "命令：",
-                "/status 查看当前会话状态",
-                "/reset 重置当前 Codex 会话",
+                "/status 查看当前工作区状态",
+                "/reset 重置当前工作区 Codex 会话",
                 "/usage 查看 Codex 5 小时和周限额",
                 "/codex-accounts 查看可用 Codex 账号",
-                "/codex <编号|名称|next> 切换当前会话使用的 Codex 账号",
+                "/codex <编号|名称|next> 切换当前工作区使用的 Codex 账号",
                 "/model 查看或切换模型和 reasoning",
-                "/cwd <path> 切换当前会话工作目录",
+                "/cwd <path> 切换当前工作区工作目录",
+                "/ws 查看项目工作区",
+                "/ws add <名称> <路径> 添加项目工作区",
+                "/ws run <名称> <任务> 指定工作区派活",
                 "/accounts 查看已连接 Bot 账号",
                 "/login 新增 Bot 账号（adminUsers only）",
                 "/restart 重启后台服务（adminUsers only）",

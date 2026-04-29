@@ -5,11 +5,11 @@
 ## 功能概览
 
 - 多个微信 Bot 账号同时在线，统一由本地服务轮询和回复。
-- 每个 `accountId:userId` 独立保存会话、工作目录、Codex thread、Codex 账号和模型选择。
-- 不同会话可并发处理；同一会话默认串行，避免同一个 Codex thread 被并发写入。
+- 每个 `accountId:userId` 可创建多个项目工作区，每个工作区独立保存工作目录、Codex thread、Codex 账号和模型选择。
+- 不同会话或不同工作区可并发处理；同一工作区默认串行，避免同一个 Codex thread 被并发写入。
 - 支持 `/codex` 在多个 `CODEX_HOME` 登录账号之间切换。
 - 支持 `/models` 查看模型列表，`/model <编号|model:reasoning>` 切换模型。
-- 支持 `/cwd` 为当前微信会话切换 Codex 工作目录。
+- 支持 `/cwd` 为当前工作区切换 Codex 工作目录，支持 `/ws` 管理同一微信用户下的多个项目工作区。
 - 支持 `/usage` 查看 Codex 5 小时窗口和周窗口用量。
 - 支持文本、图片、文件、视频收发；入站媒体会下载到本地后把路径交给 Codex。
 - 支持 Codex 回复媒体发送标记，把本地图片、文件、视频发回微信。
@@ -148,7 +148,7 @@ cp config.example.json config.json
 - `wechat.botType`：微信 Bot 类型，默认 `"3"`。
 - `wechat.routeTag`：非空时作为 `SKRouteTag` 请求头发送。
 - `codex.bin`：Codex CLI 路径，可以是 `codex` 或绝对路径。
-- `codex.workingDirectory`：默认工作目录，微信中可用 `/cwd <path>` 覆盖当前会话。
+- `codex.workingDirectory`：默认工作目录，微信中可用 `/cwd <path>` 覆盖当前工作区。
 - `codex.model`：默认模型，非空时传给 `codex -m`。
 - `codex.reasoningEffort`：默认 reasoning level，非空时传 `-c model_reasoning_effort="<level>"`。
 - `codex.modelOptions`：固定 `/models` 展示的模型选项；为空时每次通过 `codex debug models` 实时查询 Codex CLI 可用模型。
@@ -174,19 +174,24 @@ cp config.example.json config.json
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 查看帮助 |
-| `/status` | 查看当前会话、Codex 账号、模型、工作目录和 Bot 连接状态 |
+| `/status` | 查看当前工作区、Codex 账号、模型、工作目录和 Bot 连接状态 |
 | `/usage` | 查看 Codex 5 小时窗口和周窗口限额 |
 | `/accounts` | 查看已连接的微信 Bot 账号 |
 | `/codex-accounts` | 查看可用 Codex 账号 |
-| `/codex` | 查看当前会话使用的 Codex 账号 |
+| `/codex` | 查看当前工作区使用的 Codex 账号 |
 | `/codex <编号|名称|next|prev>` | 切换 Codex 账号，并重置当前 Codex thread |
 | `/codex-use <name>` | 兼容旧命令，等价于 `/codex <name>` |
 | `/models` | 查看可切换模型列表 |
 | `/model` | 查看当前模型和模型切换说明 |
-| `/model <编号|model:reasoning>` | 切换当前会话模型，并重置当前 Codex thread |
-| `/cwd` | 查看当前会话工作目录 |
-| `/cwd <path>` | 修改当前会话工作目录 |
-| `/reset` | 重置当前会话；如果 Codex 正在运行，会先取消进程 |
+| `/model <编号|model:reasoning>` | 切换当前工作区模型，并重置当前 Codex thread |
+| `/cwd` | 查看当前工作区工作目录 |
+| `/cwd <path>` | 修改当前工作区工作目录，并重置当前工作区 thread |
+| `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和 thread |
+| `/ws add <名称> <路径>` | 添加项目工作区 |
+| `/ws use <名称>` | 切换当前工作区；之后普通消息会进入该工作区 |
+| `/ws run <名称> <任务>` | 不切换当前工作区，直接在指定工作区派发 Codex 任务 |
+| `/ws reset <名称>` | 取消运行中的任务并重置指定工作区 thread |
+| `/reset` | 重置当前工作区；如果 Codex 正在运行，会先取消进程 |
 | `/login` | 新增微信 Bot 账号，仅 `adminUsers` 可用 |
 | `/restart` | 重启后台服务，仅 `adminUsers` 可用 |
 
@@ -207,9 +212,15 @@ cp config.example.json config.json
 
 /cwd /path/to/project-a
 /reset
+
+/ws add a /path/to/project-a
+/ws add b /path/to/project-b
+/ws
+/ws run a 帮我改 README
+/ws run b 跑测试并修 bug
 ```
 
-`/codex` 切换的是 Codex 登录账号，也就是不同的 `CODEX_HOME`。`/model` 切换的是当前会话使用的模型和 reasoning level。两者都会清空当前 `codexThreadId`，确保下一次请求用新的账号或模型启动。
+`/codex` 切换的是 Codex 登录账号，也就是不同的 `CODEX_HOME`。`/model` 切换的是当前工作区使用的模型和 reasoning level。两者都会清空当前工作区的 `codexThreadId`，确保下一次请求用新的账号或模型启动。
 
 ## 多 Codex 账号
 
@@ -525,7 +536,7 @@ python3 -m wechat_codex_multi media-generate image "测试图片"
 
 ## 重要设计
 
-会话 key 是：
+基础会话 key 是：
 
 ```text
 accountId:userId
@@ -533,9 +544,19 @@ accountId:userId
 
 同一个微信用户在不同 Bot 账号里聊天，会进入不同 Codex thread。
 
-当同一个 conversation 有任务正在运行时，新的普通消息会立即收到“上一条消息还在处理中”的提示，不会继续排队卡住。`/status`、`/usage`、`/codex-accounts`、`/codex`、`/model`、`/models`、`/accounts`、`/help`、`/cwd`、`/restart` 可在任务运行中直接响应；`/reset` 可取消当前运行中的 Codex 并重置会话。
+项目工作区会把会话 key 扩展为：
+
+```text
+accountId:userId:workspaceName
+```
+
+`default` 工作区继续使用基础会话 key，兼容原有会话。`/ws run <名称> <任务>` 会直接使用指定工作区的 key，因此同一个微信用户可以同时让不同项目工作区并发执行。
+
+当同一个工作区有任务正在运行时，新的普通消息会立即收到“上一条消息还在处理中”的提示，不会继续排队卡住。`/status`、`/usage`、`/codex-accounts`、`/codex`、`/model`、`/models`、`/accounts`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/reset` 可取消当前工作区正在运行的 Codex 并重置会话，`/ws reset <名称>` 可取消指定工作区。
 
 超时、服务停止或 `/reset` 取消时，服务会清理 Codex 进程组，避免残留进程继续占用会话。
+
+每次任务都会启动一个 `codex exec` 子进程。任务完成、失败、超时或被取消后，服务会从运行表中移除该进程；正常完成的进程会自动释放，不需要手动清理。
 
 ## 常见问题
 
