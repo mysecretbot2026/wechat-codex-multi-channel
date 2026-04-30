@@ -7,6 +7,25 @@ from wechat_codex_multi.service import MultiWechatCodexService
 from wechat_codex_multi.wechat import ITEM_IMAGE, ITEM_TEXT, MESSAGE_TYPE_USER
 
 
+class FakeSteerRunner:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls = []
+
+    def steer(self, conversation_key, text):
+        self.calls.append((conversation_key, text))
+        return self.ok
+
+    def cancel(self, conversation_key):
+        return False
+
+    def is_running(self, conversation_key):
+        return True
+
+    def terminate_all(self):
+        self.calls.append(("terminate_all", ""))
+
+
 class CapturingExecutor:
     def __init__(self):
         self.submissions = []
@@ -19,7 +38,7 @@ class CapturingExecutor:
         return None
 
 
-def test_config(state_dir):
+def make_test_config(state_dir):
     return {
         "stateDir": state_dir,
         "state": {"saveDebounceMs": 0},
@@ -43,7 +62,7 @@ def test_config(state_dir):
 class ServicePerformanceTests(unittest.TestCase):
     def test_submit_message_does_not_download_inbound_media_on_monitor_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             service.executor = CapturingExecutor()
             service.command_executor = CapturingExecutor()
             account = {"accountId": "acct-1"}
@@ -73,7 +92,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_commands_bypass_codex_worker_pool(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             service.executor = CapturingExecutor()
             service.command_executor = CapturingExecutor()
             account = {"accountId": "acct-1"}
@@ -91,7 +110,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_workspace_run_uses_codex_worker_pool(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             service.executor = CapturingExecutor()
             service.command_executor = CapturingExecutor()
             account = {"accountId": "acct-1"}
@@ -111,7 +130,7 @@ class ServicePerformanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project_a = Path(tmp) / "project-a"
             project_a.mkdir()
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             sent = []
             calls = []
             service._send_text = lambda account, user_id, text: sent.append(text)
@@ -131,7 +150,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_model_switch_updates_session_and_resets_thread(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             service._model_options = [
                 {"model": "gpt-5.5", "reasoningEffort": "medium", "label": "GPT-5.5"},
                 {"model": "gpt-5.5", "reasoningEffort": "high", "label": "GPT-5.5"},
@@ -151,7 +170,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_models_command_lists_plain_model_options(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             service._model_options = [
                 {"model": "gpt-5.5", "reasoningEffort": "low"},
                 {"model": "gpt-5.5", "reasoningEffort": "medium"},
@@ -170,7 +189,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_model_options_are_loaded_for_each_command(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             sent = []
             service._send_text = lambda account, user_id, text: sent.append(text)
             account = {"accountId": "acct-1"}
@@ -191,7 +210,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_restart_requires_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
-            service = MultiWechatCodexService(test_config(tmp))
+            service = MultiWechatCodexService(make_test_config(tmp))
             sent = []
             service._send_text = lambda account, user_id, text: sent.append(text)
             service._schedule_restart = lambda: sent.append("scheduled")
@@ -204,7 +223,7 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_restart_schedules_restart_for_admin(self):
         with tempfile.TemporaryDirectory() as tmp:
-            config = test_config(tmp)
+            config = make_test_config(tmp)
             config["adminUsers"] = ["user-1"]
             service = MultiWechatCodexService(config)
             sent = []
@@ -223,6 +242,122 @@ class ServicePerformanceTests(unittest.TestCase):
     def test_workspace_run_needs_conversation_lock(self):
         self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/ws"))
         self.assertFalse(MultiWechatCodexService._can_run_without_conversation_lock("/ws run a hello"))
+        self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/runner"))
+
+    def test_busy_conversation_queues_followup_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+            lock = service._conversation_lock(base)
+            self.assertTrue(lock.acquire(blocking=False))
+            try:
+                service._handle_message_safe(account, "user-1", base, "补充：标题改短一点")
+            finally:
+                lock.release()
+
+            self.assertEqual(service._pop_pending_guidance(base), ["补充：标题改短一点"])
+            self.assertIn("已收到补充引导", sent[-1])
+
+    def test_busy_conversation_uses_app_server_steer_when_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeSteerRunner(ok=True)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+            lock = service._conversation_lock(base)
+            self.assertTrue(lock.acquire(blocking=False))
+            try:
+                service._handle_message_safe(account, "user-1", base, "补充：标题改短一点")
+            finally:
+                lock.release()
+
+            self.assertEqual(service.codex.calls, [(base, "补充：标题改短一点")])
+            self.assertEqual(service._pop_pending_guidance(base), [])
+            self.assertIn("已发送引导", sent[-1])
+
+    def test_busy_slash_command_is_not_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeSteerRunner(ok=True)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+            lock = service._conversation_lock(base)
+            self.assertTrue(lock.acquire(blocking=False))
+            try:
+                service._handle_message_safe(account, "user-1", base, "/unknown")
+            finally:
+                lock.release()
+
+            self.assertEqual(service.codex.calls, [])
+            self.assertEqual(service._pop_pending_guidance(base), [])
+            self.assertIn("命令不会作为引导处理", sent[-1])
+
+    def test_runner_command_switches_runtime_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            fake = FakeSteerRunner(ok=True)
+            service.codex = fake
+            created = []
+            service._create_codex_runner = lambda config: created.append(config["codex"]["runner"]) or FakeSteerRunner()
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", base, "/runner app-server")
+
+            self.assertEqual(created, ["app-server"])
+            self.assertIn(("terminate_all", ""), fake.calls)
+            self.assertEqual(service.config["codex"]["runner"], "app-server")
+            self.assertIn("已切换 Codex runner: app-server", sent[-1])
+
+    def test_run_pending_guidance_continues_same_conversation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            calls = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._run_codex_and_reply = lambda account, user_id, key, text: calls.append((key, text))
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+
+            service._append_pending_guidance(base, "第一条")
+            service._append_pending_guidance(base, "第二条")
+            service._run_pending_guidance(account, "user-1", base)
+
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][0], base)
+            self.assertIn("第一条", calls[0][1])
+            self.assertIn("第二条", calls[0][1])
+            self.assertIn("继续处理 2 条补充引导", sent[-1])
+
+    def test_busy_interrupt_cancels_and_schedules_new_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.executor = CapturingExecutor()
+            sent = []
+            cancelled = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service.codex.cancel = lambda key: cancelled.append(key) or True
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+            lock = service._conversation_lock(base)
+            self.assertTrue(lock.acquire(blocking=False))
+            try:
+                service._handle_message_safe(account, "user-1", base, "/interrupt 改做新任务")
+            finally:
+                lock.release()
+
+            self.assertEqual(cancelled, [base])
+            self.assertIn("已中断当前 Codex 任务", sent[-1])
+            self.assertEqual(len(service.executor.submissions), 1)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from . import logging as log
 from .actions import execute_actions, extract_actions
+from .codex_app_server import CodexAppServerRunner
 from .codex_accounts import (
     adjacent_codex_account,
     codex_account_names,
@@ -34,7 +35,7 @@ class MultiWechatCodexService:
             config["stateDir"],
             save_debounce_ms=int(config.get("state", {}).get("saveDebounceMs") or 0),
         )
-        self.codex = CodexCliRunner(config, self.state)
+        self.codex = self._create_codex_runner(config)
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(config.get("concurrency", {}).get("maxWorkers") or 4)
         )
@@ -47,8 +48,16 @@ class MultiWechatCodexService:
         self.stop_event = threading.Event()
         self.conversation_locks = {}
         self.conversation_locks_guard = threading.Lock()
+        self.pending_guidance = {}
+        self.pending_guidance_guard = threading.Lock()
         self.monitor_accounts = set()
         self._model_options = None
+
+    def _create_codex_runner(self, config):
+        runner = str(config.get("codex", {}).get("runner") or "exec").strip().lower()
+        if runner in {"app-server", "appserver", "server"}:
+            return CodexAppServerRunner(config, self.state)
+        return CodexCliRunner(config, self.state)
 
     def _api_for_account(self, account):
         return WechatClient(
@@ -145,12 +154,45 @@ class MultiWechatCodexService:
             if self.config.get("concurrency", {}).get("perConversationSerial", True):
                 lock = self._conversation_lock(conversation_key)
                 if not lock.acquire(blocking=False):
+                    interrupt_action, interrupt_text = self._parse_interrupt_command(text)
                     if text.strip() == "/reset":
                         killed = self.codex.cancel(conversation_key)
+                        self._clear_pending_guidance(conversation_key)
                         message = "已取消正在运行的 Codex 并重置当前工作区。" if killed else "已重置当前工作区。"
                         self._send_text(account, user_id, message)
                         return
-                    self._send_text(account, user_id, "上一条消息还在处理中，请稍后再试。需要放弃当前 Codex 会话时可发送 /reset。")
+                    if interrupt_action:
+                        self._clear_pending_guidance(conversation_key)
+                        killed = self.codex.cancel(conversation_key)
+                        if interrupt_text:
+                            self._send_text(account, user_id, "已中断当前 Codex 任务，稍后按新任务继续。")
+                            self._schedule_after_lock(account, user_id, base_conversation_key, conversation_key, interrupt_text)
+                        else:
+                            message = "已中断当前 Codex 任务并重置当前工作区。" if killed else "当前没有运行中的 Codex 任务，已重置当前工作区。"
+                            self._send_text(account, user_id, message)
+                        return
+                    if self._is_command(text) and not self._is_workspace_run_command(text):
+                        self._send_text(account, user_id, "当前任务运行中，命令不会作为引导处理。可发送 /status、/usage、/interrupt、/reset 等命令。")
+                        return
+                    if msg is not None:
+                        text = self._extract_message_text(account, user_id, msg)
+                        if not text:
+                            return
+                    guidance_text = self._guidance_text(text)
+                    if not guidance_text:
+                        self._send_text(account, user_id, "补充引导不能为空。")
+                        return
+                    if hasattr(self.codex, "steer") and self.codex.steer(conversation_key, guidance_text):
+                        self._send_text(account, user_id, "已发送引导，Codex 会在当前任务中调整方向。")
+                        return
+                    self._append_pending_guidance(conversation_key, guidance_text)
+                    self._send_text(
+                        account,
+                        user_id,
+                        "已收到补充引导。当前任务结束后会继续处理。\n"
+                        "需要立刻放弃当前任务：/interrupt\n"
+                        "需要中断并改做新任务：/interrupt <新任务>",
+                    )
                     return
                 try:
                     if msg is not None:
@@ -217,6 +259,7 @@ class MultiWechatCodexService:
             "/model",
             "/models",
             "/cwd",
+            "/runner",
             "/restart",
         }
 
@@ -252,6 +295,7 @@ class MultiWechatCodexService:
                         f"cwd: {session.get('cwd')}",
                         f"codexAccount: {codex_account.get('name')}",
                         f"codexHome: {codex_account.get('codexHome')}",
+                        f"codexRunner: {self.config.get('codex', {}).get('runner') or 'exec'}",
                         f"codexModel: {model_selection.get('model') or 'default'}",
                         f"reasoning: {model_selection.get('reasoningEffort') or 'default'}",
                         f"codexThreadId: {(session.get('codexThreadId') or '')[:12]}",
@@ -294,6 +338,10 @@ class MultiWechatCodexService:
             selector = command[len("/model"):].strip() if command.startswith("/model ") else ""
             self._handle_model_switch(account, user_id, conversation_key, selector, list_only=command == "/models")
             return
+        if command == "/runner" or command.startswith("/runner "):
+            selector = command[len("/runner"):].strip()
+            self._handle_runner_switch(account, user_id, selector)
+            return
         if command == "/login":
             if not self._is_admin(user_id):
                 self._send_text(account, user_id, "只有 adminUsers 可以通过微信触发 /login。")
@@ -316,7 +364,19 @@ class MultiWechatCodexService:
             self._send_text(account, user_id, "正在重启服务，稍后可发送 /status 确认。")
             self._schedule_restart()
             return
+        interrupt_action, interrupt_text = self._parse_interrupt_command(command)
+        if interrupt_action:
+            self._clear_pending_guidance(conversation_key)
+            killed = self.codex.cancel(conversation_key)
+            if interrupt_text:
+                self._send_text(account, user_id, "已重置当前工作区，开始处理新任务。")
+                self._run_codex_and_reply(account, user_id, conversation_key, interrupt_text)
+            else:
+                message = "已中断当前 Codex 任务并重置当前工作区。" if killed else "已重置当前工作区。"
+                self._send_text(account, user_id, message)
+            return
         if command == "/reset":
+            self._clear_pending_guidance(conversation_key)
             self.state.reset_session(conversation_key)
             self._send_text(account, user_id, "已重置当前工作区会话。")
             return
@@ -340,6 +400,7 @@ class MultiWechatCodexService:
         workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
         self.state.touch_workspace(base_conversation_key, workspace_name)
         self._run_codex_and_reply(account, user_id, conversation_key, text)
+        self._run_pending_guidance(account, user_id, conversation_key)
 
     def _run_codex_and_reply(self, account, user_id, conversation_key, text):
         stop_typing = self._start_typing_loop(account, user_id)
@@ -365,6 +426,75 @@ class MultiWechatCodexService:
                 transfer_semaphore=self.media_semaphore,
             )
             log.info(f"sent media conversation={conversation_key} count={len(sent)}")
+
+    @staticmethod
+    def _parse_interrupt_command(text):
+        command = (text or "").strip()
+        if command == "/cancel" or command == "/interrupt":
+            return True, ""
+        for prefix in ("/cancel ", "/interrupt "):
+            if command.startswith(prefix):
+                return True, command[len(prefix):].strip()
+        return False, ""
+
+    @classmethod
+    def _guidance_text(cls, text):
+        command = (text or "").strip()
+        if command == "/guide":
+            return ""
+        if command.startswith("/guide "):
+            return command[len("/guide "):].strip()
+        parts = cls._workspace_run_parts(command)
+        if len(parts) >= 4:
+            return parts[3].strip()
+        return command
+
+    def _append_pending_guidance(self, conversation_key, text):
+        value = str(text or "").strip()
+        if not value:
+            return False
+        with self.pending_guidance_guard:
+            self.pending_guidance.setdefault(conversation_key, []).append(value)
+        log.info(f"queued guidance conversation={conversation_key}")
+        return True
+
+    def _pop_pending_guidance(self, conversation_key):
+        with self.pending_guidance_guard:
+            items = self.pending_guidance.pop(conversation_key, [])
+        return [item for item in items if str(item or "").strip()]
+
+    def _clear_pending_guidance(self, conversation_key):
+        with self.pending_guidance_guard:
+            self.pending_guidance.pop(conversation_key, None)
+
+    @staticmethod
+    def _format_guidance_prompt(items):
+        lines = [
+            "用户在你处理上一项任务期间追加了以下补充引导。",
+            "请基于当前会话上下文继续处理；如果与之前要求冲突，以这些最新引导为准。",
+            "",
+        ]
+        for index, item in enumerate(items, start=1):
+            lines.append(f"{index}. {item}")
+        return "\n".join(lines)
+
+    def _run_pending_guidance(self, account, user_id, conversation_key):
+        while True:
+            items = self._pop_pending_guidance(conversation_key)
+            if not items:
+                return
+            self._send_text(account, user_id, f"继续处理 {len(items)} 条补充引导。")
+            self._run_codex_and_reply(account, user_id, conversation_key, self._format_guidance_prompt(items))
+
+    def _schedule_after_lock(self, account, user_id, base_conversation_key, conversation_key, text):
+        def run():
+            lock = self._conversation_lock(conversation_key)
+            with lock:
+                if self.stop_event.is_set():
+                    return
+                self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
+
+        self.executor.submit(run)
 
     def _workspace_name_from_key(self, base_conversation_key, conversation_key):
         if conversation_key == base_conversation_key:
@@ -537,6 +667,7 @@ class MultiWechatCodexService:
                 return
             workspace_key = self._workspace_key(base_conversation_key, name)
             killed = self.codex.cancel(workspace_key)
+            self._clear_pending_guidance(workspace_key)
             message = "已取消正在运行的 Codex 并重置该工作区。" if killed else "已重置该工作区。"
             self._send_text(account, user_id, message)
             return
@@ -666,6 +797,51 @@ class MultiWechatCodexService:
         )
         self._send_text(account, user_id, f"已经切换到 {format_model_option(target)} 模型\n已重置当前 Codex thread。")
 
+    def _handle_runner_switch(self, account, user_id, selector):
+        current = str(self.config.get("codex", {}).get("runner") or "exec").strip().lower() or "exec"
+        aliases = {
+            "exec": "exec",
+            "cli": "exec",
+            "app-server": "app-server",
+            "appserver": "app-server",
+            "server": "app-server",
+        }
+        if not selector:
+            self._send_text(
+                account,
+                user_id,
+                "\n".join(
+                    [
+                        f"当前 Codex runner: {current}",
+                        "",
+                        "切换：/runner exec",
+                        "切换：/runner app-server",
+                        "注意：运行时切换只修改当前服务进程内配置；重启后仍以 config.json 为准。",
+                    ]
+                ),
+            )
+            return
+        target = aliases.get(selector.strip().lower())
+        if not target:
+            self._send_text(account, user_id, "未知 runner。可用：exec、app-server")
+            return
+        if target == current:
+            self._send_text(account, user_id, f"当前已在使用 Codex runner: {target}")
+            return
+        try:
+            self.codex.terminate_all()
+        except Exception:
+            pass
+        self.config.setdefault("codex", {})["runner"] = target
+        self.codex = self._create_codex_runner(self.config)
+        with self.pending_guidance_guard:
+            self.pending_guidance.clear()
+        self._send_text(
+            account,
+            user_id,
+            f"已切换 Codex runner: {target}\n已关闭旧 runner 的后台进程。重启后仍以 config.json 为准。",
+        )
+
     def _get_session(self, conversation_key):
         return self.state.get_session(
             conversation_key,
@@ -736,10 +912,14 @@ class MultiWechatCodexService:
                 "命令：",
                 "/status 查看当前工作区状态",
                 "/reset 重置当前工作区 Codex 会话",
+                "/cancel 或 /interrupt 中断当前任务并重置当前工作区",
+                "/interrupt <新任务> 中断当前任务并改做新任务",
+                "/guide <补充要求> 在任务运行中追加引导；直接发普通消息也会追加",
                 "/usage 查看 Codex 5 小时和周限额",
                 "/codex-accounts 查看可用 Codex 账号",
                 "/codex <编号|名称|next> 切换当前工作区使用的 Codex 账号",
                 "/model 查看或切换模型和 reasoning",
+                "/runner 查看或切换 exec/app-server runner",
                 "/cwd <path> 切换当前工作区工作目录",
                 "/ws 查看项目工作区",
                 "/ws add <名称> <路径> 添加项目工作区",

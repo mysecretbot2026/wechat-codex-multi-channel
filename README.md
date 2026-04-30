@@ -7,6 +7,7 @@
 - 多个微信 Bot 账号同时在线，统一由本地服务轮询和回复。
 - 每个 `accountId:userId` 可创建多个项目工作区，每个工作区独立保存工作目录、Codex thread、Codex 账号和模型选择。
 - 不同会话或不同工作区可并发处理；同一工作区默认串行，避免同一个 Codex thread 被并发写入。
+- 同一工作区运行中继续发消息默认作为补充引导；`app-server` runner 会调用 Codex 原生 `turn/steer`，`exec` runner 会退回到队列续跑。
 - 支持 `/codex` 在多个 `CODEX_HOME` 登录账号之间切换。
 - 支持 `/models` 查看模型列表，`/model <编号|model:reasoning>` 切换模型。
 - 支持 `/cwd` 为当前工作区切换 Codex 工作目录，支持 `/ws` 管理同一微信用户下的多个项目工作区。
@@ -104,6 +105,7 @@ cp config.example.json config.json
     "routeTag": null
   },
   "codex": {
+    "runner": "exec",
     "bin": "codex",
     "workingDirectory": ".",
     "model": "",
@@ -147,6 +149,7 @@ cp config.example.json config.json
 - `wechat.baseUrl`：微信 Bot API 地址。
 - `wechat.botType`：微信 Bot 类型，默认 `"3"`。
 - `wechat.routeTag`：非空时作为 `SKRouteTag` 请求头发送。
+- `codex.runner`：Codex 运行方式，`exec` 为兼容模式，`app-server` 使用 Codex 原生 app-server 支持运行中引导和 turn 中断。
 - `codex.bin`：Codex CLI 路径，可以是 `codex` 或绝对路径。
 - `codex.workingDirectory`：默认工作目录，微信中可用 `/cwd <path>` 覆盖当前工作区。
 - `codex.model`：默认模型，非空时传给 `codex -m`。
@@ -184,6 +187,9 @@ cp config.example.json config.json
 | `/models` | 查看可切换模型列表 |
 | `/model` | 查看当前模型和模型切换说明 |
 | `/model <编号|model:reasoning>` | 切换当前工作区模型，并重置当前 Codex thread |
+| `/runner` | 查看当前 Codex runner |
+| `/runner exec` | 切换到兼容的 `codex exec` runner |
+| `/runner app-server` | 切换到 Codex 原生 app-server runner，支持运行中 `turn/steer` |
 | `/cwd` | 查看当前工作区工作目录 |
 | `/cwd <path>` | 修改当前工作区工作目录，并重置当前工作区 thread |
 | `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和 thread |
@@ -192,6 +198,9 @@ cp config.example.json config.json
 | `/ws run <名称> <任务>` | 不切换当前工作区，直接在指定工作区派发 Codex 任务 |
 | `/ws reset <名称>` | 取消运行中的任务并重置指定工作区 thread |
 | `/reset` | 重置当前工作区；如果 Codex 正在运行，会先取消进程 |
+| `/guide <补充要求>` | 当前任务运行中追加补充引导；直接发送普通消息也会追加 |
+| `/interrupt` 或 `/cancel` | 立刻中断当前任务并重置当前工作区 |
+| `/interrupt <新任务>` | 中断当前任务，重置当前 thread，并在当前进程退出后自动执行新任务 |
 | `/login` | 新增微信 Bot 账号，仅 `adminUsers` 可用 |
 | `/restart` | 重启后台服务，仅 `adminUsers` 可用 |
 
@@ -209,9 +218,11 @@ cp config.example.json config.json
 /models
 /model 3
 /model gpt-5.5:high
+/runner app-server
 
 /cwd /path/to/project-a
 /reset
+/interrupt 改成先修登录页，不要继续做 README
 
 /ws add a /path/to/project-a
 /ws add b /path/to/project-b
@@ -221,6 +232,41 @@ cp config.example.json config.json
 ```
 
 `/codex` 切换的是 Codex 登录账号，也就是不同的 `CODEX_HOME`。`/model` 切换的是当前工作区使用的模型和 reasoning level。两者都会清空当前工作区的 `codexThreadId`，确保下一次请求用新的账号或模型启动。
+
+### 运行中引导和中断
+
+默认开启同一工作区串行处理时，Codex 正在运行期间，同一微信用户继续发送普通消息不会被拒绝，而是作为补充引导处理。
+
+如果 `codex.runner` 为 `app-server`，服务会调用 Codex 原生 `turn/steer`，让当前 active turn 在运行中调整方向。
+
+如果 `codex.runner` 为 `exec`，由于 `codex exec` 是一次性进程，服务会退回到补充引导队列：当前任务返回后合并补充要求并沿用当前工作区 thread 续跑。
+
+斜杠开头的系统命令不会被识别为引导，例如 `/status`、`/usage`、`/reset`、`/interrupt` 会按命令单独处理。
+
+可显式发送：
+
+```text
+/guide 标题改短一点，结尾加行动项
+```
+
+也可以直接发送普通文本，效果相同。运行中不需要特意输入 `/guide`。
+
+需要放弃当前运行中的任务时：
+
+```text
+/interrupt
+/cancel
+```
+
+需要立刻改做另一件事时：
+
+```text
+/interrupt 不要继续重构，先修复登录报错并跑测试
+```
+
+注意：`exec` runner 的中断会终止当前 `codex exec` 进程并重置当前工作区 thread；`app-server` runner 会优先调用 Codex 原生 `turn/interrupt`，失败时再由服务层做降级处理。
+
+运行时可以用 `/runner exec` 或 `/runner app-server` 临时切换当前服务进程内的 runner。切换时会关闭旧 runner 的后台进程；服务重启后仍以 `config.json` 里的 `codex.runner` 为准。
 
 ## 多 Codex 账号
 
