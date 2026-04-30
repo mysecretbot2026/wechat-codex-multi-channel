@@ -469,6 +469,49 @@ python3 -m wechat_codex_multi media-generate image "生成一张产品海报"
 
 推荐用 `launchd` 以当前用户身份运行。它可以在登录后自动启动，并在程序异常退出后自动拉起。
 
+### 一键部署
+
+在项目目录运行：
+
+```bash
+./scripts/deploy_macos.sh
+```
+
+脚本会自动完成：
+
+- 创建或复用项目内 `.venv`，隔离 Python 依赖。
+- 安装 `requirements.txt`。
+- 如果有 `npm`，执行 `npm install`。
+- 如果没有 `config.json`，从 `config.example.json` 创建。
+- 如果还没有微信 Bot 账号，进入交互式扫码添加账号流程。
+- 写入 `~/Library/LaunchAgents/com.wechat-codex-multi.plist`。
+- 加载并启动 launchd 服务，登录后自启动，异常退出自动拉起。
+
+常用选项：
+
+```bash
+./scripts/deploy_macos.sh --skip-account
+./scripts/deploy_macos.sh --no-start
+./scripts/deploy_macos.sh --config /path/to/config.json
+./scripts/deploy_macos.sh --venv /path/to/.venv
+```
+
+说明：
+
+- 脚本不会覆盖已有 `config.json`。
+- 脚本不会自动安装 Codex CLI；如果 `codex login status` 失败，会提示先运行 `codex login`。
+- 运行时切换 `exec` / `app-server` 可用微信命令 `/runner`；重启后仍以 `config.json` 为准。
+
+查看服务：
+
+```bash
+launchctl print gui/$(id -u)/com.wechat-codex-multi
+tail -f ~/Library/Logs/wechat-codex-multi/stdout.log
+tail -f ~/Library/Logs/wechat-codex-multi/stderr.log
+```
+
+### 手动部署
+
 先确认项目路径、虚拟环境、配置文件和微信账号都已经准备好：
 
 ```bash

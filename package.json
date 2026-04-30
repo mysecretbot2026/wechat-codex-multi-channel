@@ -5,7 +5,8 @@
   "scripts": {
     "start": "python3 -m wechat_codex_multi start",
     "setup": "python3 -m wechat_codex_multi add-account",
-    "status": "python3 -m wechat_codex_multi status"
+    "status": "python3 -m wechat_codex_multi status",
+    "deploy:macos": "./scripts/deploy_macos.sh"
   },
   "dependencies": {
     "qrcode-terminal": "^0.12.0"
