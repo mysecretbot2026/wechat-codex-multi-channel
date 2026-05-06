@@ -1,4 +1,5 @@
 import json
+import os
 import shutil
 import subprocess
 
@@ -67,10 +68,14 @@ def configured_model_options(config):
     return options
 
 
-def discover_model_options(codex_bin="codex", timeout_s=10):
+def discover_model_options(codex_bin="codex", timeout_s=30, codex_home=""):
     binary = shutil.which(codex_bin) or codex_bin
+    env = os.environ.copy()
+    if codex_home:
+        env["CODEX_HOME"] = os.path.expanduser(str(codex_home))
     completed = subprocess.run(
         [binary, "debug", "models"],
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -115,7 +120,18 @@ def model_options(config):
     if configured:
         return configured
     codex = config.get("codex") or {}
-    return discover_model_options(codex.get("bin") or "codex")
+    timeout_s = int(codex.get("modelDiscoveryTimeoutSeconds") or 30)
+    codex_home = ""
+    accounts = codex.get("accounts") or []
+    default_account = codex.get("defaultAccount") or ""
+    for account in accounts:
+        if account.get("name") == default_account:
+            codex_home = account.get("codexHome") or ""
+            break
+    try:
+        return discover_model_options(codex.get("bin") or "codex", timeout_s=timeout_s, codex_home=codex_home)
+    except subprocess.TimeoutExpired:
+        return default_model_options()
 
 
 def find_model_option(options, selector):

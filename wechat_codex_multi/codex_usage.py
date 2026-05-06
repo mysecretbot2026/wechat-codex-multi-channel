@@ -4,14 +4,120 @@ import select
 import shutil
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
+from pathlib import Path
 
 
 def read_codex_usage(codex_bin="codex", timeout_s=15, codex_home=""):
+    try:
+        return _read_codex_usage_backend(codex_bin=codex_bin, timeout_s=timeout_s, codex_home=codex_home)
+    except Exception as backend_err:
+        try:
+            return _read_codex_usage_app_server(codex_bin=codex_bin, timeout_s=timeout_s, codex_home=codex_home)
+        except Exception as app_server_err:
+            raise RuntimeError(f"{backend_err}; app-server fallback failed: {app_server_err}") from app_server_err
+
+
+def _read_codex_usage_backend(codex_bin="codex", timeout_s=15, codex_home=""):
+    auth = _load_chatgpt_auth(codex_home)
+    try:
+        return _request_chatgpt_usage(auth["accessToken"], timeout_s=timeout_s)
+    except urllib.error.HTTPError as err:
+        if err.code not in {401, 403}:
+            raise
+        _refresh_codex_auth(codex_bin=codex_bin, timeout_s=timeout_s, codex_home=codex_home)
+        auth = _load_chatgpt_auth(codex_home)
+        return _request_chatgpt_usage(auth["accessToken"], timeout_s=timeout_s)
+
+
+def _load_chatgpt_auth(codex_home=""):
+    home = Path(os.path.expandvars(os.path.expanduser(str(codex_home or os.environ.get("CODEX_HOME") or "~/.codex")))).resolve()
+    path = home / "auth.json"
+    if not path.exists():
+        raise RuntimeError(f"未找到 Codex 登录文件: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("auth_mode") != "chatgpt":
+        raise RuntimeError("当前 Codex 登录方式不是 ChatGPT，无法直接读取用量")
+    tokens = data.get("tokens") or {}
+    access_token = tokens.get("access_token")
+    if not access_token:
+        raise RuntimeError("Codex 登录文件缺少 access_token")
+    return {"accessToken": access_token}
+
+
+def _refresh_codex_auth(codex_bin="codex", timeout_s=15, codex_home=""):
     binary = shutil.which(codex_bin) or codex_bin
     env = os.environ.copy()
     if codex_home:
-        env["CODEX_HOME"] = codex_home
+        env["CODEX_HOME"] = str(Path(os.path.expandvars(os.path.expanduser(str(codex_home)))).resolve())
+    subprocess.run(
+        [binary, "login", "status"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=max(5, timeout_s),
+        check=True,
+    )
+
+
+def _request_chatgpt_usage(access_token, timeout_s=15):
+    request = urllib.request.Request(
+        "https://chatgpt.com/backend-api/wham/usage",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+            "User-Agent": "wechat-codex-multi-channel",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout_s) as response:
+        return _normalize_chatgpt_usage(json.loads(response.read().decode("utf-8")))
+
+
+def _normalize_chatgpt_usage(data):
+    rate_limit = data.get("rate_limit") or {}
+    credits = data.get("credits") or {}
+    return {
+        "account": {
+            "userId": data.get("user_id") or "",
+            "accountId": data.get("account_id") or "",
+            "email": data.get("email") or "",
+        },
+        "rateLimits": {
+            "planType": data.get("plan_type") or "",
+            "primary": _normalize_chatgpt_window(rate_limit.get("primary_window")),
+            "secondary": _normalize_chatgpt_window(rate_limit.get("secondary_window")),
+            "credits": {
+                "hasCredits": bool(credits.get("has_credits")),
+                "balance": credits.get("balance", "0"),
+                "unlimited": bool(credits.get("unlimited")),
+            },
+            "rateLimitReachedType": data.get("rate_limit_reached_type") or ("rate_limit_reached" if rate_limit.get("limit_reached") else ""),
+        },
+    }
+
+
+def _normalize_chatgpt_window(window):
+    if not window:
+        return None
+    duration_seconds = window.get("limit_window_seconds")
+    duration_mins = int(duration_seconds / 60) if isinstance(duration_seconds, (int, float)) else None
+    return {
+        "usedPercent": window.get("used_percent"),
+        "windowDurationMins": duration_mins,
+        "resetsAt": window.get("reset_at"),
+    }
+
+
+def _read_codex_usage_app_server(codex_bin="codex", timeout_s=15, codex_home=""):
+    binary = shutil.which(codex_bin) or codex_bin
+    env = os.environ.copy()
+    if codex_home:
+        env["CODEX_HOME"] = str(Path(os.path.expandvars(os.path.expanduser(str(codex_home)))).resolve())
     messages = [
         {
             "id": 1,
@@ -74,6 +180,34 @@ def read_codex_usage(codex_bin="codex", timeout_s=15, codex_home=""):
 def format_codex_usage(usage):
     rate_limits = (usage or {}).get("rateLimits") or {}
     lines = ["Codex 用量："]
+    _append_codex_usage_lines(lines, rate_limits, (usage or {}).get("account") or {})
+    return "\n".join(lines)
+
+
+def format_codex_usage_all(results):
+    lines = ["Codex 全部账号用量："]
+    for result in results:
+        account = result.get("account") or {}
+        name = account.get("name") or "unknown"
+        codex_home = account.get("codexHome") or ""
+        lines.append("")
+        lines.append(f"[{name}]")
+        if codex_home:
+            lines.append(f"codexHome: {codex_home}")
+        error = result.get("error")
+        if error:
+            lines.append(f"读取失败：{error}")
+            continue
+        usage = result.get("usage") or {}
+        rate_limits = usage.get("rateLimits") or {}
+        _append_codex_usage_lines(lines, rate_limits, usage.get("account") or {})
+    return "\n".join(lines)
+
+
+def _append_codex_usage_lines(lines, rate_limits, account=None):
+    account_line = _format_usage_account(account or {})
+    if account_line:
+        lines.append(f"登录账号：{account_line}")
     plan = rate_limits.get("planType")
     if plan:
         lines.append(f"套餐：{plan}")
@@ -90,7 +224,6 @@ def format_codex_usage(usage):
     reached = rate_limits.get("rateLimitReachedType")
     if reached:
         lines.append(f"限额状态：{reached}")
-    return "\n".join(lines)
 
 
 def _append_window(lines, label, window):
@@ -105,3 +238,22 @@ def _append_window(lines, label, window):
         lines.append(f"窗口长度：{duration} 分钟")
     if resets_at:
         lines.append(f"重置时间：{datetime.fromtimestamp(int(resets_at)).strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+def _format_usage_account(account):
+    email = account.get("email") or ""
+    account_id = account.get("accountId") or account.get("userId") or ""
+    if email and account_id:
+        return f"{email} ({_short_account_id(account_id)})"
+    if email:
+        return email
+    if account_id:
+        return _short_account_id(account_id)
+    return ""
+
+
+def _short_account_id(value):
+    text = str(value or "")
+    if len(text) <= 16:
+        return text
+    return f"{text[:8]}...{text[-6:]}"

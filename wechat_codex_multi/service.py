@@ -18,7 +18,7 @@ from .codex_accounts import (
 )
 from .codex_cli import CodexCancelled, CodexCliRunner
 from .codex_models import find_model_option, format_model_option, model_options, resolve_session_model
-from .codex_usage import format_codex_usage, read_codex_usage
+from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
 from .config import PROJECT_DIR
 from .login import login_with_qr
 from .state import StateStore
@@ -304,14 +304,21 @@ class MultiWechatCodexService:
                 ),
             )
             return
-        if command == "/usage":
+        usage_parts = command.split()
+        if usage_parts and usage_parts[0] == "/usage" and (len(usage_parts) == 1 or (len(usage_parts) == 2 and usage_parts[1].lower() == "all")):
             session = self._get_session(conversation_key)
-            codex_account = resolve_session_codex_account(self.config, session)
-            usage = read_codex_usage(
-                self.config["codex"].get("bin") or "codex",
-                codex_home=codex_account.get("codexHome") or "",
-            )
-            self._send_text(account, user_id, format_codex_usage(usage))
+            if len(usage_parts) == 2:
+                self._send_text(account, user_id, self._read_all_codex_usage())
+            else:
+                codex_account = resolve_session_codex_account(self.config, session)
+                usage = read_codex_usage(
+                    self.config["codex"].get("bin") or "codex",
+                    codex_home=codex_account.get("codexHome") or "",
+                )
+                self._send_text(account, user_id, format_codex_usage(usage))
+            return
+        if command.startswith("/usage "):
+            self._send_text(account, user_id, "用法：/usage 或 /usage all")
             return
         if command == "/codex-accounts":
             current = resolve_session_codex_account(self.config, self._get_session(conversation_key)).get("name")
@@ -495,6 +502,34 @@ class MultiWechatCodexService:
                 self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
 
         self.executor.submit(run)
+
+    def _read_all_codex_usage(self):
+        accounts = list_codex_accounts(self.config)
+        if not accounts:
+            return "没有配置 Codex 账号。"
+        codex_bin = self.config["codex"].get("bin") or "codex"
+        max_workers = min(4, len(accounts))
+        results = [None] * len(accounts)
+
+        def read_one(index, codex_account):
+            try:
+                usage = read_codex_usage(
+                    codex_bin,
+                    codex_home=codex_account.get("codexHome") or "",
+                )
+                return index, {"account": codex_account, "usage": usage}
+            except Exception as err:
+                return index, {"account": codex_account, "error": str(err)}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(read_one, index, codex_account)
+                for index, codex_account in enumerate(accounts)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                index, result = future.result()
+                results[index] = result
+        return format_codex_usage_all([result for result in results if result is not None])
 
     def _workspace_name_from_key(self, base_conversation_key, conversation_key):
         if conversation_key == base_conversation_key:
@@ -916,6 +951,7 @@ class MultiWechatCodexService:
                 "/interrupt <新任务> 中断当前任务并改做新任务",
                 "/guide <补充要求> 在任务运行中追加引导；直接发普通消息也会追加",
                 "/usage 查看 Codex 5 小时和周限额",
+                "/usage all 查看配置里所有 Codex 账号的用量",
                 "/codex-accounts 查看可用 Codex 账号",
                 "/codex <编号|名称|next> 切换当前工作区使用的 Codex 账号",
                 "/model 查看或切换模型和 reasoning",

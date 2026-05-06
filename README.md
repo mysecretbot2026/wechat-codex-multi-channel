@@ -111,6 +111,7 @@ cp config.example.json config.json
     "model": "",
     "reasoningEffort": "",
     "modelOptions": [],
+    "modelDiscoveryTimeoutSeconds": 30,
     "timeoutMs": 7200000,
     "bypassApprovalsAndSandbox": true,
     "defaultAccount": "main",
@@ -155,6 +156,7 @@ cp config.example.json config.json
 - `codex.model`：默认模型，非空时传给 `codex -m`。
 - `codex.reasoningEffort`：默认 reasoning level，非空时传 `-c model_reasoning_effort="<level>"`。
 - `codex.modelOptions`：固定 `/models` 展示的模型选项；为空时每次通过 `codex debug models` 实时查询 Codex CLI 可用模型。
+- `codex.modelDiscoveryTimeoutSeconds`：`codex debug models` 的超时时间，默认 30 秒；超时会回退到内置模型列表。
 - `codex.timeoutMs`：单次 Codex 执行超时，默认 2 小时。
 - `codex.bypassApprovalsAndSandbox`：为 true 时传 `--dangerously-bypass-approvals-and-sandbox`。
 - `codex.defaultAccount`：默认 Codex 账号名。
@@ -651,7 +653,7 @@ accountId:userId:workspaceName
 
 ### `/models` 显示哪些模型？
 
-如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。需要固定可选范围时，配置 `codex.modelOptions`；配置后不会再实时查询。
+如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。查询会使用默认 Codex 账号的 `CODEX_HOME`，超时时间由 `codex.modelDiscoveryTimeoutSeconds` 控制，默认 30 秒；如果查询超时，会回退到内置模型列表。需要固定可选范围时，配置 `codex.modelOptions`；配置后不会再实时查询。
 
 ### `/model 1` 切换后为什么要重置 thread？
 

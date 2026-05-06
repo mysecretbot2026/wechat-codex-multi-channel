@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
         "model": "",
         "reasoningEffort": "",
         "modelOptions": [],
+        "modelDiscoveryTimeoutSeconds": 30,
         "timeoutMs": 7200_000,
         "bypassApprovalsAndSandbox": True,
         "defaultAccount": "main",

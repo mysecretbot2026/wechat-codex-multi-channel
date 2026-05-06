@@ -13,6 +13,7 @@
     "model": "",
     "reasoningEffort": "",
     "modelOptions": [],
+    "modelDiscoveryTimeoutSeconds": 30,
     "timeoutMs": 7200000,
     "bypassApprovalsAndSandbox": true,
     "defaultAccount": "main",
