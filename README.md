@@ -1,19 +1,21 @@
 # wechat-codex-multi-channel
 
-把多个微信 Bot 账号接到同一个本地 Codex CLI 服务上。它适合把 Codex 当作微信里的长期在线助手使用，同时保留本机 `codex` 登录态、`CODEX_HOME`、工作目录、模型和 reasoning level 的控制权。
+把多个微信 Bot 账号接到同一个本地 AI coding CLI 服务上。默认使用 Codex CLI，也可以在微信里切换到 Claude Code CLI，同时保留本机 `codex` / `claude` 登录态、工作目录、模型和 reasoning/effort 的控制权。
 
 ## 功能概览
 
 - 多个微信 Bot 账号同时在线，统一由本地服务轮询和回复。
-- 每个 `accountId:userId` 可创建多个项目工作区，每个工作区独立保存工作目录、Codex thread、Codex 账号和模型选择。
-- 不同会话或不同工作区可并发处理；同一工作区默认串行，避免同一个 Codex thread 被并发写入。
+- 每个 `accountId:userId` 可创建多个项目工作区，每个工作区独立保存工作目录、Agent、CLI 会话、账号和模型选择。
+- 不同会话或不同工作区可并发处理；同一工作区默认串行，避免同一个 CLI 会话被并发写入。
 - 同一工作区运行中继续发消息默认作为补充引导；`app-server` runner 会调用 Codex 原生 `turn/steer`，`exec` runner 会退回到队列续跑。
+- 支持 `/agent codex` 和 `/agent claude` 在 Codex CLI 与 Claude Code CLI 之间切换。
 - 支持 `/codex` 在多个 `CODEX_HOME` 登录账号之间切换。
+- 支持 `/claude` 在多个 `CLAUDE_CONFIG_DIR` 登录配置之间切换。
 - 支持 `/models` 查看模型列表，`/model <编号|model:reasoning>` 切换模型。
-- 支持 `/cwd` 为当前工作区切换 Codex 工作目录，支持 `/ws` 管理同一微信用户下的多个项目工作区。
+- 支持 `/cwd` 为当前工作区切换 CLI 工作目录，支持 `/ws` 管理同一微信用户下的多个项目工作区。
 - 支持 `/usage` 查看 Codex 5 小时窗口和周窗口用量。
-- 支持文本、图片、文件、视频收发；入站媒体会下载到本地后把路径交给 Codex。
-- 支持 Codex 回复媒体发送标记，把本地图片、文件、视频发回微信。
+- 支持文本、图片、文件、视频收发；入站媒体会下载到本地后把路径交给当前 Agent。
+- 支持 CLI 回复媒体发送标记，把本地图片、文件、视频发回微信。
 - 支持可配置的图片/视频生成器，以及 Codex 原生 `image_generation_end` 事件转微信图片。
 - 支持 macOS `launchd` 开机自启和异常退出自动重启。
 
@@ -22,7 +24,9 @@
 - [快速开始](#快速开始)
 - [配置说明](#配置说明)
 - [微信命令](#微信命令)
+- [Agent 和 Claude Code](#agent-和-claude-code)
 - [多 Codex 账号](#多-codex-账号)
+- [多 Claude 账号](#多-claude-账号)
 - [模型和 Reasoning 切换](#模型和-reasoning-切换)
 - [媒体发送协议](#媒体发送协议)
 - [媒体生成器](#媒体生成器)
@@ -36,13 +40,20 @@
 
 - macOS 或 Linux。
 - Python 3.10+。
-- 已安装并登录本机 Codex CLI。
+- 已安装并登录本机 Codex CLI。需要 Claude Code 支持时，也要安装并登录 `claude`。
 - 可访问微信 Bot 接口。
 
 确认 Codex CLI 可用：
 
 ```bash
 codex login status
+```
+
+确认 Claude Code CLI 可用：
+
+```bash
+claude auth status --text
+claude -p --verbose --output-format stream-json "只回复 OK"
 ```
 
 安装并启动：
@@ -123,6 +134,23 @@ cp config.example.json config.json
     ],
     "extraPrompt": ""
   },
+  "claude": {
+    "bin": "claude",
+    "workingDirectory": "",
+    "model": "sonnet",
+    "effort": "",
+    "modelOptions": [],
+    "timeoutMs": 7200000,
+    "permissionMode": "bypassPermissions",
+    "defaultAccount": "main",
+    "accounts": [
+      {
+        "name": "main",
+        "claudeConfigDir": ""
+      }
+    ],
+    "extraPrompt": ""
+  },
   "concurrency": {
     "maxWorkers": 4,
     "commandWorkers": 2,
@@ -162,7 +190,17 @@ cp config.example.json config.json
 - `codex.defaultAccount`：默认 Codex 账号名。
 - `codex.accounts`：多个 Codex 登录账号，每个账号对应一个独立 `CODEX_HOME`。
 - `codex.extraPrompt`：追加到发给 Codex 的系统提示。
-- `concurrency.maxWorkers`：普通 Codex 任务线程数。
+- `claude.bin`：Claude Code CLI 路径，可以是 `claude` 或绝对路径。
+- `claude.workingDirectory`：Claude 默认工作目录；为空时沿用 `codex.workingDirectory`，微信中仍可用 `/cwd <path>` 覆盖当前工作区。
+- `claude.model`：默认 Claude 模型，非空时传给 `claude --model`，例如 `sonnet`。
+- `claude.effort`：默认 effort level，非空时传给 `claude --effort`。Claude Code 2.1.119 支持 `low`、`medium`、`high`、`xhigh`、`max`。
+- `claude.modelOptions`：固定 `/models` 在 Claude Agent 下展示的模型选项；为空时使用内置默认列表。
+- `claude.timeoutMs`：单次 Claude 执行超时，默认 2 小时。
+- `claude.permissionMode`：传给 `claude --permission-mode`，默认 `bypassPermissions`。
+- `claude.defaultAccount`：默认 Claude 账号名。
+- `claude.accounts`：多个 Claude 登录配置。`claudeConfigDir` 为空表示使用 Claude Code 默认登录态；非空时作为独立 `CLAUDE_CONFIG_DIR`。
+- `claude.extraPrompt`：追加到 Claude Code 的系统提示。
+- `concurrency.maxWorkers`：普通 Agent 任务线程数。
 - `concurrency.commandWorkers`：微信命令处理线程数，避免 `/status`、`/models` 被长任务阻塞。
 - `concurrency.perConversationSerial`：同一会话是否串行处理。
 - `state.saveDebounceMs`：状态文件防抖写入间隔。
@@ -179,30 +217,37 @@ cp config.example.json config.json
 | 命令 | 作用 |
 | --- | --- |
 | `/help` | 查看帮助 |
-| `/status` | 查看当前工作区、Codex 账号、模型、工作目录和 Bot 连接状态 |
+| `/status` | 查看当前工作区、Agent、账号、模型、工作目录和 Bot 连接状态 |
 | `/usage` | 查看 Codex 5 小时窗口和周窗口限额 |
 | `/accounts` | 查看已连接的微信 Bot 账号 |
+| `/agents` | 查看可用 Agent |
+| `/agent` | 查看当前工作区使用的 Agent |
+| `/agent codex` | 切换当前工作区到 Codex CLI |
+| `/agent claude` | 切换当前工作区到 Claude Code CLI |
 | `/codex-accounts` | 查看可用 Codex 账号 |
 | `/codex` | 查看当前工作区使用的 Codex 账号 |
 | `/codex <编号|名称|next|prev>` | 切换 Codex 账号，并重置当前 Codex thread |
 | `/codex-use <name>` | 兼容旧命令，等价于 `/codex <name>` |
+| `/claude-accounts` | 查看可用 Claude 账号 |
+| `/claude` | 查看当前工作区使用的 Claude 账号 |
+| `/claude <编号|名称|next|prev>` | 切换 Claude 账号，并重置当前 Claude session |
 | `/models` | 查看可切换模型列表 |
 | `/model` | 查看当前模型和模型切换说明 |
-| `/model <编号|model:reasoning>` | 切换当前工作区模型，并重置当前 Codex thread |
+| `/model <编号|model:reasoning>` | 切换当前 Agent 的模型，并重置当前 Agent 会话 |
 | `/runner` | 查看当前 Codex runner |
 | `/runner exec` | 切换到兼容的 `codex exec` runner |
 | `/runner app-server` | 切换到 Codex 原生 app-server runner，支持运行中 `turn/steer` |
 | `/cwd` | 查看当前工作区工作目录 |
-| `/cwd <path>` | 修改当前工作区工作目录，并重置当前工作区 thread |
-| `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和 thread |
+| `/cwd <path>` | 修改当前工作区工作目录，并重置当前工作区 Codex thread 和 Claude session |
+| `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和当前 Agent session |
 | `/ws add <名称> <路径>` | 添加项目工作区 |
 | `/ws use <名称>` | 切换当前工作区；之后普通消息会进入该工作区 |
-| `/ws run <名称> <任务>` | 不切换当前工作区，直接在指定工作区派发 Codex 任务 |
-| `/ws reset <名称>` | 取消运行中的任务并重置指定工作区 thread |
-| `/reset` | 重置当前工作区；如果 Codex 正在运行，会先取消进程 |
+| `/ws run <名称> <任务>` | 不切换当前工作区，直接在指定工作区派发当前 Agent 任务 |
+| `/ws reset <名称>` | 取消运行中的任务并重置指定工作区当前 Agent 会话 |
+| `/reset` | 重置当前工作区当前 Agent 会话；如果任务正在运行，会先取消进程 |
 | `/guide <补充要求>` | 当前任务运行中追加补充引导；直接发送普通消息也会追加 |
 | `/interrupt` 或 `/cancel` | 立刻中断当前任务并重置当前工作区 |
-| `/interrupt <新任务>` | 中断当前任务，重置当前 thread，并在当前进程退出后自动执行新任务 |
+| `/interrupt <新任务>` | 中断当前任务，重置当前 Agent 会话，并在当前进程退出后自动执行新任务 |
 | `/login` | 新增微信 Bot 账号，仅 `adminUsers` 可用 |
 | `/restart` | 重启后台服务，仅 `adminUsers` 可用 |
 
@@ -212,14 +257,24 @@ cp config.example.json config.json
 /status
 /usage
 
+/agents
+/agent claude
+/agent codex
+
 /codex-accounts
 /codex 2
 /codex backup
 /codex next
 
+/claude-accounts
+/claude 2
+/claude work
+/claude next
+
 /models
 /model 3
 /model gpt-5.5:high
+/model sonnet:high
 /runner app-server
 
 /cwd /path/to/project-a
@@ -233,15 +288,37 @@ cp config.example.json config.json
 /ws run b 跑测试并修 bug
 ```
 
-`/codex` 切换的是 Codex 登录账号，也就是不同的 `CODEX_HOME`。`/model` 切换的是当前工作区使用的模型和 reasoning level。两者都会清空当前工作区的 `codexThreadId`，确保下一次请求用新的账号或模型启动。
+`/agent` 切换当前工作区使用的 CLI。Codex 和 Claude 的会话 ID 分开保存，切换 Agent 不会共享上下文。
+
+`/codex` 切换的是 Codex 登录账号，也就是不同的 `CODEX_HOME`；会清空当前工作区的 `codexThreadId`。`/claude` 切换的是 Claude Code 登录配置，也就是不同的 `CLAUDE_CONFIG_DIR`；会清空当前工作区的 `claudeSessionId`。`/model` 切换的是当前 Agent 的模型和 effort/reasoning，会重置当前 Agent 的会话。
+
+## Agent 和 Claude Code
+
+服务启动时默认使用 `defaultAgent`，可设为 `codex` 或 `claude`。运行中也可以在微信里切换：
+
+```text
+/agents
+/agent claude
+/agent codex
+```
+
+Claude Code runner 使用新版 headless 接口：
+
+```bash
+claude -p --verbose --output-format stream-json --model sonnet --effort low --permission-mode bypassPermissions "任务内容"
+```
+
+当前已在 Claude Code 2.1.119 上验证：`stream-json` 必须搭配 `--verbose`；输出事件中的 `system`、`assistant`、`result` 都带 `session_id`，服务会把它保存为 `claudeSessionId` 并在下一轮用 `--resume <session_id>` 续会话。
+
+Claude Code 暂只支持 `exec/headless` 方式。运行中补充消息会进入服务层队列，当前任务结束后继续处理；不像 Codex `app-server` runner 那样支持原生 `turn/steer`。
 
 ### 运行中引导和中断
 
-默认开启同一工作区串行处理时，Codex 正在运行期间，同一微信用户继续发送普通消息不会被拒绝，而是作为补充引导处理。
+默认开启同一工作区串行处理时，当前 Agent 正在运行期间，同一微信用户继续发送普通消息不会被拒绝，而是作为补充引导处理。
 
 如果 `codex.runner` 为 `app-server`，服务会调用 Codex 原生 `turn/steer`，让当前 active turn 在运行中调整方向。
 
-如果 `codex.runner` 为 `exec`，由于 `codex exec` 是一次性进程，服务会退回到补充引导队列：当前任务返回后合并补充要求并沿用当前工作区 thread 续跑。
+如果 `codex.runner` 为 `exec` 或当前 Agent 是 Claude，由于 CLI 是一次性进程，服务会退回到补充引导队列：当前任务返回后合并补充要求并沿用当前工作区会话续跑。
 
 斜杠开头的系统命令不会被识别为引导，例如 `/status`、`/usage`、`/reset`、`/interrupt` 会按命令单独处理。
 
@@ -266,7 +343,7 @@ cp config.example.json config.json
 /interrupt 不要继续重构，先修复登录报错并跑测试
 ```
 
-注意：`exec` runner 的中断会终止当前 `codex exec` 进程并重置当前工作区 thread；`app-server` runner 会优先调用 Codex 原生 `turn/interrupt`，失败时再由服务层做降级处理。
+注意：`exec` runner 和 Claude runner 的中断会终止当前子进程并重置当前工作区对应的会话；`app-server` runner 会优先调用 Codex 原生 `turn/interrupt`，失败时再由服务层做降级处理。
 
 运行时可以用 `/runner exec` 或 `/runner app-server` 临时切换当前服务进程内的 runner。切换时会关闭旧 runner 的后台进程；服务重启后仍以 `config.json` 里的 `codex.runner` 为准。
 
@@ -318,6 +395,50 @@ CODEX_HOME=$HOME/.codex-accounts/backup codex login status
 
 `/codex <编号或名称>` 支持编号、完整名称、唯一前缀。切换账号时会清空当前 `codexThreadId`，避免不同 Codex 登录态之间错误 resume。
 
+## 多 Claude 账号
+
+Claude Code 账号通过 `CLAUDE_CONFIG_DIR` 隔离。默认账号建议把 `claudeConfigDir` 留空，这样使用当前系统默认 Claude Code 登录态；额外账号再使用独立 Claude 配置目录。
+
+先准备独立目录并登录：
+
+```bash
+CLAUDE_CONFIG_DIR=$HOME/.claude-accounts/work claude auth login
+CLAUDE_CONFIG_DIR=$HOME/.claude-accounts/work claude auth status --text
+```
+
+加入 `config.json`：
+
+```json
+{
+  "claude": {
+    "defaultAccount": "main",
+    "accounts": [
+      {
+        "name": "main",
+        "claudeConfigDir": ""
+      },
+      {
+        "name": "work",
+        "claudeConfigDir": "~/.claude-accounts/work"
+      }
+    ]
+  }
+}
+```
+
+微信里查看和切换：
+
+```text
+/claude-accounts
+/claude
+/claude 2
+/claude work
+/claude next
+/claude prev
+```
+
+`/claude <编号或名称>` 支持编号、完整名称、唯一前缀。切换账号时会清空当前 `claudeSessionId`，避免不同 Claude 登录配置之间错误 resume。
+
 ## 模型和 Reasoning 切换
 
 微信里发送：
@@ -326,7 +447,7 @@ CODEX_HOME=$HOME/.codex-accounts/backup codex login status
 /models
 ```
 
-服务会按模型分组显示可切换项，适合在微信中阅读：
+服务会按当前 Agent 的模型分组显示可切换项，适合在微信中阅读。Codex 使用 `reasoningEffort`，Claude 使用 `effort`。
 
 ```text
 可切换模型（发送 /model 编号 切换）：
@@ -354,6 +475,7 @@ gpt-5.4-mini
 ```text
 /model 3
 /model gpt-5.5:high
+/model sonnet:high
 ```
 
 切换成功后会回复：
@@ -361,6 +483,13 @@ gpt-5.4-mini
 ```text
 已经切换到 gpt-5.5:high 模型
 已重置当前 Codex thread。
+```
+
+如果当前 Agent 是 Claude，切换成功后会回复：
+
+```text
+已经切换到 sonnet:high 模型
+已重置当前 Claude session。
 ```
 
 默认内置模型列表：
@@ -413,9 +542,30 @@ codex-auto-review:xhigh
 }
 ```
 
+Claude 的固定可选项配置在 `claude.modelOptions`：
+
+```json
+{
+  "claude": {
+    "modelOptions": [
+      {
+        "model": "sonnet",
+        "effort": "medium",
+        "label": "Claude Sonnet medium"
+      },
+      {
+        "model": "sonnet",
+        "effort": "high",
+        "label": "Claude Sonnet high"
+      }
+    ]
+  }
+}
+```
+
 ## 媒体发送协议
 
-Codex 最终回复里可以包含这些标记，服务会发送对应本地文件，并从文本回复里移除标记：
+CLI 最终回复里可以包含这些标记，服务会发送对应本地文件，并从文本回复里移除标记：
 
 ```text
 [[send_image:/absolute/path/to/image.png]]
@@ -501,7 +651,7 @@ python3 -m wechat_codex_multi media-generate image "生成一张产品海报"
 说明：
 
 - 脚本不会覆盖已有 `config.json`。
-- 脚本不会自动安装 Codex CLI；如果 `codex login status` 失败，会提示先运行 `codex login`。
+- 脚本不会自动安装 Codex CLI 或 Claude Code CLI；如果 `codex login status` 失败，会提示先运行 `codex login`。需要 Claude 时请先确认 `claude auth status --text` 正常。
 - 运行时切换 `exec` / `app-server` 可用微信命令 `/runner`；重启后仍以 `config.json` 为准。
 
 查看服务：
@@ -600,8 +750,9 @@ launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
 注意：
 
 - `KeepAlive=true` 表示进程退出后会自动重启；临时停服务要先 `bootout`。
-- `PATH` 要包含 `codex` 所在目录。Apple Silicon Homebrew 通常是 `/opt/homebrew/bin`，Intel Mac Homebrew 通常是 `/usr/local/bin`。
+- `PATH` 要包含 `codex` 和 `claude` 所在目录。Apple Silicon Homebrew 通常是 `/opt/homebrew/bin`，Intel Mac Homebrew 通常是 `/usr/local/bin`。
 - 如果 Codex 使用多个 `CODEX_HOME`，确保这些目录都已经单独 `codex login`。
+- 如果 Claude 使用多个 `CLAUDE_CONFIG_DIR`，确保这些目录都已经单独 `claude auth login`。
 - `/login` 会在运行服务的终端输出二维码。使用 `launchd` 后看不到交互终端，建议先手动运行 `python3 -m wechat_codex_multi add-account`。
 
 ## 开发和验证
@@ -633,7 +784,7 @@ python3 -m wechat_codex_multi media-generate image "测试图片"
 accountId:userId
 ```
 
-同一个微信用户在不同 Bot 账号里聊天，会进入不同 Codex thread。
+同一个微信用户在不同 Bot 账号里聊天，会进入不同工作区会话。
 
 项目工作区会把会话 key 扩展为：
 
@@ -643,21 +794,23 @@ accountId:userId:workspaceName
 
 `default` 工作区继续使用基础会话 key，兼容原有会话。`/ws run <名称> <任务>` 会直接使用指定工作区的 key，因此同一个微信用户可以同时让不同项目工作区并发执行。
 
-当同一个工作区有任务正在运行时，新的普通消息会立即收到“上一条消息还在处理中”的提示，不会继续排队卡住。`/status`、`/usage`、`/codex-accounts`、`/codex`、`/model`、`/models`、`/accounts`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/reset` 可取消当前工作区正在运行的 Codex 并重置会话，`/ws reset <名称>` 可取消指定工作区。
+当同一个工作区有任务正在运行时，新的普通消息会立即作为补充引导处理。`/status`、`/usage`、`/agents`、`/agent`、`/codex-accounts`、`/codex`、`/claude-accounts`、`/claude`、`/model`、`/models`、`/accounts`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/reset` 可取消当前工作区正在运行的任务并重置会话，`/ws reset <名称>` 可取消指定工作区。
 
-超时、服务停止或 `/reset` 取消时，服务会清理 Codex 进程组，避免残留进程继续占用会话。
+超时、服务停止或 `/reset` 取消时，服务会清理当前 CLI 进程组，避免残留进程继续占用会话。
 
-每次任务都会启动一个 `codex exec` 子进程。任务完成、失败、超时或被取消后，服务会从运行表中移除该进程；正常完成的进程会自动释放，不需要手动清理。
+`codex exec` 和 Claude headless runner 每次任务都会启动一个子进程。任务完成、失败、超时或被取消后，服务会从运行表中移除该进程；正常完成的进程会自动释放，不需要手动清理。Codex `app-server` runner 会维护对应的后台 app-server 进程。
 
 ## 常见问题
 
 ### `/models` 显示哪些模型？
 
-如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。查询会使用默认 Codex 账号的 `CODEX_HOME`，超时时间由 `codex.modelDiscoveryTimeoutSeconds` 控制，默认 30 秒；如果查询超时，会回退到内置模型列表。需要固定可选范围时，配置 `codex.modelOptions`；配置后不会再实时查询。
+当前 Agent 是 Codex 时，如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。查询会使用默认 Codex 账号的 `CODEX_HOME`，超时时间由 `codex.modelDiscoveryTimeoutSeconds` 控制，默认 30 秒；如果查询超时，会回退到内置模型列表。
 
-### `/model 1` 切换后为什么要重置 thread？
+当前 Agent 是 Claude 时，`/models` 使用 `claude.modelOptions`；为空时使用内置 Claude 默认选项。
 
-Codex thread 和模型、reasoning、账号登录态有关。切换模型后清空当前 `codexThreadId`，下一次请求会用新模型启动新 thread，避免旧上下文混用。
+### `/model 1` 切换后为什么要重置会话？
+
+CLI 会话和模型、effort/reasoning、账号登录态有关。切换模型后会清空当前 Agent 的 `codexThreadId` 或 `claudeSessionId`，下一次请求会用新模型启动新会话，避免旧上下文混用。
 
 ### `/login` 看不到二维码怎么办？
 
@@ -683,4 +836,4 @@ launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
 
 ### 为什么普通消息会提示“上一条消息还在处理中”？
 
-这是为了保护同一会话的 Codex thread 不被并发写入。命令类消息走独立 worker，通常仍可立即响应。
+这是为了保护同一工作区的 CLI 会话不被并发写入。命令类消息走独立 worker，通常仍可立即响应。

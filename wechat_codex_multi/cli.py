@@ -66,7 +66,7 @@ def main(argv=None):
     p = sub.add_parser("add-account", help="扫码新增一个微信 Bot 账号")
     p.set_defaults(func=add_account)
 
-    p = sub.add_parser("start", help="启动多账号微信 Codex 服务")
+    p = sub.add_parser("start", help="启动多账号微信 CLI Agent 服务")
     p.set_defaults(func=start)
 
     p = sub.add_parser("status", help="查看本地状态")

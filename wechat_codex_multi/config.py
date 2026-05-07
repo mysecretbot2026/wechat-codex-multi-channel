@@ -33,6 +33,23 @@ DEFAULT_CONFIG = {
         ],
         "extraPrompt": "",
     },
+    "claude": {
+        "bin": "claude",
+        "workingDirectory": "",
+        "model": "sonnet",
+        "effort": "",
+        "modelOptions": [],
+        "timeoutMs": 7200_000,
+        "permissionMode": "bypassPermissions",
+        "defaultAccount": "main",
+        "accounts": [
+            {
+                "name": "main",
+                "claudeConfigDir": "",
+            }
+        ],
+        "extraPrompt": "",
+    },
     "concurrency": {
         "maxWorkers": 4,
         "commandWorkers": 2,
@@ -69,6 +86,8 @@ def deep_merge(base, override):
 
 
 def load_config(path=None):
+    from .agents import default_agent
+    from .claude_accounts import normalize_claude_accounts
     from .codex_accounts import normalize_codex_accounts
 
     config_file = Path(path or os.environ.get("WECHAT_CODEX_MULTI_CONFIG") or DEFAULT_CONFIG_FILE)
@@ -77,7 +96,11 @@ def load_config(path=None):
         loaded = json.loads(config_file.read_text(encoding="utf-8"))
     config = deep_merge(DEFAULT_CONFIG, loaded)
     config["configFile"] = str(config_file)
+    config["defaultAgent"] = default_agent(config)
     config["stateDir"] = expand_path(config["stateDir"])
     config["codex"]["workingDirectory"] = expand_path(config["codex"]["workingDirectory"])
+    if config.get("claude", {}).get("workingDirectory"):
+        config["claude"]["workingDirectory"] = expand_path(config["claude"]["workingDirectory"])
     normalize_codex_accounts(config)
+    normalize_claude_accounts(config)
     return config

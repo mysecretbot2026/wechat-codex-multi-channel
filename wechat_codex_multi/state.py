@@ -183,17 +183,30 @@ class StateStore:
             result = [dict(item, name=name) for name, item in items.items()]
             return sorted(result, key=lambda item: (item.get("createdAt") or 0, item.get("name") or ""))
 
-    def get_session(self, conversation_key, default_cwd, default_codex_account=""):
+    def get_session(self, conversation_key, default_cwd, default_codex_account="", default_agent="codex"):
         with self.lock:
             sessions = self.state["sessions"]
             if conversation_key not in sessions:
                 sessions[conversation_key] = {
                     "cwd": default_cwd,
+                    "agent": default_agent or "codex",
                     "codexThreadId": "",
                     "codexAccount": default_codex_account,
+                    "claudeSessionId": "",
                     "lastActive": int(time.time() * 1000),
                 }
                 self.save(debounce=True)
+            else:
+                session = sessions[conversation_key]
+                changed = False
+                if "agent" not in session:
+                    session["agent"] = default_agent or "codex"
+                    changed = True
+                if "claudeSessionId" not in session:
+                    session["claudeSessionId"] = ""
+                    changed = True
+                if changed:
+                    self.save(debounce=True)
             return dict(sessions[conversation_key])
 
     def update_session(self, conversation_key, **updates):
@@ -207,12 +220,28 @@ class StateStore:
             self.save(debounce=True)
             return True
 
-    def reset_session(self, conversation_key):
+    def reset_session(self, conversation_key, agent="codex"):
         with self.lock:
             session = self.state["sessions"].setdefault(conversation_key, {})
-            if session.get("codexThreadId") == "":
+            target = str(agent or "codex").strip().lower()
+            if target == "claude":
+                key = "claudeSessionId"
+            elif target == "all":
+                changed = False
+                for key in ("codexThreadId", "claudeSessionId"):
+                    if session.get(key):
+                        session[key] = ""
+                        changed = True
+                if not changed:
+                    return False
+                session["lastActive"] = int(time.time() * 1000)
+                self.save()
+                return True
+            else:
+                key = "codexThreadId"
+            if session.get(key) == "":
                 return False
-            session["codexThreadId"] = ""
+            session[key] = ""
             session["lastActive"] = int(time.time() * 1000)
             self.save()
             return True

@@ -146,6 +146,16 @@ else
   log "codex command not found. Install and login Codex CLI before starting real traffic."
 fi
 
+if command -v claude >/dev/null 2>&1; then
+  if claude auth status --text >/dev/null 2>&1; then
+    log "Claude Code CLI login looks available"
+  else
+    log "Claude Code CLI exists, but auth status failed. Run: claude auth login"
+  fi
+else
+  log "claude command not found. Install and login Claude Code CLI before using /agent claude."
+fi
+
 account_count="$("$VENV_PYTHON" - "$CONFIG_FILE" <<'PY'
 import contextlib
 import io
