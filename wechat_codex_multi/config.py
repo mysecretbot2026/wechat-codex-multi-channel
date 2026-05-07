@@ -40,6 +40,7 @@ DEFAULT_CONFIG = {
         "effort": "",
         "modelOptions": [],
         "timeoutMs": 7200_000,
+        "usageTimeoutSeconds": 2,
         "permissionMode": "bypassPermissions",
         "defaultAccount": "main",
         "accounts": [

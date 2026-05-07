@@ -13,7 +13,7 @@
 - 支持 `/claude` 在多个 `CLAUDE_CONFIG_DIR` 登录配置之间切换。
 - 支持 `/models` 查看模型列表，`/model <编号|model:reasoning>` 切换模型。
 - 支持 `/cwd` 为当前工作区切换 CLI 工作目录，支持 `/ws` 管理同一微信用户下的多个项目工作区。
-- 支持 `/usage` 查看 Codex 5 小时窗口和周窗口用量。
+- 支持 `/usage` 查看当前 Agent 用量，`/usage all` 汇总 Codex 与 Claude 配置账号。
 - 支持文本、图片、文件、视频收发；入站媒体会下载到本地后把路径交给当前 Agent。
 - 支持 CLI 回复媒体发送标记，把本地图片、文件、视频发回微信。
 - 支持可配置的图片/视频生成器，以及 Codex 原生 `image_generation_end` 事件转微信图片。
@@ -141,6 +141,7 @@ cp config.example.json config.json
     "effort": "",
     "modelOptions": [],
     "timeoutMs": 7200000,
+    "usageTimeoutSeconds": 2,
     "permissionMode": "bypassPermissions",
     "defaultAccount": "main",
     "accounts": [
@@ -196,6 +197,7 @@ cp config.example.json config.json
 - `claude.effort`：默认 effort level，非空时传给 `claude --effort`。Claude Code 2.1.119 支持 `low`、`medium`、`high`、`xhigh`、`max`。
 - `claude.modelOptions`：固定 `/models` 在 Claude Agent 下展示的模型选项；为空时使用内置默认列表。
 - `claude.timeoutMs`：单次 Claude 执行超时，默认 2 小时。
+- `claude.usageTimeoutSeconds`：Claude `/usage` 订阅状态 best-effort 读取超时，默认 2 秒；模型 token 统计仍会从本地缓存读取。
 - `claude.permissionMode`：传给 `claude --permission-mode`，默认 `bypassPermissions`。
 - `claude.defaultAccount`：默认 Claude 账号名。
 - `claude.accounts`：多个 Claude 登录配置。`claudeConfigDir` 为空表示使用 Claude Code 默认登录态；非空时作为独立 `CLAUDE_CONFIG_DIR`。
@@ -218,7 +220,12 @@ cp config.example.json config.json
 | --- | --- |
 | `/help` | 查看帮助 |
 | `/status` | 查看当前工作区、Agent、账号、模型、工作目录和 Bot 连接状态 |
-| `/usage` | 查看 Codex 5 小时窗口和周窗口限额 |
+| `/usage` | 查看当前 Agent 当前账号用量 |
+| `/usage all` | 查看配置里所有 Codex 和 Claude 账号的用量 |
+| `/usage codex` | 查看当前工作区 Codex 账号用量 |
+| `/usage claude` | 查看当前工作区 Claude 账号用量 |
+| `/usage codex all` | 查看所有 Codex 账号用量 |
+| `/usage claude all` | 查看所有 Claude 账号用量 |
 | `/accounts` | 查看已连接的微信 Bot 账号 |
 | `/agents` | 查看可用 Agent |
 | `/agent` | 查看当前工作区使用的 Agent |
@@ -242,6 +249,7 @@ cp config.example.json config.json
 | `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和当前 Agent session |
 | `/ws add <名称> <路径>` | 添加项目工作区 |
 | `/ws use <名称>` | 切换当前工作区；之后普通消息会进入该工作区 |
+| `/ws agent <名称> <codex|claude>` | 设置指定工作区使用的 Agent |
 | `/ws run <名称> <任务>` | 不切换当前工作区，直接在指定工作区派发当前 Agent 任务 |
 | `/ws reset <名称>` | 取消运行中的任务并重置指定工作区当前 Agent 会话 |
 | `/reset` | 重置当前工作区当前 Agent 会话；如果任务正在运行，会先取消进程 |
@@ -256,6 +264,8 @@ cp config.example.json config.json
 ```text
 /status
 /usage
+/usage all
+/usage claude
 
 /agents
 /agent claude
@@ -283,6 +293,7 @@ cp config.example.json config.json
 
 /ws add a /path/to/project-a
 /ws add b /path/to/project-b
+/ws agent a claude
 /ws
 /ws run a 帮我改 README
 /ws run b 跑测试并修 bug
@@ -311,6 +322,21 @@ claude -p --verbose --output-format stream-json --model sonnet --effort low --pe
 当前已在 Claude Code 2.1.119 上验证：`stream-json` 必须搭配 `--verbose`；输出事件中的 `system`、`assistant`、`result` 都带 `session_id`，服务会把它保存为 `claudeSessionId` 并在下一轮用 `--resume <session_id>` 续会话。
 
 Claude Code 暂只支持 `exec/headless` 方式。运行中补充消息会进入服务层队列，当前任务结束后继续处理；不像 Codex `app-server` runner 那样支持原生 `turn/steer`。
+
+### 通用用量命令
+
+`/usage` 会根据当前工作区 Agent 自动分发。当前是 Codex 时读取 Codex 限额；当前是 Claude 时调用 Claude Code 的 headless `/usage` 并补充本地 `stats-cache.json` 模型 token 统计。
+
+```text
+/usage
+/usage all
+/usage codex
+/usage claude
+/usage codex all
+/usage claude all
+```
+
+Claude Code 2.1.119 的 `/usage` 只返回订阅状态文本，不返回 Codex 那种 5 小时/周窗口百分比；在 Python 子进程里这个命令有时不会及时关闭管道，所以服务只做短超时 best-effort 读取。模型 token、会话数和消息数主要来自 Claude 本地 `stats-cache.json`；如果缓存不存在，会明确提示无缓存。
 
 ### 运行中引导和中断
 

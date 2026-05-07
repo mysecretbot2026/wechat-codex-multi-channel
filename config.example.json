@@ -40,6 +40,7 @@
     "effort": "",
     "modelOptions": [],
     "timeoutMs": 7200000,
+    "usageTimeoutSeconds": 2,
     "permissionMode": "bypassPermissions",
     "defaultAccount": "main",
     "accounts": [
