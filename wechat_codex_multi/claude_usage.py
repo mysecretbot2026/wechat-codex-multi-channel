@@ -1,127 +1,109 @@
 import json
 import os
-import select
 import shutil
 import subprocess
-import time
 from pathlib import Path
 
 
 def read_claude_usage(claude_bin="claude", timeout_s=2, claude_config_dir="", permission_mode=""):
     stats = _read_claude_stats_cache(claude_config_dir)
-    try:
-        subscription = _read_claude_subscription_usage(
-            claude_bin=claude_bin,
-            timeout_s=timeout_s,
-            claude_config_dir=claude_config_dir,
-            permission_mode=permission_mode,
-        )
-    except Exception as err:
-        subscription = {"text": "", "error": str(err)}
+    auth = read_claude_auth_status(
+        claude_bin=claude_bin,
+        timeout_s=timeout_s,
+        claude_config_dir=claude_config_dir,
+    )
+    subscription = {"text": auth.get("text") or ""}
+    if auth.get("error"):
+        subscription["error"] = auth.get("error")
     return {
+        "auth": auth,
         "subscription": subscription,
         "stats": stats,
     }
 
 
-def _read_claude_subscription_usage(claude_bin="claude", timeout_s=15, claude_config_dir="", permission_mode=""):
+def read_claude_auth_status(claude_bin="claude", timeout_s=5, claude_config_dir=""):
     binary = shutil.which(claude_bin) or claude_bin
+    env = _claude_env(claude_config_dir)
+    data = {}
+    text = ""
+    try:
+        raw = _run_claude_auth_status(binary, env, timeout_s, as_text=False)
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception as err:
+        data = {"error": str(err)}
+    try:
+        text = _run_claude_auth_status(binary, env, timeout_s, as_text=True).strip()
+    except Exception as err:
+        if not data.get("error"):
+            data["error"] = str(err)
+    parsed = _parse_auth_status_text(text)
+    result = {
+        "loggedIn": bool(data.get("loggedIn") or parsed.get("loggedIn")),
+        "authMethod": data.get("authMethod") or parsed.get("authMethod") or "",
+        "apiProvider": data.get("apiProvider") or "",
+        "apiKeySource": data.get("apiKeySource") or "",
+        "email": data.get("email") or parsed.get("email") or "",
+        "orgId": data.get("orgId") or "",
+        "orgName": data.get("orgName") or parsed.get("orgName") or "",
+        "subscriptionType": data.get("subscriptionType") or "",
+        "text": text,
+    }
+    if data.get("error"):
+        result["error"] = data.get("error")
+    return result
+
+
+def _run_claude_auth_status(binary, env, timeout_s, as_text=False):
+    args = [binary, "auth", "status"]
+    if as_text:
+        args.append("--text")
+    process = subprocess.run(
+        args,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout_s,
+        check=False,
+    )
+    output = (process.stdout or "").strip()
+    error = (process.stderr or "").strip()
+    if process.returncode != 0 and not output:
+        raise RuntimeError(error or f"claude auth status 退出码 {process.returncode}")
+    return output or error
+
+
+def _parse_auth_status_text(text):
+    result = {}
+    value = str(text or "").strip()
+    if not value:
+        return result
+    lowered = value.lower()
+    if "not logged in" in lowered:
+        result["loggedIn"] = False
+    for line in value.splitlines():
+        key, sep, raw = line.partition(":")
+        if not sep:
+            continue
+        field = key.strip().lower()
+        item = raw.strip()
+        if field == "email":
+            result["email"] = item
+            result["loggedIn"] = True
+        elif field == "organization":
+            result["orgName"] = item
+        elif field == "login method":
+            result["authMethod"] = item
+            result["loggedIn"] = True
+    return result
+
+
+def _claude_env(claude_config_dir=""):
     env = os.environ.copy()
     if claude_config_dir:
         env["CLAUDE_CONFIG_DIR"] = str(Path(os.path.expandvars(os.path.expanduser(str(claude_config_dir)))).resolve())
-    args = [binary, "-p", "--verbose", "--output-format", "stream-json"]
-    if permission_mode:
-        args.extend(["--permission-mode", str(permission_mode)])
-    args.append("/usage")
-    process = subprocess.Popen(
-        args,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    text = ""
-    is_error = False
-    stderr_chunks = []
-    stdout_buffer = ""
-    stderr_buffer = ""
-    deadline = time.time() + timeout_s
-    timed_out = False
-
-    def handle_stdout_line(line):
-        nonlocal text, is_error
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            return None
-        if event.get("type") == "result":
-            if event.get("is_error"):
-                is_error = True
-            result = event.get("result")
-            if isinstance(result, str) and result.strip():
-                text = result.strip()
-            if is_error:
-                raise RuntimeError(text or "claude /usage 返回错误")
-            return {"text": text or "Claude 没有返回用量信息"}
-        if event.get("type") == "assistant" and not text:
-            text = _assistant_text(event.get("message") or {})
-        return None
-
-    try:
-        while time.time() < deadline:
-            streams = [s for s in (process.stdout, process.stderr) if s is not None]
-            readable, _, _ = select.select(streams, [], [], 0.5)
-            for stream in readable:
-                chunk = os.read(stream.fileno(), 65536)
-                if not chunk:
-                    continue
-                if stream is process.stderr:
-                    stderr_buffer += chunk.decode("utf-8", errors="replace")
-                    while "\n" in stderr_buffer:
-                        line, stderr_buffer = stderr_buffer.split("\n", 1)
-                        stderr_chunks.append(line)
-                    continue
-                stdout_buffer += chunk.decode("utf-8", errors="replace")
-                while "\n" in stdout_buffer:
-                    line, stdout_buffer = stdout_buffer.split("\n", 1)
-                    result = handle_stdout_line(line)
-                    if result:
-                        return result
-            if process.poll() is not None:
-                break
-        if stdout_buffer.strip():
-            result = handle_stdout_line(stdout_buffer.strip())
-            if result:
-                return result
-    finally:
-        if process.poll() is None:
-            timed_out = True
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-    return_code = process.poll()
-    if timed_out:
-        raise TimeoutError(f"Claude /usage 未在 {timeout_s} 秒内返回完整结果")
-    if is_error:
-        raise RuntimeError(text or "".join(stderr_chunks).strip() or "claude /usage 返回错误")
-    if return_code not in (0, None):
-        raise RuntimeError(text or "".join(stderr_chunks).strip() or f"claude /usage 退出码 {return_code}")
-    if text:
-        return {"text": text}
-    raise TimeoutError("Claude 没有返回用量信息")
-
-
-def _assistant_text(message):
-    content = message.get("content")
-    if not isinstance(content, list):
-        return ""
-    parts = []
-    for item in content:
-        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str):
-            parts.append(item["text"])
-    return "".join(parts).strip()
+    return env
 
 
 def _read_claude_stats_cache(claude_config_dir=""):
@@ -179,8 +161,23 @@ def _append_claude_usage_lines(lines, usage, account):
         lines.append(f"登录配置：{config_dir}")
     else:
         lines.append("登录配置：默认 Claude Code 登录态")
+    auth = (usage or {}).get("auth") or {}
+    if auth:
+        lines.append(f"登录状态：{'已登录' if auth.get('loggedIn') else '未登录'}")
+        if auth.get("email"):
+            lines.append(f"邮箱：{auth.get('email')}")
+        if auth.get("orgName"):
+            lines.append(f"组织：{auth.get('orgName')}")
+        if auth.get("authMethod"):
+            lines.append(f"认证方式：{auth.get('authMethod')}")
+        if auth.get("apiProvider"):
+            lines.append(f"API Provider：{auth.get('apiProvider')}")
+        if auth.get("apiKeySource"):
+            lines.append(f"API Key 来源：{auth.get('apiKeySource')}")
+        if auth.get("error"):
+            lines.append(f"登录状态读取失败：{auth.get('error')}")
     subscription = (usage or {}).get("subscription") or {}
-    if subscription.get("text"):
+    if subscription.get("text") and not auth:
         lines.append(f"订阅状态：{subscription.get('text')}")
     if subscription.get("error"):
         lines.append(f"订阅状态读取失败：{subscription.get('error')}")

@@ -187,15 +187,17 @@ class CodexCliRunner:
             process = self.process_by_conversation.get(conversation_key)
         return bool(process and process.poll() is None)
 
-    def cancel(self, conversation_key):
+    def cancel(self, conversation_key, reset_session=True):
         with self.processes_lock:
             process = self.process_by_conversation.get(conversation_key)
             self.cancelled_conversations.add(conversation_key)
         if process and process.poll() is None:
             self._terminate_process(process)
-            self.state.reset_session(conversation_key)
+            if reset_session:
+                self.state.reset_session(conversation_key)
             return True
-        self.state.reset_session(conversation_key)
+        if reset_session:
+            self.state.reset_session(conversation_key)
         return False
 
     def _consume_cancelled(self, conversation_key):

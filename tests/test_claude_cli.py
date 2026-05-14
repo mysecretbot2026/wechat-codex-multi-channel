@@ -111,6 +111,21 @@ class ClaudeCliRunnerTests(unittest.TestCase):
             killpg.assert_called_once_with(12345, signal.SIGTERM)
             self.assertEqual(state.reset_calls, [("conversation-1", "claude")])
 
+    def test_cancel_can_preserve_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = FakeState(tmp)
+            runner = ClaudeCliRunner(
+                {
+                    "codex": {"workingDirectory": tmp},
+                    "claude": {"bin": "claude", "timeoutMs": 1000},
+                    "media": {"generators": []},
+                },
+                state,
+            )
+
+            self.assertFalse(runner.cancel("conversation-1", reset_session=False))
+            self.assertEqual(state.reset_calls, [])
+
     def test_cancelled_run_raises_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {

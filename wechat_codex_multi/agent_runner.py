@@ -78,11 +78,11 @@ class AgentRunnerManager:
     def is_running(self, conversation_key):
         return any(runner.is_running(conversation_key) for runner in self.runners.values())
 
-    def cancel(self, conversation_key):
+    def cancel(self, conversation_key, reset_session=True):
         for runner in list(self.runners.values()):
             if runner.is_running(conversation_key):
-                return runner.cancel(conversation_key)
-        return self.runner_for(self._session_agent(conversation_key)).cancel(conversation_key)
+                return runner.cancel(conversation_key, reset_session=reset_session)
+        return self.runner_for(self._session_agent(conversation_key)).cancel(conversation_key, reset_session=reset_session)
 
     def terminate_all(self):
         for runner in list(self.runners.values()):

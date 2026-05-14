@@ -24,7 +24,7 @@ from .claude_models import (
     format_claude_model_option,
     resolve_session_claude_model,
 )
-from .claude_usage import format_claude_usage, format_claude_usage_all, read_claude_usage
+from .claude_usage import format_claude_usage, format_claude_usage_all, read_claude_auth_status, read_claude_usage
 from .codex_app_server import CodexAppServerRunner
 from .codex_accounts import (
     adjacent_codex_account,
@@ -185,19 +185,19 @@ class MultiWechatCodexService:
                     agent = resolve_session_agent(self.config, self._get_session(conversation_key))
                     agent_label = self._agent_label(agent)
                     if text.strip() == "/reset":
-                        killed = self.codex.cancel(conversation_key)
+                        killed = self._cancel_runner(conversation_key, reset_session=True)
                         self._clear_pending_guidance(conversation_key)
                         message = f"已取消正在运行的 {agent_label} 并重置当前工作区。" if killed else "已重置当前工作区。"
                         self._send_text(account, user_id, message)
                         return
                     if interrupt_action:
                         self._clear_pending_guidance(conversation_key)
-                        killed = self.codex.cancel(conversation_key)
+                        killed = self._cancel_runner(conversation_key, reset_session=False)
                         if interrupt_text:
-                            self._send_text(account, user_id, f"已中断当前 {agent_label} 任务，稍后按新任务继续。")
+                            self._send_text(account, user_id, f"已中断当前 {agent_label} 任务，保留当前会话，稍后按新任务继续。")
                             self._schedule_after_lock(account, user_id, base_conversation_key, conversation_key, interrupt_text)
                         else:
-                            message = f"已中断当前 {agent_label} 任务并重置当前工作区。" if killed else f"当前没有运行中的 {agent_label} 任务，已重置当前工作区。"
+                            message = f"已中断当前 {agent_label} 任务，已保留当前会话。" if killed else f"当前没有运行中的 {agent_label} 任务，当前会话保持不变。"
                             self._send_text(account, user_id, message)
                         return
                     if self._is_command(text) and not self._is_workspace_run_command(text):
@@ -285,6 +285,7 @@ class MultiWechatCodexService:
             "/usage",
             "/agents",
             "/agent",
+            "/account",
             "/codex-accounts",
             "/codex",
             "/claude-accounts",
@@ -341,6 +342,27 @@ class MultiWechatCodexService:
                         f"claudeSessionId: {(session.get('claudeSessionId') or '')[:12]}",
                     ]
                 )
+                try:
+                    auth = read_claude_auth_status(
+                        self.config.get("claude", {}).get("bin") or "claude",
+                        timeout_s=int(self.config.get("claude", {}).get("usageTimeoutSeconds") or 2),
+                        claude_config_dir=claude_account.get("claudeConfigDir") or "",
+                    )
+                    lines.append(f"claudeLogin: {'logged in' if auth.get('loggedIn') else 'not logged in'}")
+                    if auth.get("email"):
+                        lines.append(f"claudeEmail: {auth.get('email')}")
+                    if auth.get("orgName"):
+                        lines.append(f"claudeOrg: {auth.get('orgName')}")
+                    if auth.get("authMethod"):
+                        lines.append(f"claudeAuthMethod: {auth.get('authMethod')}")
+                    if auth.get("apiProvider"):
+                        lines.append(f"claudeApiProvider: {auth.get('apiProvider')}")
+                    if auth.get("apiKeySource"):
+                        lines.append(f"claudeApiKeySource: {auth.get('apiKeySource')}")
+                    if auth.get("error"):
+                        lines.append(f"claudeAuthError: {auth.get('error')}")
+                except Exception as err:
+                    lines.append(f"claudeAuthError: {err}")
             else:
                 lines.extend(
                     [
@@ -366,6 +388,10 @@ class MultiWechatCodexService:
         if command == "/agent" or command.startswith("/agent "):
             selector = command[len("/agent"):].strip()
             self._handle_agent_switch(account, user_id, conversation_key, selector)
+            return
+        if command == "/account" or command.startswith("/account "):
+            selector = command[len("/account"):].strip()
+            self._handle_current_agent_account_switch(account, user_id, conversation_key, selector)
             return
         if command == "/codex-accounts":
             current = resolve_session_codex_account(self.config, self._get_session(conversation_key)).get("name")
@@ -444,12 +470,12 @@ class MultiWechatCodexService:
             self._clear_pending_guidance(conversation_key)
             agent = resolve_session_agent(self.config, self._get_session(conversation_key))
             agent_label = self._agent_label(agent)
-            killed = self.codex.cancel(conversation_key)
+            killed = self._cancel_runner(conversation_key, reset_session=False)
             if interrupt_text:
-                self._send_text(account, user_id, "已重置当前工作区，开始处理新任务。")
+                self._send_text(account, user_id, "已中断当前工作区，保留当前会话，开始处理新任务。")
                 self._run_codex_and_reply(account, user_id, conversation_key, interrupt_text)
             else:
-                message = f"已中断当前 {agent_label} 任务并重置当前工作区。" if killed else "已重置当前工作区。"
+                message = f"已中断当前 {agent_label} 任务，已保留当前会话。" if killed else "当前没有运行中的任务，当前会话保持不变。"
                 self._send_text(account, user_id, message)
             return
         if command == "/reset":
@@ -504,6 +530,12 @@ class MultiWechatCodexService:
                 transfer_semaphore=self.media_semaphore,
             )
             log.info(f"sent media conversation={conversation_key} count={len(sent)}")
+
+    def _cancel_runner(self, conversation_key, reset_session=True):
+        try:
+            return self.codex.cancel(conversation_key, reset_session=reset_session)
+        except TypeError:
+            return self.codex.cancel(conversation_key)
 
     @staticmethod
     def _parse_interrupt_command(text):
@@ -880,7 +912,7 @@ class MultiWechatCodexService:
                 self._send_text(account, user_id, f"未知工作区: {name}")
                 return
             workspace_key = self._workspace_key(base_conversation_key, name)
-            killed = self.codex.cancel(workspace_key)
+            killed = self._cancel_runner(workspace_key, reset_session=True)
             self._clear_pending_guidance(workspace_key)
             agent = resolve_session_agent(self.config, self._get_session(workspace_key))
             message = f"已取消正在运行的 {self._agent_label(agent)} 并重置该工作区。" if killed else "已重置该工作区。"
@@ -940,20 +972,36 @@ class MultiWechatCodexService:
             f"已切换 Agent: {target}\nCodex 和 Claude 会话彼此独立，不会共享上下文。",
         )
 
+    def _handle_current_agent_account_switch(self, account, user_id, conversation_key, selector):
+        session = self._get_session(conversation_key)
+        agent = resolve_session_agent(self.config, session)
+        if agent == "claude":
+            self._handle_claude_switch(account, user_id, conversation_key, selector)
+            return
+        self._handle_codex_switch(account, user_id, conversation_key, selector)
+
     def _handle_codex_switch(self, account, user_id, conversation_key, selector):
         session = self._get_session(conversation_key)
+        current_agent = resolve_session_agent(self.config, session)
+        switching_agent = current_agent != "codex"
+        if switching_agent and self.codex.is_running(conversation_key):
+            self._send_text(account, user_id, "当前工作区有任务运行中，请等待结束或 /interrupt 后再切换 Agent。")
+            return
         current = resolve_session_codex_account(self.config, session)
         if not selector:
+            if switching_agent:
+                self.state.update_session(conversation_key, agent="codex")
             self._send_text(
                 account,
                 user_id,
                 "\n".join(
                     [
+                        "已切换 Agent: codex" if switching_agent else "当前 Agent: codex",
                         f"当前 Codex 账号: {current.get('name')}",
                         f"CODEX_HOME: {current.get('codexHome')}",
                         "",
                         "查看全部：/codex-accounts",
-                        "切换：/codex <编号或名称>",
+                        "切换：/account <编号或名称> 或 /codex <编号或名称>",
                     ]
                 ),
             )
@@ -974,30 +1022,51 @@ class MultiWechatCodexService:
             )
             return
         name = target.get("name")
-        if name == current.get("name"):
+        if name == current.get("name") and not switching_agent:
             self._send_text(account, user_id, f"当前已在使用 Codex 账号: {name}")
             return
-        self.state.update_session(conversation_key, codexAccount=name, codexThreadId="")
+        updates = {"agent": "codex"}
+        account_changed = name != current.get("name")
+        if account_changed:
+            updates.update(codexAccount=name, codexThreadId="")
+        self.state.update_session(conversation_key, **updates)
+        lines = []
+        if switching_agent:
+            lines.append("已切换 Agent: codex")
+        if account_changed:
+            lines.append(f"已切换 Codex 账号: {name}")
+            lines.append(f"CODEX_HOME: {target.get('codexHome')}")
+            lines.append("已重置当前 Codex thread。")
+        else:
+            lines.append(f"当前已在使用 Codex 账号: {name}")
         self._send_text(
             account,
             user_id,
-            f"已切换 Codex 账号: {name}\nCODEX_HOME: {target.get('codexHome')}\n已重置当前 Codex thread。",
+            "\n".join(lines),
         )
 
     def _handle_claude_switch(self, account, user_id, conversation_key, selector):
         session = self._get_session(conversation_key)
+        current_agent = resolve_session_agent(self.config, session)
+        switching_agent = current_agent != "claude"
+        if switching_agent and self.codex.is_running(conversation_key):
+            self._send_text(account, user_id, "当前工作区有任务运行中，请等待结束或 /interrupt 后再切换 Agent。")
+            return
         current = resolve_session_claude_account(self.config, session)
         if not selector:
+            if switching_agent:
+                self.state.update_session(conversation_key, agent="claude")
             self._send_text(
                 account,
                 user_id,
                 "\n".join(
                     [
+                        "已切换 Agent: claude" if switching_agent else "当前 Agent: claude",
                         f"当前 Claude 账号: {current.get('name')}",
                         f"CLAUDE_CONFIG_DIR: {current.get('claudeConfigDir')}",
                         "",
                         "查看全部：/claude-accounts",
-                        "切换：/claude <编号或名称>",
+                        "切换：/account <编号或名称> 或 /claude <编号或名称>",
                     ]
                 ),
             )
@@ -1018,14 +1087,27 @@ class MultiWechatCodexService:
             )
             return
         name = target.get("name")
-        if name == current.get("name"):
+        if name == current.get("name") and not switching_agent:
             self._send_text(account, user_id, f"当前已在使用 Claude 账号: {name}")
             return
-        self.state.update_session(conversation_key, claudeAccount=name, claudeSessionId="")
+        updates = {"agent": "claude"}
+        account_changed = name != current.get("name")
+        if account_changed:
+            updates.update(claudeAccount=name, claudeSessionId="")
+        self.state.update_session(conversation_key, **updates)
+        lines = []
+        if switching_agent:
+            lines.append("已切换 Agent: claude")
+        if account_changed:
+            lines.append(f"已切换 Claude 账号: {name}")
+            lines.append(f"CLAUDE_CONFIG_DIR: {target.get('claudeConfigDir')}")
+            lines.append("已重置当前 Claude session。")
+        else:
+            lines.append(f"当前已在使用 Claude 账号: {name}")
         self._send_text(
             account,
             user_id,
-            f"已切换 Claude 账号: {name}\nCLAUDE_CONFIG_DIR: {target.get('claudeConfigDir')}\n已重置当前 Claude session。",
+            "\n".join(lines),
         )
 
     def _available_model_options(self):
@@ -1292,18 +1374,17 @@ class MultiWechatCodexService:
                 "命令：",
                 "/status 查看当前工作区状态",
                 "/reset 重置当前工作区当前 Agent 会话",
-                "/cancel 或 /interrupt 中断当前任务并重置当前工作区",
-                "/interrupt <新任务> 中断当前任务并改做新任务",
+                "/cancel 或 /interrupt 中断当前任务，保留当前会话",
+                "/interrupt <新任务> 中断当前任务，保留当前会话并改做新任务",
                 "/guide <补充要求> 在任务运行中追加引导；直接发普通消息也会追加",
                 "/usage 查看当前 Agent 用量",
                 "/usage all 查看配置里所有 Codex 和 Claude 账号的用量",
-                "/usage codex 或 /usage claude 查看指定 Agent 当前账号用量",
                 "/agents 查看可用 Agent",
                 "/agent <codex|claude> 切换当前工作区使用的 CLI",
-                "/codex-accounts 查看可用 Codex 账号",
-                "/codex <编号|名称|next> 切换当前工作区使用的 Codex 账号",
-                "/claude-accounts 查看可用 Claude 账号",
-                "/claude <编号|名称|next> 切换当前工作区使用的 Claude 账号",
+                "/account 查看或切换当前 Agent 账号",
+                "/account <编号|名称|next> 切换当前 Agent 账号",
+                "/codex [编号|名称|next] 切到 Codex，可同时切账号",
+                "/claude [编号|名称|next] 切到 Claude，可同时切账号",
                 "/model 查看或切换当前 Agent 的模型和 effort",
                 "/runner 查看或切换 Codex exec/app-server runner",
                 "/cwd <path> 切换当前工作区工作目录",

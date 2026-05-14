@@ -482,7 +482,7 @@ class CodexAppServerRunner:
             log.warn(f"[app-server] steer failed conversation={conversation_key}: {err}")
             return False
 
-    def cancel(self, conversation_key):
+    def cancel(self, conversation_key, reset_session=True):
         default_cwd = self.config["codex"]["workingDirectory"]
         session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))
         codex_account = resolve_session_codex_account(self.config, session)
@@ -499,9 +499,11 @@ class CodexAppServerRunner:
                 killed = True
             except Exception as err:
                 log.warn(f"[app-server] interrupt failed conversation={conversation_key}: {err}")
-        self.state.reset_session(conversation_key)
+        if reset_session:
+            self.state.reset_session(conversation_key)
         with context.lock:
-            context.thread_id = ""
+            if reset_session:
+                context.thread_id = ""
             context.active_turn_id = ""
         context.finish("interrupted", "")
         return killed
