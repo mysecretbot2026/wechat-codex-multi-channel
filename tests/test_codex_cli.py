@@ -88,6 +88,22 @@ class CodexCliRunnerTests(unittest.TestCase):
 
         killpg.assert_called_once_with(12345, signal.SIGTERM)
 
+    def test_cancel_can_preserve_session(self):
+        state = FakeState(str(Path.cwd()))
+        runner = CodexCliRunner(
+            {
+                "codex": {
+                    "bin": "codex",
+                    "workingDirectory": str(Path.cwd()),
+                    "timeoutMs": 1000,
+                }
+            },
+            state,
+        )
+
+        self.assertFalse(runner.cancel("conversation-1", reset_session=False))
+        self.assertEqual(state.reset_keys, [])
+
     def test_cancelled_run_raises_cancelled_without_retrying(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {

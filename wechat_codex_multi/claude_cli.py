@@ -7,82 +7,70 @@ import threading
 from pathlib import Path
 
 from . import logging as log
-from .codex_accounts import default_codex_account, resolve_session_codex_account
-from .codex_models import resolve_session_model
+from .claude_accounts import default_claude_account, resolve_session_claude_account
+from .claude_models import resolve_session_claude_model
+from .codex_cli import CodexCancelled
 
 
-class CodexCancelled(RuntimeError):
-    pass
-
-
-class CodexAccumulator:
-    def __init__(self, thread_id="", codex_home=""):
-        self.thread_id = thread_id or ""
-        self.codex_home = str(Path(codex_home or "~/.codex").expanduser())
-        self.item_order = []
-        self.item_text = {}
+class ClaudeAccumulator:
+    def __init__(self, session_id=""):
+        self.session_id = session_id or ""
         self.messages = []
+        self.final_result = ""
         self.errors = []
 
     def handle(self, event):
         event_type = event.get("type")
-        if event_type == "thread.started":
-            thread_id = event.get("thread_id")
-            if isinstance(thread_id, str) and thread_id:
-                self.thread_id = thread_id
+        session_id = event.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self.session_id = session_id
+        if event_type == "system":
+            session_id = event.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.session_id = session_id
             return
-        if event_type in {"item.started", "item.delta", "item.completed"}:
-            self._handle_item(event_type, event.get("item") or event)
+        if event_type == "assistant":
+            self._handle_assistant(event.get("message") or {})
             return
-        if event_type in {"turn.failed", "error"}:
+        if event_type == "result":
+            self._handle_result(event)
+            return
+        if event_type == "error":
             message = self._extract_error(event)
             if message:
                 self.errors.append(message)
-            return
-        if event_type == "image_generation_end":
-            self._handle_image_generation(event)
 
-    def _handle_item(self, event_type, item):
-        item = item if isinstance(item, dict) else {}
-        item_type = item.get("type") or item.get("item_type") or item.get("itemType")
-        if item_type not in (None, "", "agent_message"):
+    def _handle_assistant(self, message):
+        content = message.get("content")
+        if not isinstance(content, list):
             return
-        item_id = item.get("id") or item.get("item_id") or item.get("itemId")
-        if isinstance(item_id, str) and item_id and item_id not in self.item_order:
-            self.item_order.append(item_id)
-        if event_type == "item.delta":
-            delta = item.get("delta")
-            if isinstance(item_id, str) and isinstance(delta, str):
-                self.item_text[item_id] = self.item_text.get(item_id, "") + delta
-            return
-        text = item.get("text")
-        if isinstance(text, str) and text:
-            if isinstance(item_id, str) and item_id:
-                self.item_text[item_id] = text
-            else:
-                self.messages.append(text)
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "text" and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        text = "".join(parts).strip()
+        if text:
+            self.messages.append(text)
+
+    def _handle_result(self, event):
+        result = event.get("result")
+        if isinstance(result, str) and result.strip():
+            self.final_result = result.strip()
+        if event.get("is_error"):
+            message = self._extract_error(event)
+            if message:
+                self.errors.append(message)
 
     def text(self):
-        parts = []
-        for item_id in self.item_order:
-            value = self.item_text.get(item_id, "").strip()
-            if value:
-                parts.append(value)
-        parts.extend(m.strip() for m in self.messages if isinstance(m, str) and m.strip())
-        return "\n".join(parts).strip()
-
-    def _handle_image_generation(self, event):
-        call_id = event.get("call_id")
-        if not isinstance(call_id, str) or not call_id:
-            return
-        if not self.thread_id:
-            return
-        path = Path(self.codex_home) / "generated_images" / self.thread_id / f"{call_id}.png"
-        self.messages.append(f"[[send_image:{path}]]")
+        if self.final_result:
+            return self.final_result
+        return "\n".join(m.strip() for m in self.messages if isinstance(m, str) and m.strip()).strip()
 
     @staticmethod
     def _extract_error(event):
-        for key in ("message", "error", "stderr"):
+        for key in ("message", "error", "result", "stderr", "api_error_status", "terminal_reason"):
             value = event.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -95,15 +83,16 @@ class CodexAccumulator:
         return json.dumps(event, ensure_ascii=False)
 
 
-class CodexCliRunner:
+class ClaudeCliRunner:
     def __init__(self, config, state_store):
         self.config = config
         self.state = state_store
-        self.timeout_ms = int(config["codex"].get("timeoutMs") or 1200_000)
-        self.model = str(config["codex"].get("model") or "").strip()
-        self.reasoning_effort = str(config["codex"].get("reasoningEffort") or "").strip()
-        self.bin = str(config["codex"].get("bin") or "codex")
-        self.bypass = bool(config["codex"].get("bypassApprovalsAndSandbox", True))
+        claude = config.get("claude") or {}
+        self.timeout_ms = int(claude.get("timeoutMs") or 1200_000)
+        self.model = str(claude.get("model") or "").strip()
+        self.effort = str(claude.get("effort") or "").strip()
+        self.bin = str(claude.get("bin") or "claude")
+        self.permission_mode = str(claude.get("permissionMode") or "").strip()
         self.processes = set()
         self.process_by_conversation = {}
         self.cancelled_conversations = set()
@@ -112,19 +101,34 @@ class CodexCliRunner:
     def _resolve_bin(self):
         return shutil.which(self.bin) or self.bin
 
-    def _base_args(self, cwd, model="", reasoning_effort=""):
-        args = [self._resolve_bin(), "-C", str(cwd)]
-        if self.bypass:
-            args.append("--dangerously-bypass-approvals-and-sandbox")
+    def _default_cwd(self):
+        claude_cwd = (self.config.get("claude") or {}).get("workingDirectory") or ""
+        return claude_cwd or self.config["codex"]["workingDirectory"]
+
+    def _base_args(self, model="", effort="", session_id=""):
+        args = [
+            self._resolve_bin(),
+            "-p",
+            "--verbose",
+            "--output-format",
+            "stream-json",
+        ]
+        if self.permission_mode:
+            args.extend(["--permission-mode", self.permission_mode])
         selected_model = str(model or self.model or "").strip()
-        selected_reasoning = str(reasoning_effort or self.reasoning_effort or "").strip()
+        selected_effort = str(effort or self.effort or "").strip()
         if selected_model:
-            args.extend(["-m", selected_model])
-        if selected_reasoning:
-            args.extend(["-c", f'model_reasoning_effort="{selected_reasoning}"'])
+            args.extend(["--model", selected_model])
+        if selected_effort:
+            args.extend(["--effort", selected_effort])
+        system_prompt = self._system_prompt()
+        if system_prompt:
+            args.extend(["--append-system-prompt", system_prompt])
+        if session_id:
+            args.extend(["--resume", session_id])
         return args
 
-    def _build_prompt(self, user_message, fresh_session, media_generators):
+    def _system_prompt(self):
         instructions = [
             "你通过微信与用户交流。",
             "默认用中文回复，除非用户明确使用其他语言。",
@@ -135,13 +139,14 @@ class CodexCliRunner:
             "发送本地媒体时，在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
             "媒体标记路径必须是真实存在的本地绝对路径。",
             "不要原样输出占位路径，例如 /absolute/path/to/image.png、/Users/bot/.../xxx.png 或 真实绝对路径。",
-            "如果 Codex 生成图片后输出 Saved to: file:///Users/.../image.png，也可以直接保留这个 file:// 路径，微信通道会自动发送。",
+            "如果生成图片后输出 Saved to: file:///Users/.../image.png，也可以直接保留这个 file:// 路径，微信通道会自动发送。",
             "这些标记会被微信通道解析并发送，用户不会看到标记文本。",
             "",
             "如果需要调用可配置媒体生成器，可在 shell 中运行：",
             "python3 -m wechat_codex_multi media-generate <name> <prompt>",
             "命令会输出生成文件路径。然后使用对应 send_image/send_video/send_file 标记发送。",
         ]
+        media_generators = self.config.get("media", {}).get("generators") or []
         if media_generators:
             instructions.append("当前已配置媒体生成器：")
             for gen in media_generators:
@@ -149,27 +154,15 @@ class CodexCliRunner:
                 kind = gen.get("kind")
                 desc = gen.get("description") or ""
                 instructions.append(f"- {name} ({kind}) {desc}".strip())
-        extra = str(self.config["codex"].get("extraPrompt") or "").strip()
+        extra = str((self.config.get("claude") or {}).get("extraPrompt") or "").strip()
         if extra:
             instructions.extend(["", extra])
-        if fresh_session:
-            return "\n".join(instructions + ["", f"用户消息：{user_message}"])
-        return user_message
+        return "\n".join(instructions)
 
     @staticmethod
-    def _is_transient_resume_error(error):
+    def _is_resume_error(error):
         value = str(error or "").lower()
-        return (
-            "stream disconnected before completion" in value
-            or "broken pipe" in value
-            or "failed to send websocket request" in value
-            or "reconnecting..." in value
-        )
-
-    @staticmethod
-    def _is_rollout_record_error(error):
-        value = str(error or "").lower()
-        return "failed to record rollout items" in value and "thread" in value and "not found" in value
+        return "resume" in value or ("session" in value and "not found" in value)
 
     def _register_process(self, conversation_key, process):
         with self.processes_lock:
@@ -194,10 +187,10 @@ class CodexCliRunner:
         if process and process.poll() is None:
             self._terminate_process(process)
             if reset_session:
-                self.state.reset_session(conversation_key)
+                self.state.reset_session(conversation_key, agent="claude")
             return True
         if reset_session:
-            self.state.reset_session(conversation_key)
+            self.state.reset_session(conversation_key, agent="claude")
         return False
 
     def _consume_cancelled(self, conversation_key):
@@ -248,37 +241,29 @@ class CodexCliRunner:
             pass
 
     def run(self, conversation_key, user_message, retry_on_resume_error=True):
-        default_cwd = self.config["codex"]["workingDirectory"]
-        session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))
+        default_cwd = self._default_cwd()
+        session = self.state.get_session(conversation_key, default_cwd)
         cwd = session.get("cwd") or default_cwd
-        codex_account = resolve_session_codex_account(self.config, session)
-        codex_account_name = codex_account.get("name") or default_codex_account(self.config)
-        codex_home = codex_account.get("codexHome") or ""
-        model_selection = resolve_session_model(self.config, session)
+        claude_account = resolve_session_claude_account(self.config, session)
+        claude_account_name = claude_account.get("name") or default_claude_account(self.config)
+        claude_config_dir = claude_account.get("claudeConfigDir") or ""
+        model_selection = resolve_session_claude_model(self.config, session)
         selected_model = model_selection.get("model") or ""
-        selected_reasoning = model_selection.get("reasoningEffort") or ""
-        existing_thread_id = session.get("codexThreadId") or ""
-        fresh = not existing_thread_id
-        args = self._base_args(cwd, selected_model, selected_reasoning) + ["exec"]
-        if existing_thread_id:
-            args.extend(["resume", existing_thread_id])
-        prompt = self._build_prompt(
-            user_message,
-            fresh,
-            self.config.get("media", {}).get("generators") or [],
-        )
-        args.extend(["--skip-git-repo-check", "--json", prompt])
+        selected_effort = model_selection.get("effort") or ""
+        existing_session_id = session.get("claudeSessionId") or ""
+        args = self._base_args(selected_model, selected_effort, existing_session_id)
+        args.append(user_message)
 
         log.info(
-            f"[codex] start conversation={conversation_key} account={codex_account_name} "
-            f"model={selected_model or 'default'} reasoning={selected_reasoning or 'default'} "
-            f"resume={bool(existing_thread_id)} cwd={cwd}"
+            f"[claude] start conversation={conversation_key} account={claude_account_name} "
+            f"model={selected_model or 'default'} effort={selected_effort or 'default'} "
+            f"resume={bool(existing_session_id)} cwd={cwd}"
         )
 
         env = os.environ.copy()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
-        if codex_home:
-            env["CODEX_HOME"] = codex_home
+        if claude_config_dir:
+            env["CLAUDE_CONFIG_DIR"] = claude_config_dir
         process = subprocess.Popen(
             args,
             cwd=cwd,
@@ -293,7 +278,7 @@ class CodexCliRunner:
             start_new_session=True,
         )
         self._register_process(conversation_key, process)
-        accumulator = CodexAccumulator(existing_thread_id, codex_home=codex_home)
+        accumulator = ClaudeAccumulator(existing_session_id)
         stderr_chunks = []
         stdout_errors = []
 
@@ -328,38 +313,35 @@ class CodexCliRunner:
                 return_code = process.wait(timeout=self.timeout_ms / 1000)
             except subprocess.TimeoutExpired:
                 self._terminate_process(process)
-                self.state.reset_session(conversation_key)
-                raise RuntimeError(f"Codex 在 {self.timeout_ms // 1000} 秒内没有返回结果")
+                self.state.reset_session(conversation_key, agent="claude")
+                raise RuntimeError(f"Claude 在 {self.timeout_ms // 1000} 秒内没有返回结果")
             except BaseException:
                 self._terminate_process(process)
                 raise
             t1.join(timeout=2)
             t2.join(timeout=2)
             if self._consume_cancelled(conversation_key):
-                raise CodexCancelled("Codex 已取消")
+                raise CodexCancelled("Claude 已取消")
             if stdout_errors:
                 raise RuntimeError(str(stdout_errors[-1]))
-            if accumulator.thread_id:
+            if accumulator.session_id:
                 self.state.update_session(
                     conversation_key,
-                    codexThreadId=accumulator.thread_id,
+                    claudeSessionId=accumulator.session_id,
                     cwd=cwd,
-                    codexAccount=codex_account_name,
-                    codexModel=selected_model,
-                    codexReasoningEffort=selected_reasoning,
+                    claudeAccount=claude_account_name,
+                    claudeModel=selected_model,
+                    claudeEffort=selected_effort,
                 )
             text = accumulator.text()
-            if return_code == 0 and text:
+            if return_code == 0 and text and not accumulator.errors:
                 return text
             stderr = "".join(stderr_chunks).strip()
             error = text or (accumulator.errors[-1] if accumulator.errors else "") or stderr
-            if text and self._is_rollout_record_error(stderr or error):
-                log.warn(f"[codex] ignoring rollout record error after content was produced conversation={conversation_key}")
-                return text
-            if existing_thread_id and retry_on_resume_error and self._is_transient_resume_error(error):
-                log.warn(f"[codex] resume failed; resetting thread and retrying conversation={conversation_key}")
-                self.state.reset_session(conversation_key)
+            if existing_session_id and retry_on_resume_error and self._is_resume_error(error):
+                log.warn(f"[claude] resume failed; resetting session and retrying conversation={conversation_key}")
+                self.state.reset_session(conversation_key, agent="claude")
                 return self.run(conversation_key, user_message, retry_on_resume_error=False)
-            raise RuntimeError(error or f"codex 返回非零退出码: {return_code}")
+            raise RuntimeError(error or f"claude 返回非零退出码: {return_code}")
         finally:
             self._unregister_process(conversation_key, process)

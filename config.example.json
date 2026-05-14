@@ -33,6 +33,24 @@
     ],
     "extraPrompt": ""
   },
+  "claude": {
+    "bin": "claude",
+    "workingDirectory": "",
+    "model": "sonnet",
+    "effort": "",
+    "modelOptions": [],
+    "timeoutMs": 7200000,
+    "usageTimeoutSeconds": 2,
+    "permissionMode": "bypassPermissions",
+    "defaultAccount": "main",
+    "accounts": [
+      {
+        "name": "main",
+        "claudeConfigDir": ""
+      }
+    ],
+    "extraPrompt": ""
+  },
   "concurrency": {
     "maxWorkers": 4,
     "commandWorkers": 2,

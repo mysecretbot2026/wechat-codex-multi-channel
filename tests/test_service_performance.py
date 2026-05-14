@@ -51,6 +51,16 @@ def make_test_config(state_dir):
             "defaultAccount": "main",
             "accounts": [{"name": "main", "codexHome": ""}],
         },
+        "claude": {
+            "bin": "claude",
+            "model": "sonnet",
+            "effort": "",
+            "timeoutMs": 1000,
+            "permissionMode": "bypassPermissions",
+            "defaultAccount": "main",
+            "accounts": [{"name": "main", "claudeConfigDir": ""}],
+            "modelOptions": [],
+        },
         "concurrency": {"maxWorkers": 1, "commandWorkers": 1, "perConversationSerial": True},
         "media": {"maxFileBytes": 1024, "maxConcurrentTransfers": 1, "generators": []},
         "allowedUsers": [],
@@ -318,6 +328,189 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertEqual(service.config["codex"]["runner"], "app-server")
             self.assertIn("已切换 Codex runner: app-server", sent[-1])
 
+    def test_agent_command_switches_current_workspace_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", base, "/agent claude")
+
+            session = service.state.get_session(base, tmp)
+            self.assertEqual(session["agent"], "claude")
+            self.assertIn("已切换 Agent: claude", sent[-1])
+
+    def test_agent_switch_is_rejected_while_workspace_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeSteerRunner(ok=True)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", base, "/agent claude")
+
+            session = service.state.get_session(base, tmp)
+            self.assertNotEqual(session.get("agent"), "claude")
+            self.assertIn("任务运行中", sent[-1])
+
+    def test_account_command_switches_current_codex_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["codex"]["accounts"] = [
+                {"name": "main", "codexHome": ""},
+                {"name": "backup", "codexHome": "/tmp/codex-backup"},
+            ]
+            service = MultiWechatCodexService(config)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/account 2")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertEqual(session["codexAccount"], "backup")
+            self.assertIn("已切换 Codex 账号: backup", sent[-1])
+
+    def test_account_command_switches_current_claude_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["claude"]["accounts"] = [
+                {"name": "main", "claudeConfigDir": ""},
+                {"name": "work", "claudeConfigDir": "/tmp/claude-work"},
+            ]
+            service = MultiWechatCodexService(config)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="claude")
+
+            service._handle_message(account, "user-1", conversation_key, "/account 2")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertEqual(session["claudeAccount"], "work")
+            self.assertIn("已切换 Claude 账号: work", sent[-1])
+
+    def test_claude_command_switches_agent_and_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["claude"]["accounts"] = [
+                {"name": "main", "claudeConfigDir": ""},
+                {"name": "work", "claudeConfigDir": "/tmp/claude-work"},
+            ]
+            service = MultiWechatCodexService(config)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/claude 2")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertEqual(session["agent"], "claude")
+            self.assertEqual(session["claudeAccount"], "work")
+            self.assertIn("已切换 Agent: claude", sent[-1])
+            self.assertIn("已切换 Claude 账号: work", sent[-1])
+
+    def test_codex_command_switches_agent_and_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["codex"]["accounts"] = [
+                {"name": "main", "codexHome": ""},
+                {"name": "backup", "codexHome": "/tmp/codex-backup"},
+            ]
+            service = MultiWechatCodexService(config)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="claude")
+
+            service._handle_message(account, "user-1", conversation_key, "/codex 2")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertEqual(session["agent"], "codex")
+            self.assertEqual(session["codexAccount"], "backup")
+            self.assertIn("已切换 Agent: codex", sent[-1])
+            self.assertIn("已切换 Codex 账号: backup", sent[-1])
+
+    def test_model_switch_uses_claude_options_when_agent_is_claude(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service._claude_model_options = [
+                {"model": "sonnet", "effort": "low"},
+                {"model": "sonnet", "effort": "high"},
+            ]
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="claude", claudeSessionId="session-1")
+
+            service._handle_model_switch(account, "user-1", conversation_key, "2")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertEqual(session["claudeModel"], "sonnet")
+            self.assertEqual(session["claudeEffort"], "high")
+            self.assertEqual(session["claudeSessionId"], "")
+            self.assertIn("已经切换到 sonnet:high", sent[-1])
+
+    def test_usage_command_uses_current_claude_agent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="claude")
+
+            with patch("wechat_codex_multi.service.read_claude_usage") as read_usage:
+                read_usage.return_value = {
+                    "subscription": {"text": "subscription ok"},
+                    "stats": {"exists": False, "path": "/tmp/missing"},
+                }
+                service._handle_message(account, "user-1", conversation_key, "/usage")
+
+            self.assertIn("Claude 用量", sent[-1])
+            self.assertIn("subscription ok", sent[-1])
+
+    def test_usage_all_includes_codex_and_claude(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._read_all_codex_usage = lambda: "Codex 全部账号用量：\nmain"
+            service._read_all_claude_usage = lambda: "Claude 全部账号用量：\nmain"
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/usage all")
+
+            self.assertIn("Codex 全部账号用量", sent[-1])
+            self.assertIn("Claude 全部账号用量", sent[-1])
+
+    def test_workspace_agent_command_sets_agent_for_named_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_a = Path(tmp) / "project-a"
+            project_a.mkdir()
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", base, f"/ws add a {project_a}")
+            service._handle_message(account, "user-1", base, "/ws agent a claude")
+
+            session = service.state.get_session(service.state.workspace_conversation_key(base, "a"), tmp)
+            self.assertEqual(session["agent"], "claude")
+            self.assertIn("已设置工作区 a 的 Agent: claude", sent[-1])
+
     def test_run_pending_guidance_continues_same_conversation(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = MultiWechatCodexService(make_test_config(tmp))
@@ -358,6 +551,24 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertEqual(cancelled, [base])
             self.assertIn("已中断当前 Codex 任务", sent[-1])
             self.assertEqual(len(service.executor.submissions), 1)
+
+    def test_interrupt_preserves_current_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            cancelled = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service.codex.cancel = lambda key, reset_session=True: cancelled.append((key, reset_session)) or True
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(base, cwd=tmp, codexThreadId="thread-1")
+
+            service._handle_message(account, "user-1", base, "/interrupt")
+
+            session = service.state.get_session(base, tmp)
+            self.assertEqual(session["codexThreadId"], "thread-1")
+            self.assertEqual(cancelled, [(base, False)])
+            self.assertIn("已保留当前会话", sent[-1])
 
 
 if __name__ == "__main__":
