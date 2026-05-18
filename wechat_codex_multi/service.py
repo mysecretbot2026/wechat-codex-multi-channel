@@ -38,7 +38,8 @@ from .codex_cli import CodexCancelled, CodexCliRunner
 from .codex_models import find_model_option, format_model_option, model_options, resolve_session_model
 from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
 from .config import PROJECT_DIR
-from .login import login_with_qr
+from .login import login_with_qr, render_qr_png
+from .media import send_local_media
 from .state import StateStore
 from .util import markdown_to_plain_text, split_text
 from .wechat import MESSAGE_TYPE_USER, TYPING_STATUS_CANCEL, TYPING_STATUS_TYPING, WechatClient, extract_text
@@ -448,12 +449,22 @@ class MultiWechatCodexService:
             if not self._is_admin(user_id):
                 self._send_text(account, user_id, "只有 adminUsers 可以通过微信触发 /login。")
                 return
-            self._send_text(account, user_id, "开始新增 Bot 账号登录，请到运行服务的终端扫描二维码。")
+            self._send_text(account, user_id, "正在生成新增 Bot 账号登录二维码，请在微信中扫码确认。")
+
+            def send_qr(qr_content, _qr):
+                try:
+                    self._send_login_qr(account, user_id, qr_content)
+                    self._send_text(account, user_id, "请扫描上方二维码并确认登录。")
+                except Exception as err:
+                    log.error(f"failed to send login qr account={account.get('accountId')} user={user_id}: {err}")
+                    self._send_text(account, user_id, f"二维码图片发送失败，请到运行服务的终端扫描二维码。错误：{err}")
+
             new_account = login_with_qr(
                 base_url=self.config["wechat"]["baseUrl"],
                 bot_type=self.config["wechat"]["botType"],
                 route_tag=self.config["wechat"].get("routeTag"),
                 project_dir=PROJECT_DIR,
+                on_qr=send_qr,
             )
             self.state.upsert_account(new_account)
             self._ensure_account_session(new_account)
@@ -1320,6 +1331,15 @@ class MultiWechatCodexService:
             return False
         self._get_session(self.state.conversation_key(account_id, user_id))
         return True
+
+    def _send_login_qr(self, account, user_id, qr_content):
+        context_token = self.state.get_context_token(account["accountId"], user_id)
+        if not context_token:
+            raise RuntimeError("缺少 context_token，无法发送登录二维码")
+        path = render_qr_png(qr_content, PROJECT_DIR, self.state.state_dir / "login_qr")
+        with self.media_semaphore:
+            send_local_media(self._api_for_account(account), user_id, context_token, path, "image")
+        return path
 
     def _start_typing_loop(self, account, user_id):
         context_token = self.state.get_context_token(account["accountId"], user_id)

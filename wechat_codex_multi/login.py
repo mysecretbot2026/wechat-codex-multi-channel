@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import socket
 import subprocess
 import sys
@@ -37,7 +38,28 @@ def render_qr(qr_content, project_dir):
     print(qr_content)
 
 
-def login_with_qr(base_url, bot_type, route_tag, project_dir):
+def render_qr_png(qr_content, project_dir, output_dir):
+    output_dir = Path(output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"wechat-login-{int(time.time() * 1000)}.png"
+    script = (
+        "const QRCode = require('qrcode');"
+        "QRCode.toFile(process.argv[2], process.argv[1], { margin: 2, width: 640 }, err => {"
+        " if (err) { console.error(err && (err.stack || err.message) || err); process.exit(1); }"
+        "});"
+    )
+    subprocess.run(
+        ["node", "-e", script, qr_content, str(path)],
+        cwd=project_dir,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=True,
+    )
+    return str(path)
+
+
+def login_with_qr(base_url, bot_type, route_tag, project_dir, on_qr=None):
     base = base_url.rstrip("/")
     headers = {"SKRouteTag": route_tag} if route_tag else {}
     qr = fetch_json(f"{base}/ilink/bot/get_bot_qrcode?bot_type={urllib.parse.quote(bot_type)}", headers=headers)
@@ -45,6 +67,8 @@ def login_with_qr(base_url, bot_type, route_tag, project_dir):
     if not qr_content:
         raise RuntimeError("二维码内容缺失")
     render_qr(qr_content, project_dir)
+    if on_qr:
+        on_qr(qr_content, qr)
     print("\n请使用微信扫描二维码并确认登录。")
     deadline = time.time() + LOGIN_TIMEOUT_MS / 1000
     scanned = False

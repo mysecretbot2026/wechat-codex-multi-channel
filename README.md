@@ -791,7 +791,7 @@ launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
 - `PATH` 要包含 `codex` 和 `claude` 所在目录。Apple Silicon Homebrew 通常是 `/opt/homebrew/bin`，Intel Mac Homebrew 通常是 `/usr/local/bin`。
 - 如果 Codex 使用多个 `CODEX_HOME`，确保这些目录都已经单独 `codex login`。
 - 如果 Claude 使用多个 `CLAUDE_CONFIG_DIR`，确保这些目录都已经单独 `claude auth login`。
-- `/login` 会在运行服务的终端输出二维码。使用 `launchd` 后看不到交互终端，建议先手动运行 `python3 -m wechat_codex_multi add-account`。
+- `/login` 会把登录二维码发送给管理员微信，同时也会在运行服务的终端输出二维码作为兜底。
 
 ## 开发和验证
 
@@ -852,7 +852,7 @@ CLI 会话和模型、effort/reasoning、账号登录态有关。切换模型后
 
 ### `/login` 看不到二维码怎么办？
 
-后台服务没有交互终端时，二维码会出现在日志或后台 stdout 中。更稳妥的方式是在可见终端里执行：
+如果微信里没有收到二维码图片，先确认已经运行 `npm install` 安装 Node 依赖；仍不可用时，可以在可见终端里执行：
 
 ```bash
 python3 -m wechat_codex_multi add-account

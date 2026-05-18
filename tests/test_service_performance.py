@@ -280,6 +280,59 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertEqual(session["cwd"], tmp)
             self.assertEqual(session["agent"], "codex")
 
+    def test_login_sends_qr_to_admin_before_waiting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["adminUsers"] = ["admin-1"]
+            service = MultiWechatCodexService(config)
+            sent = []
+            qr_sent = []
+            started = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._send_login_qr = lambda account, user_id, qr_content: qr_sent.append(
+                (account["accountId"], user_id, qr_content)
+            )
+            service._start_account_monitor = lambda account: started.append(account["accountId"])
+            current_account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "admin-1")
+            new_account = {
+                "accountId": "acct-new",
+                "userId": "user-new",
+                "token": "token-new",
+                "baseUrl": "https://example.test",
+            }
+
+            def fake_login_with_qr(**kwargs):
+                kwargs["on_qr"]("qr-content", {"qrcode": "ticket"})
+                return new_account
+
+            with patch("wechat_codex_multi.service.login_with_qr", side_effect=fake_login_with_qr):
+                service._handle_message(current_account, "admin-1", conversation_key, "/login")
+
+            self.assertEqual(qr_sent, [("acct-current", "admin-1", "qr-content")])
+            self.assertIn("正在生成新增 Bot 账号登录二维码", sent[0])
+            self.assertIn("请扫描上方二维码", sent[1])
+            self.assertEqual(started, ["acct-new"])
+            self.assertIn("新增账号已连接: acct-new", sent[-1])
+
+    def test_send_login_qr_uploads_image_to_admin_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            account = {"accountId": "acct-1", "token": "token-1", "baseUrl": "https://example.test"}
+            service.state.set_context_token("acct-1", "admin-1", "ctx-1")
+            fake_client = object()
+            service._api_for_account = lambda current: fake_client
+
+            with patch("wechat_codex_multi.service.render_qr_png", return_value="/tmp/login-qr.png") as render, patch(
+                "wechat_codex_multi.service.send_local_media"
+            ) as send_media:
+                path = service._send_login_qr(account, "admin-1", "qr-content")
+
+            self.assertEqual(path, "/tmp/login-qr.png")
+            self.assertEqual(render.call_args.args[0], "qr-content")
+            self.assertEqual(Path(render.call_args.args[2]), Path(tmp) / "login_qr")
+            send_media.assert_called_once_with(fake_client, "admin-1", "ctx-1", "/tmp/login-qr.png", "image")
+
     def test_workspace_run_needs_conversation_lock(self):
         self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/ws"))
         self.assertFalse(MultiWechatCodexService._can_run_without_conversation_lock("/ws run a hello"))
