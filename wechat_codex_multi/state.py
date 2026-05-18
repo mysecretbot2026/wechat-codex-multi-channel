@@ -78,8 +78,7 @@ class StateStore:
             next_accounts = []
             for existing in self.state["accounts"]:
                 same_account = existing.get("accountId") == account.get("accountId")
-                same_user = account.get("userId") and existing.get("userId") == account.get("userId")
-                if not same_account and not same_user:
+                if not same_account:
                     next_accounts.append(existing)
             next_accounts.append(account)
             self.state["accounts"] = next_accounts

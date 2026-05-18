@@ -42,7 +42,7 @@ def make_test_config(state_dir):
     return {
         "stateDir": state_dir,
         "state": {"saveDebounceMs": 0},
-        "wechat": {"baseUrl": "https://example.test", "routeTag": None},
+        "wechat": {"baseUrl": "https://example.test", "botType": "3", "routeTag": None},
         "codex": {
             "bin": "codex",
             "workingDirectory": state_dir,
@@ -248,6 +248,37 @@ class ServicePerformanceTests(unittest.TestCase):
 
     def test_restart_can_run_without_conversation_lock(self):
         self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/restart"))
+
+    def test_login_seeds_session_for_new_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["adminUsers"] = ["admin-1"]
+            service = MultiWechatCodexService(config)
+            sent = []
+            started = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._start_account_monitor = lambda account: started.append(account["accountId"])
+            current_account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "admin-1")
+            new_account = {
+                "accountId": "acct-new",
+                "userId": "user-new",
+                "token": "token-new",
+                "baseUrl": "https://example.test",
+            }
+
+            with patch("wechat_codex_multi.service.login_with_qr", return_value=new_account):
+                service._handle_message(current_account, "admin-1", conversation_key, "/login")
+
+            reloaded_service = MultiWechatCodexService(config)
+            session = reloaded_service.state.get_session("acct-new:user-new", tmp)
+            accounts = reloaded_service.state.list_accounts()
+
+            self.assertEqual(started, ["acct-new"])
+            self.assertIn("新增账号已连接: acct-new", sent[-1])
+            self.assertEqual([item["accountId"] for item in accounts], ["acct-new"])
+            self.assertEqual(session["cwd"], tmp)
+            self.assertEqual(session["agent"], "codex")
 
     def test_workspace_run_needs_conversation_lock(self):
         self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/ws"))

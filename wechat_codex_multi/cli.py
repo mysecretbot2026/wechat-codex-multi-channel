@@ -4,10 +4,25 @@ from pathlib import Path
 
 from . import logging as log
 from .config import PROJECT_DIR, load_config
+from .codex_accounts import default_codex_account
 from .login import login_with_qr
 from .media_tool import run_media_generator
 from .service import MultiWechatCodexService
 from .state import StateStore
+
+
+def ensure_account_session(state, config, account):
+    account_id = (account or {}).get("accountId")
+    user_id = (account or {}).get("userId")
+    if not account_id or not user_id:
+        return False
+    state.get_session(
+        state.conversation_key(account_id, user_id),
+        config["codex"]["workingDirectory"],
+        default_codex_account(config),
+        config.get("defaultAgent") or "codex",
+    )
+    return True
 
 
 def add_account(args):
@@ -21,6 +36,7 @@ def add_account(args):
     )
     state = StateStore(config["stateDir"])
     state.upsert_account(account)
+    ensure_account_session(state, config, account)
     print("\n微信账号已保存。")
     print(f"accountId: {account['accountId']}")
     print(f"state: {state.file}")

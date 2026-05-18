@@ -99,6 +99,7 @@ class MultiWechatCodexService:
             raise RuntimeError("没有微信账号。请先运行 python3 -m wechat_codex_multi add-account")
         log.info(f"starting {len(accounts)} account monitor(s), maxWorkers={self.config['concurrency']['maxWorkers']}")
         for account in accounts:
+            self._ensure_account_session(account)
             self._start_account_monitor(account)
         try:
             while not self.stop_event.is_set():
@@ -455,6 +456,7 @@ class MultiWechatCodexService:
                 project_dir=PROJECT_DIR,
             )
             self.state.upsert_account(new_account)
+            self._ensure_account_session(new_account)
             self._start_account_monitor(new_account)
             self._send_text(account, user_id, f"新增账号已连接: {new_account['accountId']}")
             return
@@ -1310,6 +1312,14 @@ class MultiWechatCodexService:
             default_codex_account(self.config),
             self.config.get("defaultAgent") or "codex",
         )
+
+    def _ensure_account_session(self, account):
+        account_id = (account or {}).get("accountId")
+        user_id = (account or {}).get("userId")
+        if not account_id or not user_id:
+            return False
+        self._get_session(self.state.conversation_key(account_id, user_id))
+        return True
 
     def _start_typing_loop(self, account, user_id):
         context_token = self.state.get_context_token(account["accountId"], user_id)

@@ -17,6 +17,30 @@ class StateStoreTests(unittest.TestCase):
             self.assertFalse(changed)
             self.assertEqual(state.file.stat().st_mtime_ns, before)
 
+    def test_upsert_account_keeps_distinct_accounts_with_same_user(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(tmp, save_debounce_ms=0)
+            state.upsert_account({"accountId": "acct-1", "userId": "user-1", "token": "token-1"})
+            state.upsert_account({"accountId": "acct-2", "userId": "user-1", "token": "token-2"})
+
+            reloaded = StateStore(tmp, save_debounce_ms=0)
+            accounts = sorted(reloaded.list_accounts(), key=lambda item: item["accountId"])
+
+            self.assertEqual([item["accountId"] for item in accounts], ["acct-1", "acct-2"])
+            self.assertEqual([item["token"] for item in accounts], ["token-1", "token-2"])
+
+    def test_upsert_account_replaces_matching_account_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = StateStore(tmp, save_debounce_ms=0)
+            state.upsert_account({"accountId": "acct-1", "userId": "user-1", "token": "old"})
+            state.upsert_account({"accountId": "acct-1", "userId": "user-2", "token": "new"})
+
+            accounts = state.list_accounts()
+
+            self.assertEqual(len(accounts), 1)
+            self.assertEqual(accounts[0]["userId"], "user-2")
+            self.assertEqual(accounts[0]["token"], "new")
+
     def test_debounced_context_token_flushes_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = StateStore(tmp, save_debounce_ms=60_000)
