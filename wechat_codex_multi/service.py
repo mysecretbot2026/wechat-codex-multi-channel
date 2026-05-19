@@ -40,6 +40,13 @@ from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_
 from .config import PROJECT_DIR
 from .login import login_with_qr, render_qr_png
 from .media import send_local_media
+from .session_discovery import (
+    format_session_time,
+    list_claude_sessions,
+    list_codex_sessions,
+    short_session_id,
+    sort_sessions,
+)
 from .state import StateStore
 from .util import markdown_to_plain_text, split_text
 from .wechat import MESSAGE_TYPE_USER, TYPING_STATUS_CANCEL, TYPING_STATUS_TYPING, WechatClient, extract_text
@@ -74,6 +81,7 @@ class MultiWechatCodexService:
         self.conversation_locks_guard = threading.Lock()
         self.pending_guidance = {}
         self.pending_guidance_guard = threading.Lock()
+        self.session_selection_cache = {}
         self.monitor_accounts = set()
         self._model_options = None
         self._claude_model_options = None
@@ -294,6 +302,8 @@ class MultiWechatCodexService:
             "/claude",
             "/model",
             "/models",
+            "/sessions",
+            "/session",
             "/cwd",
             "/runner",
             "/restart",
@@ -333,6 +343,7 @@ class MultiWechatCodexService:
                 f"workspace: {workspace_name}",
                 f"cwd: {session.get('cwd')}",
                 f"agent: {agent}",
+                f"running: {str(self.codex.is_running(conversation_key)).lower()}",
             ]
             if agent == "claude":
                 lines.extend(
@@ -378,6 +389,12 @@ class MultiWechatCodexService:
                 )
             lines.append("accounts: " + ", ".join(a["accountId"] for a in self.state.list_accounts()))
             self._send_text(account, user_id, "\n".join(lines))
+            return
+        if command == "/sessions" or command.startswith("/sessions "):
+            self._handle_sessions_command(account, user_id, conversation_key, command[len("/sessions"):].strip())
+            return
+        if command == "/session" or command.startswith("/session "):
+            self._handle_session_command(account, user_id, conversation_key, command[len("/session"):].strip())
             return
         usage_parts = command.split()
         if usage_parts and usage_parts[0] == "/usage":
@@ -549,6 +566,135 @@ class MultiWechatCodexService:
             return self.codex.cancel(conversation_key, reset_session=reset_session)
         except TypeError:
             return self.codex.cancel(conversation_key)
+
+    def _discover_sessions(self, conversation_key, scope="", limit=20):
+        current = self._get_session(conversation_key)
+        current_agent = resolve_session_agent(self.config, current)
+        value = str(scope or "").strip().lower()
+        if value in {"", "current"}:
+            agents = [current_agent]
+        elif value in {"all", "*"}:
+            agents = ["codex", "claude"]
+        elif value in {"codex", "claude"}:
+            agents = [value]
+        else:
+            return None, f"未知 sessions 范围: {scope}\n用法：/sessions [codex|claude|all]"
+
+        sessions = []
+        if "codex" in agents:
+            codex_account = resolve_session_codex_account(self.config, current)
+            sessions.extend(list_codex_sessions(codex_account, limit=limit))
+        if "claude" in agents:
+            claude_account = resolve_session_claude_account(self.config, current)
+            sessions.extend(list_claude_sessions(claude_account, limit=limit))
+        return sort_sessions(sessions)[:limit], ""
+
+    def _handle_sessions_command(self, account, user_id, conversation_key, scope):
+        sessions, error = self._discover_sessions(conversation_key, scope, limit=20)
+        if error:
+            self._send_text(account, user_id, error)
+            return
+        self.session_selection_cache[conversation_key] = sessions
+        if not sessions:
+            self._send_text(account, user_id, "没有找到可恢复的 session。")
+            return
+        lines = ["可恢复 sessions（发送 /session use 编号 切换）："]
+        for index, item in enumerate(sessions, 1):
+            lines.append(
+                f"{index}. {item['agent']}:{item.get('account') or '-'} {short_session_id(item.get('sessionId'))}"
+            )
+            lines.append(f"   time: {format_session_time(item.get('updatedAt'))}")
+            if item.get("cwd"):
+                lines.append(f"   cwd: {item.get('cwd')}")
+            lines.append(f"   title: {item.get('title') or 'untitled'}")
+        self._send_text(account, user_id, "\n".join(lines))
+
+    @staticmethod
+    def _session_help_text():
+        return "\n".join(
+            [
+                "用法：",
+                "/sessions [codex|claude|all] 查看可恢复 sessions",
+                "/session use <编号|sessionId前缀> 切换当前工作区到指定 session",
+                "/session new [codex|claude] 新建当前工作区会话",
+            ]
+        )
+
+    def _find_cached_session(self, conversation_key, selector):
+        value = str(selector or "").strip()
+        cached = list(self.session_selection_cache.get(conversation_key) or [])
+        if value.isdigit() and cached:
+            index = int(value) - 1
+            if 0 <= index < len(cached):
+                return cached[index], ""
+            return None, f"编号超出范围: {value}"
+        if value.isdigit():
+            return None, "请先发送 /sessions 查看编号，再用 /session use <编号> 切换。"
+        candidates = cached
+        if not candidates:
+            candidates, error = self._discover_sessions(conversation_key, "all", limit=100)
+            if error:
+                return None, error
+        matches = [
+            item
+            for item in candidates
+            if str(item.get("sessionId") or "").startswith(value)
+            or short_session_id(item.get("sessionId")).startswith(value)
+        ]
+        if len(matches) == 1:
+            return matches[0], ""
+        if not matches:
+            return None, f"没有找到 session: {value}\n请先发送 /sessions all 查看。"
+        return None, f"匹配到多个 session: {value}\n请使用更长的 sessionId 前缀。"
+
+    def _handle_session_command(self, account, user_id, conversation_key, arg):
+        parts = str(arg or "").strip().split(maxsplit=1)
+        if not parts:
+            self._send_text(account, user_id, self._session_help_text())
+            return
+        action = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if action in {"use", "switch"}:
+            if not rest:
+                self._send_text(account, user_id, "用法：/session use <编号|sessionId前缀>")
+                return
+            if self.codex.is_running(conversation_key):
+                self._send_text(account, user_id, "当前工作区有任务运行中，请等待结束或 /interrupt 后再切换 session。")
+                return
+            item, error = self._find_cached_session(conversation_key, rest)
+            if error:
+                self._send_text(account, user_id, error)
+                return
+            updates = {"agent": item["agent"]}
+            if item.get("cwd"):
+                updates["cwd"] = item["cwd"]
+            if item["agent"] == "claude":
+                updates.update(claudeSessionId=item["sessionId"], claudeAccount=item.get("account") or default_claude_account(self.config))
+            else:
+                updates.update(codexThreadId=item["sessionId"], codexAccount=item.get("account") or default_codex_account(self.config))
+            self.state.update_session(conversation_key, **updates)
+            self._send_text(
+                account,
+                user_id,
+                f"已切换当前工作区到 {item['agent']} session: {short_session_id(item.get('sessionId'))}\n"
+                f"title: {item.get('title') or 'untitled'}",
+            )
+            return
+        if action == "new":
+            if self.codex.is_running(conversation_key):
+                self._send_text(account, user_id, "当前工作区有任务运行中，请等待结束或 /interrupt 后再新建 session。")
+                return
+            current = self._get_session(conversation_key)
+            target = normalize_agent(rest or resolve_session_agent(self.config, current))
+            if not target:
+                self._send_text(account, user_id, "未知 Agent。可用：codex、claude")
+                return
+            self.state.reset_session(conversation_key, agent=target)
+            self.state.update_session(conversation_key, agent=target)
+            self.session_selection_cache.pop(conversation_key, None)
+            self._send_text(account, user_id, f"已新建当前工作区 {self._agent_label(target)} 会话。")
+            return
+        self._send_text(account, user_id, self._session_help_text())
 
     @staticmethod
     def _parse_interrupt_command(text):
@@ -1409,6 +1555,9 @@ class MultiWechatCodexService:
                 "/guide <补充要求> 在任务运行中追加引导；直接发普通消息也会追加",
                 "/usage 查看当前 Agent 用量",
                 "/usage all 查看配置里所有 Codex 和 Claude 账号的用量",
+                "/sessions [codex|claude|all] 查看可恢复 sessions",
+                "/session use <编号|sessionId前缀> 恢复指定 session",
+                "/session new [codex|claude] 新建会话",
                 "/agents 查看可用 Agent",
                 "/agent <codex|claude> 切换当前工作区使用的 CLI",
                 "/account 查看或切换当前 Agent 账号",

@@ -136,6 +136,65 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertEqual(len(service.executor.submissions), 1)
             self.assertEqual(len(service.command_executor.submissions), 0)
 
+    def test_status_includes_current_workspace_running_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeSteerRunner(ok=True)
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/status")
+
+            self.assertIn("running: true", sent[-1])
+
+    def test_sessions_command_lists_and_uses_codex_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            sessions = [
+                {
+                    "agent": "codex",
+                    "account": "main",
+                    "sessionId": "thread-123456",
+                    "title": "检查项目",
+                    "cwd": "/tmp/project",
+                    "updatedAt": 200,
+                    "createdAt": 100,
+                }
+            ]
+
+            with patch("wechat_codex_multi.service.list_codex_sessions", return_value=sessions):
+                service._handle_message(account, "user-1", conversation_key, "/sessions")
+                service._handle_message(account, "user-1", conversation_key, "/session use 1")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertIn("thread-12345", sent[0])
+            self.assertEqual(session["agent"], "codex")
+            self.assertEqual(session["codexThreadId"], "thread-123456")
+            self.assertEqual(session["codexAccount"], "main")
+            self.assertEqual(session["cwd"], "/tmp/project")
+            self.assertIn("已切换当前工作区到 codex session", sent[-1])
+
+    def test_session_new_resets_current_agent_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="codex", codexThreadId="thread-old")
+
+            service._handle_message(account, "user-1", conversation_key, "/session new")
+
+            session = service.state.get_session(conversation_key, tmp)
+            self.assertEqual(session["codexThreadId"], "")
+            self.assertIn("已新建当前工作区 Codex 会话", sent[-1])
+
     def test_workspace_commands_add_use_list_and_run_by_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             project_a = Path(tmp) / "project-a"

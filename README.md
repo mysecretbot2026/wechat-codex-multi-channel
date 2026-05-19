@@ -248,6 +248,12 @@ cp config.example.json config.json
 | `/runner app-server` | 切换到 Codex 原生 app-server runner，支持运行中 `turn/steer` |
 | `/cwd` | 查看当前工作区工作目录 |
 | `/cwd <path>` | 修改当前工作区工作目录，并重置当前工作区 Codex thread 和 Claude session |
+| `/sessions` | 查看当前 Agent、当前账号下可恢复的 sessions，按更新时间倒序 |
+| `/sessions codex` | 查看当前 Codex 账号下可恢复的 Codex sessions |
+| `/sessions claude` | 查看当前 Claude 账号下可恢复的 Claude sessions |
+| `/sessions all` | 合并查看当前 Codex 和 Claude 账号下可恢复的 sessions |
+| `/session use <编号|sessionId前缀>` | 把当前工作区切换到指定 Codex thread 或 Claude session |
+| `/session new [codex|claude]` | 新建当前工作区当前 Agent 或指定 Agent 会话 |
 | `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和当前 Agent session |
 | `/ws add <名称> <路径>` | 添加项目工作区 |
 | `/ws use <名称>` | 切换当前工作区；之后普通消息会进入该工作区 |
@@ -296,6 +302,10 @@ cp config.example.json config.json
 /runner app-server
 
 /cwd /path/to/project-a
+/sessions
+/sessions all
+/session use 1
+/session new
 /reset
 /interrupt 改成先修登录页，不要继续做 README
 
@@ -312,6 +322,12 @@ cp config.example.json config.json
 `/account` 切换的是当前 Agent 的登录账号。当前 Agent 是 Codex 时切换不同的 `CODEX_HOME`，会清空当前工作区的 `codexThreadId`；当前 Agent 是 Claude 时切换不同的 `CLAUDE_CONFIG_DIR`，会清空当前工作区的 `claudeSessionId`。
 
 `/codex` 是切到 Codex CLI 的快捷命令，可同时切 Codex 账号；`/claude` 是切到 Claude Code CLI 的快捷命令，可同时切 Claude 账号。只切 Agent 不会清空另一个 Agent 已保存的会话 ID，切换账号才会重置对应 Agent 会话。`/model` 切换的是当前 Agent 的模型和 effort/reasoning，会重置当前 Agent 的会话。
+
+`/status` 会显示当前工作区是否有任务正在运行：`running: true` 或 `running: false`。这个状态和 `/ws` 里的 `[running]` / `[idle]` 使用同一套运行表。
+
+`/sessions` 从本机 CLI 会话存储读取可恢复会话。Codex 读取当前 `CODEX_HOME/state_5.sqlite` 的 threads 表，优先显示 Codex 生成的 title；必要时回退到 `session_index.jsonl`。Claude 读取当前 `CLAUDE_CONFIG_DIR` 下的 `usage-data/session-meta/*.json` 和 `projects/**/*.jsonl`，用 `first_prompt` 或第一条用户消息作为标题。列表按更新时间倒序，编号只在当前工作区最近一次 `/sessions` 输出中有效。
+
+`/session use <编号|sessionId前缀>` 会把当前工作区切到指定 session，并同步 Agent、账号、工作目录和会话 ID。当前工作区任务运行中时会拒绝切换，避免把正在执行的 CLI 会话状态写乱。
 
 ## Agent 和 Claude Code
 
@@ -832,7 +848,7 @@ accountId:userId:workspaceName
 
 `default` 工作区继续使用基础会话 key，兼容原有会话。`/ws run <名称> <任务>` 会直接使用指定工作区的 key，因此同一个微信用户可以同时让不同项目工作区并发执行。
 
-当同一个工作区有任务正在运行时，新的普通消息会立即作为补充引导处理。`/status`、`/usage`、`/agents`、`/agent`、`/account`、`/codex-accounts`、`/codex`、`/claude-accounts`、`/claude`、`/model`、`/models`、`/accounts`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/interrupt` 和 `/cancel` 可取消当前任务并保留会话，`/reset` 可取消当前工作区正在运行的任务并重置会话，`/ws reset <名称>` 可取消指定工作区。
+当同一个工作区有任务正在运行时，新的普通消息会立即作为补充引导处理。`/status`、`/usage`、`/agents`、`/agent`、`/account`、`/codex-accounts`、`/codex`、`/claude-accounts`、`/claude`、`/model`、`/models`、`/sessions`、`/session`、`/accounts`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/interrupt` 和 `/cancel` 可取消当前任务并保留会话，`/reset` 可取消当前工作区正在运行的任务并重置会话，`/ws reset <名称>` 可取消指定工作区。
 
 超时、服务停止或 `/reset` 取消时，服务会清理当前 CLI 进程组，避免残留进程继续占用会话。
 
