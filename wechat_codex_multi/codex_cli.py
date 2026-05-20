@@ -9,6 +9,7 @@ from pathlib import Path
 from . import logging as log
 from .codex_accounts import default_codex_account, resolve_session_codex_account
 from .codex_models import resolve_session_model
+from .media_outbox import media_outbox_path
 
 
 class CodexCancelled(RuntimeError):
@@ -124,6 +125,15 @@ class CodexCliRunner:
             args.extend(["-c", f'model_reasoning_effort="{selected_reasoning}"'])
         return args
 
+    def _media_instructions(self):
+        return [
+            "发送本地图片、文档、视频、压缩包等媒体时，优先使用项目内置 send-media skill，不要在回复里写媒体标记。",
+            "调用方式：python3 -m wechat_codex_multi media-send /absolute/path/to/file",
+            "可选指定类型：python3 -m wechat_codex_multi media-send --kind image|video|file /absolute/path/to/file",
+            "命令会把媒体登记到本轮微信会话，服务会在当前任务结束后自动发送。",
+            "只有在 media-send 不可用时，才在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
+        ]
+
     def _build_prompt(self, user_message, fresh_session, media_generators):
         instructions = [
             "你通过微信与用户交流。",
@@ -131,16 +141,11 @@ class CodexCliRunner:
             "回复尽量直接、简洁、可执行。",
             "微信不渲染 Markdown，尽量输出纯文本。",
             "",
-            "你可以生成本地图片、文件或视频，然后让微信通道发送。",
-            "发送本地媒体时，在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
-            "媒体标记路径必须是真实存在的本地绝对路径。",
-            "不要原样输出占位路径，例如 /absolute/path/to/image.png、/Users/bot/.../xxx.png 或 真实绝对路径。",
-            "如果 Codex 生成图片后输出 Saved to: file:///Users/.../image.png，也可以直接保留这个 file:// 路径，微信通道会自动发送。",
-            "这些标记会被微信通道解析并发送，用户不会看到标记文本。",
+            *self._media_instructions(),
             "",
             "如果需要调用可配置媒体生成器，可在 shell 中运行：",
             "python3 -m wechat_codex_multi media-generate <name> <prompt>",
-            "命令会输出生成文件路径。然后使用对应 send_image/send_video/send_file 标记发送。",
+            "命令会输出生成文件路径。然后使用 media-send 登记发送。",
         ]
         if media_generators:
             instructions.append("当前已配置媒体生成器：")
@@ -154,7 +159,7 @@ class CodexCliRunner:
             instructions.extend(["", extra])
         if fresh_session:
             return "\n".join(instructions + ["", f"用户消息：{user_message}"])
-        return user_message
+        return "\n".join(self._media_instructions() + ["", f"用户消息：{user_message}"])
 
     @staticmethod
     def _is_transient_resume_error(error):
@@ -279,6 +284,8 @@ class CodexCliRunner:
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent) + os.pathsep + env.get("PYTHONPATH", "")
         if codex_home:
             env["CODEX_HOME"] = codex_home
+        state_dir = getattr(self.state, "state_dir", None) or self.config.get("stateDir") or cwd
+        env["WECHAT_CODEX_MULTI_MEDIA_OUTBOX"] = str(media_outbox_path(state_dir, conversation_key))
         process = subprocess.Popen(
             args,
             cwd=cwd,

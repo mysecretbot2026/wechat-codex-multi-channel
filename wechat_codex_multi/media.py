@@ -129,7 +129,13 @@ def cdn_upload(upload_param, filekey, ciphertext, upload_url=""):
             except Exception:
                 body = ""
             message = err.headers.get("x-error-message") or body or f"HTTP {err.code}"
-            raise MediaUploadError(f"CDN upload HTTP {err.code}: {message}") from err
+            error = MediaUploadError(f"CDN upload HTTP {err.code}: {message}")
+            if 500 <= err.code < 600:
+                last_error = error
+                if attempt < MAX_CDN_UPLOAD_RETRIES:
+                    time.sleep(attempt)
+                    continue
+            raise error from err
         except Exception as err:
             last_error = err
             if attempt >= MAX_CDN_UPLOAD_RETRIES:

@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from .ilink import ilink_common_headers
 from .util import generate_id, random_wechat_uin
 
 
@@ -43,6 +44,7 @@ class WechatClient:
             "AuthorizationType": "ilink_bot_token",
             "Content-Length": str(len(body.encode("utf-8"))),
             "X-WECHAT-UIN": random_wechat_uin(),
+            **ilink_common_headers(),
         }
         if self.token:
             headers["Authorization"] = f"Bearer {self.token}"

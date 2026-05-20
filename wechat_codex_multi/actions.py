@@ -17,6 +17,9 @@ PLACEHOLDER_MEDIA_PATHS = {
     "/path",
     "/path/from/generator.png",
     "真实绝对路径",
+    "/真实图片路径",
+    "/真实文件路径",
+    "/真实视频路径",
     "真实/图片/路径.png",
     "本地图片绝对路径",
     "本地文件绝对路径",
@@ -33,6 +36,9 @@ def is_placeholder_media_path(path):
         or normalized.startswith("/absolute/path/to/")
         or normalized.startswith("/path/from/generator")
         or "真实绝对路径" in normalized
+        or "真实图片路径" in normalized
+        or "真实文件路径" in normalized
+        or "真实视频路径" in normalized
         or "..." in normalized
         or "/xxx." in normalized
         or normalized.startswith("<")

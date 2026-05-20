@@ -8,6 +8,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from .ilink import ilink_common_headers
+
 
 LOGIN_TIMEOUT_MS = 480_000
 STATUS_TIMEOUT_MS = 35_000
@@ -61,7 +63,9 @@ def render_qr_png(qr_content, project_dir, output_dir):
 
 def login_with_qr(base_url, bot_type, route_tag, project_dir, on_qr=None):
     base = base_url.rstrip("/")
-    headers = {"SKRouteTag": route_tag} if route_tag else {}
+    headers = ilink_common_headers()
+    if route_tag:
+        headers["SKRouteTag"] = route_tag
     qr = fetch_json(f"{base}/ilink/bot/get_bot_qrcode?bot_type={urllib.parse.quote(bot_type)}", headers=headers)
     qr_content = qr.get("qrcode_img_content")
     if not qr_content:
@@ -77,7 +81,7 @@ def login_with_qr(base_url, bot_type, route_tag, project_dir, on_qr=None):
         try:
             status = fetch_json(
                 f"{base}/ilink/bot/get_qrcode_status?qrcode={encoded}",
-                headers={**headers, "iLink-App-ClientVersion": "1"},
+                headers=headers,
                 timeout_s=STATUS_TIMEOUT_MS / 1000,
             )
         except (TimeoutError, socket.timeout, urllib.error.URLError) as err:

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from wechat_codex_multi.service import MultiWechatCodexService
+from wechat_codex_multi.media_outbox import media_outbox_path, queue_media
 from wechat_codex_multi.wechat import ITEM_IMAGE, ITEM_TEXT, MESSAGE_TYPE_USER
 
 
@@ -35,6 +36,23 @@ class CapturingExecutor:
         return None
 
     def shutdown(self, **kwargs):
+        return None
+
+
+class FakeRunRunner:
+    def __init__(self, text="完成"):
+        self.text = text
+
+    def run(self, conversation_key, text):
+        return self.text
+
+    def cancel(self, conversation_key, reset_session=True):
+        return False
+
+    def is_running(self, conversation_key):
+        return False
+
+    def terminate_all(self):
         return None
 
 
@@ -194,6 +212,28 @@ class ServicePerformanceTests(unittest.TestCase):
             session = service.state.get_session(conversation_key, tmp)
             self.assertEqual(session["codexThreadId"], "")
             self.assertIn("已新建当前工作区 Codex 会话", sent[-1])
+
+    def test_run_reply_sends_media_registered_in_outbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeRunRunner()
+            sent = []
+            executed = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._start_typing_loop = lambda account, user_id: (lambda: None)
+            account = {"accountId": "acct-1", "baseUrl": "https://example.test", "token": "token"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.set_context_token("acct-1", "user-1", "context-token")
+            media = Path(tmp) / "report.pdf"
+            media.write_bytes(b"pdf")
+            queue_media(media_outbox_path(tmp, conversation_key), [str(media)])
+
+            with patch("wechat_codex_multi.service.execute_actions") as execute:
+                execute.side_effect = lambda *args, **kwargs: executed.extend(args[3]) or [str(media)]
+                service._run_codex_and_reply(account, "user-1", conversation_key, "send it")
+
+            self.assertEqual(sent, ["完成"])
+            self.assertEqual(executed, [{"kind": "file", "path": str(media.resolve())}])
 
     def test_workspace_commands_add_use_list_and_run_by_key(self):
         with tempfile.TemporaryDirectory() as tmp:

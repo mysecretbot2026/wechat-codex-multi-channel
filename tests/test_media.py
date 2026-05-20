@@ -78,6 +78,38 @@ class MediaTests(unittest.TestCase):
         self.assertIn("HTTP 403", str(ctx.exception))
         self.assertIn("denied", str(ctx.exception))
 
+    def test_cdn_upload_retries_http_500(self):
+        class Headers:
+            def get(self, name):
+                return "download-param" if name == "x-encrypted-param" else None
+
+        class Response:
+            headers = Headers()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        error = HTTPError(
+            url="https://example.test/upload",
+            code=500,
+            msg="Server Error",
+            hdrs={},
+            fp=None,
+        )
+
+        with patch(
+            "wechat_codex_multi.media.urllib.request.urlopen",
+            side_effect=[error, Response()],
+        ) as urlopen, patch("wechat_codex_multi.media.time.sleep") as sleep:
+            result = cdn_upload("upload-param", "filekey", b"ciphertext")
+
+        self.assertEqual(result, "download-param")
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
 
 if __name__ == "__main__":
     unittest.main()

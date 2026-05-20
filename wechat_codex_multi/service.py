@@ -40,6 +40,7 @@ from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_
 from .config import PROJECT_DIR
 from .login import login_with_qr, render_qr_png
 from .media import send_local_media
+from .media_outbox import media_outbox_path, read_and_clear_media_outbox
 from .session_discovery import (
     format_session_time,
     list_claude_sessions,
@@ -543,6 +544,7 @@ class MultiWechatCodexService:
         finally:
             stop_typing()
         cleaned, actions = extract_actions(result)
+        actions.extend(read_and_clear_media_outbox(media_outbox_path(self.state.state_dir, conversation_key)))
         cleaned = markdown_to_plain_text(cleaned)
         if cleaned:
             self._send_text(account, user_id, cleaned)

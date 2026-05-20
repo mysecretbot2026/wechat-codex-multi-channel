@@ -69,6 +69,21 @@ class ActionTests(unittest.TestCase):
 
         self.assertEqual(sent, [])
 
+    def test_extract_actions_ignores_chinese_example_media_markers(self):
+        text = "\n".join(
+            [
+                "示例：",
+                "[[send_image:/真实图片路径]]",
+                "[[send_file:/真实文件路径]]",
+                "[[send_video:/真实视频路径]]",
+            ]
+        )
+
+        cleaned, actions = extract_actions(text)
+
+        self.assertEqual(actions, [])
+        self.assertEqual(cleaned, "示例：")
+
     def test_extract_actions_normalizes_file_url_marker(self):
         cleaned, actions = extract_actions("完成\n[[send_image:file:///tmp/real-image.png]]")
 
