@@ -2,6 +2,7 @@ import signal
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from wechat_codex_multi.claude_cli import ClaudeAccumulator, ClaudeCliRunner
@@ -125,6 +126,35 @@ class ClaudeCliRunnerTests(unittest.TestCase):
 
             self.assertFalse(runner.cancel("conversation-1", reset_session=False))
             self.assertEqual(state.reset_calls, [])
+
+    def test_active_runs_reports_running_process_model_and_pid(self):
+        state = FakeState(str(Path.cwd()))
+        state.session_updates = {"claudeModel": "opus", "claudeEffort": "medium"}
+        runner = ClaudeCliRunner(
+            {
+                "codex": {"workingDirectory": str(Path.cwd())},
+                "claude": {"bin": "claude", "timeoutMs": 1000, "model": "sonnet", "effort": "high"},
+                "media": {"generators": []},
+            },
+            state,
+        )
+        process = Mock()
+        process.pid = 12345
+        process.poll.return_value = None
+        runner._register_process("acct-1:user-1", process)
+
+        self.assertEqual(
+            runner.active_runs(),
+            [
+                {
+                    "agent": "claude",
+                    "conversationKey": "acct-1:user-1",
+                    "pid": 12345,
+                    "model": "opus",
+                    "effort": "medium",
+                }
+            ],
+        )
 
     def test_cancelled_run_raises_cancelled(self):
         with tempfile.TemporaryDirectory() as tmp:

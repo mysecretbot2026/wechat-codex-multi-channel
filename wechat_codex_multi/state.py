@@ -7,6 +7,7 @@ from pathlib import Path
 
 class StateStore:
     DEFAULT_WORKSPACE = "default"
+    ACCOUNT_NICKNAME_PREFIX = "用户"
 
     def __init__(self, state_dir, save_debounce_ms=0):
         self.state_dir = Path(state_dir)
@@ -36,6 +37,8 @@ class StateStore:
             self.state["sessions"] = dict(loaded.get("sessions") or {})
             self.state["contextTokens"] = dict(loaded.get("contextTokens") or {})
             self.state["workspaces"] = dict(loaded.get("workspaces") or {})
+            if self._ensure_account_nicknames_locked():
+                self._write_locked()
             return self.state
 
     def _write_locked(self):
@@ -69,23 +72,100 @@ class StateStore:
 
     def list_accounts(self):
         with self.lock:
+            changed = self._ensure_account_nicknames_locked()
+            if changed:
+                self.save(debounce=True)
             return [dict(a) for a in self.state["accounts"]]
+
+    @staticmethod
+    def _normalize_account_nickname(nickname):
+        return str(nickname or "").strip()
+
+    @classmethod
+    def validate_account_nickname(cls, nickname):
+        value = cls._normalize_account_nickname(nickname)
+        if not value:
+            return "用户昵称不能为空。"
+        if len(value) > 64:
+            return "用户昵称不能超过 64 个字符。"
+        if any(ch in value for ch in "\r\n\t"):
+            return "用户昵称不能包含换行或制表符。"
+        return ""
+
+    def _next_account_nickname_locked(self, used=None):
+        used = set(used or [])
+        index = 1
+        while f"{self.ACCOUNT_NICKNAME_PREFIX}{index}" in used:
+            index += 1
+        return f"{self.ACCOUNT_NICKNAME_PREFIX}{index}"
+
+    def _ensure_account_nicknames_locked(self):
+        used = set()
+        changed = False
+        for account in self.state["accounts"]:
+            nickname = self._normalize_account_nickname(account.get("nickname"))
+            if not nickname or nickname in used:
+                nickname = self._next_account_nickname_locked(used)
+                account["nickname"] = nickname
+                changed = True
+            elif account.get("nickname") != nickname:
+                account["nickname"] = nickname
+                changed = True
+            used.add(nickname)
+        return changed
+
+    def account_nickname_available(self, nickname, account_id=""):
+        value = self._normalize_account_nickname(nickname)
+        with self.lock:
+            self._ensure_account_nicknames_locked()
+            for account in self.state["accounts"]:
+                if account.get("accountId") != account_id and account.get("nickname") == value:
+                    return False
+            return True
 
     def upsert_account(self, account):
         with self.lock:
             account = dict(account)
             account.setdefault("getUpdatesBuf", "")
+            self._ensure_account_nicknames_locked()
+            existing_match = None
             next_accounts = []
             for existing in self.state["accounts"]:
                 same_account = existing.get("accountId") == account.get("accountId")
+                if same_account:
+                    existing_match = existing
                 if not same_account:
                     next_accounts.append(existing)
+            nickname = self._normalize_account_nickname(account.get("nickname"))
+            if not nickname and existing_match:
+                nickname = self._normalize_account_nickname(existing_match.get("nickname"))
+            if not nickname:
+                nickname = self._next_account_nickname_locked(a.get("nickname") for a in next_accounts)
+            error = self.validate_account_nickname(nickname)
+            if error:
+                raise ValueError(error)
+            if any(existing.get("nickname") == nickname for existing in next_accounts):
+                raise ValueError(f"用户昵称已存在: {nickname}")
+            account["nickname"] = nickname
             next_accounts.append(account)
             self.state["accounts"] = next_accounts
             self.save()
+            return dict(account)
 
     def update_account(self, account_id, **updates):
         with self.lock:
+            if "nickname" in updates:
+                nickname = self._normalize_account_nickname(updates.get("nickname"))
+                error = self.validate_account_nickname(nickname)
+                if error:
+                    raise ValueError(error)
+                self._ensure_account_nicknames_locked()
+                if any(
+                    account.get("accountId") != account_id and account.get("nickname") == nickname
+                    for account in self.state["accounts"]
+                ):
+                    raise ValueError(f"用户昵称已存在: {nickname}")
+                updates["nickname"] = nickname
             changed = False
             for account in self.state["accounts"]:
                 if account.get("accountId") == account_id:
@@ -98,6 +178,53 @@ class StateStore:
                 return False
             self.save(debounce=True)
             return True
+
+    def find_account(self, selector):
+        value = str(selector or "").strip()
+        if not value:
+            return None
+        with self.lock:
+            self._ensure_account_nicknames_locked()
+            accounts = list(self.state["accounts"])
+            for account in accounts:
+                if account.get("accountId") == value:
+                    return dict(account)
+            for account in accounts:
+                if account.get("nickname") == value:
+                    return dict(account)
+            if value.isdigit():
+                index = int(value) - 1
+                if 0 <= index < len(accounts):
+                    return dict(accounts[index])
+        return None
+
+    def rename_account(self, selector, nickname):
+        target = self.find_account(selector)
+        if not target:
+            return None
+        self.update_account(target.get("accountId"), nickname=nickname)
+        target["nickname"] = self._normalize_account_nickname(nickname)
+        return target
+
+    def delete_account(self, selector):
+        target = self.find_account(selector)
+        if not target:
+            return None
+        account_id = target.get("accountId")
+        if not account_id:
+            return None
+        prefix = f"{account_id}:"
+        with self.lock:
+            self.state["accounts"] = [
+                account for account in self.state["accounts"] if account.get("accountId") != account_id
+            ]
+            for bucket in ("sessions", "contextTokens", "workspaces"):
+                values = self.state.get(bucket) or {}
+                for key in list(values.keys()):
+                    if key.startswith(prefix):
+                        values.pop(key, None)
+            self.save()
+        return target
 
     def conversation_key(self, account_id, user_id):
         return f"{account_id}:{user_id}"

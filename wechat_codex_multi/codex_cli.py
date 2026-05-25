@@ -192,6 +192,29 @@ class CodexCliRunner:
             process = self.process_by_conversation.get(conversation_key)
         return bool(process and process.poll() is None)
 
+    def active_runs(self):
+        default_cwd = self.config["codex"]["workingDirectory"]
+        with self.processes_lock:
+            items = [
+                (conversation_key, process)
+                for conversation_key, process in self.process_by_conversation.items()
+                if process and process.poll() is None
+            ]
+        runs = []
+        for conversation_key, process in sorted(items, key=lambda item: item[0]):
+            session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))
+            model_selection = resolve_session_model(self.config, session)
+            runs.append(
+                {
+                    "agent": "codex",
+                    "conversationKey": conversation_key,
+                    "pid": getattr(process, "pid", None),
+                    "model": model_selection.get("model") or "",
+                    "effort": model_selection.get("reasoningEffort") or "",
+                }
+            )
+        return runs
+
     def cancel(self, conversation_key, reset_session=True):
         with self.processes_lock:
             process = self.process_by_conversation.get(conversation_key)

@@ -78,6 +78,13 @@ class AgentRunnerManager:
     def is_running(self, conversation_key):
         return any(runner.is_running(conversation_key) for runner in self.runners.values())
 
+    def active_runs(self):
+        runs = []
+        for runner in self.runners.values():
+            if hasattr(runner, "active_runs"):
+                runs.extend(runner.active_runs())
+        return runs
+
     def cancel(self, conversation_key, reset_session=True):
         for runner in list(self.runners.values()):
             if runner.is_running(conversation_key):

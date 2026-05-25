@@ -30,16 +30,26 @@ def ensure_account_session(state, config, account):
 def add_account(args):
     config = load_config(args.config)
     log.configure(config.get("logLevel"))
+    state = StateStore(config["stateDir"])
+    nickname = str(args.nickname or "").strip()
+    if nickname:
+        error = StateStore.validate_account_nickname(nickname)
+        if error:
+            raise RuntimeError(error)
+        if not state.account_nickname_available(nickname):
+            raise RuntimeError(f"用户昵称已存在: {nickname}")
     account = login_with_qr(
         base_url=config["wechat"]["baseUrl"],
         bot_type=config["wechat"]["botType"],
         route_tag=config["wechat"].get("routeTag"),
         project_dir=PROJECT_DIR,
     )
-    state = StateStore(config["stateDir"])
-    state.upsert_account(account)
+    if nickname:
+        account["nickname"] = nickname
+    account = state.upsert_account(account)
     ensure_account_session(state, config, account)
     print("\n微信账号已保存。")
+    print(f"nickname: {account.get('nickname')}")
     print(f"accountId: {account['accountId']}")
     print(f"state: {state.file}")
 
@@ -60,6 +70,7 @@ def status(args):
         "accounts": [
             {
                 "accountId": a.get("accountId"),
+                "nickname": a.get("nickname"),
                 "baseUrl": a.get("baseUrl"),
                 "userId": a.get("userId"),
                 "hasToken": bool(a.get("token")),
@@ -70,6 +81,28 @@ def status(args):
         "sessionCount": len(state.state.get("sessions") or {}),
     }
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def delete_account(args):
+    config = load_config(args.config)
+    state = StateStore(config["stateDir"])
+    deleted = state.delete_account(args.selector)
+    if not deleted:
+        raise RuntimeError(f"没有找到用户: {args.selector}")
+    print(f"已删除用户: {deleted.get('nickname')}")
+    print(f"accountId: {deleted.get('accountId')}")
+    print(f"state: {state.file}")
+
+
+def rename_account(args):
+    config = load_config(args.config)
+    state = StateStore(config["stateDir"])
+    renamed = state.rename_account(args.selector, args.nickname)
+    if not renamed:
+        raise RuntimeError(f"没有找到用户: {args.selector}")
+    print(f"已修改用户昵称: {args.selector} -> {renamed.get('nickname')}")
+    print(f"accountId: {renamed.get('accountId')}")
+    print(f"state: {state.file}")
 
 
 def media_generate(args):
@@ -91,7 +124,26 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("add-account", help="扫码新增一个微信 Bot 账号")
+    p.add_argument("nickname", nargs="?", help="用户昵称，默认自动生成 用户1、用户2 ...")
     p.set_defaults(func=add_account)
+
+    p = sub.add_parser("delete-account", help="按昵称、accountId 或编号删除微信用户")
+    p.add_argument("selector")
+    p.set_defaults(func=delete_account)
+
+    p = sub.add_parser("delete-user", help="按昵称、accountId 或编号删除微信用户")
+    p.add_argument("selector")
+    p.set_defaults(func=delete_account)
+
+    p = sub.add_parser("rename-account", help="修改微信用户昵称")
+    p.add_argument("selector")
+    p.add_argument("nickname")
+    p.set_defaults(func=rename_account)
+
+    p = sub.add_parser("rename-user", help="修改微信用户昵称")
+    p.add_argument("selector")
+    p.add_argument("nickname")
+    p.set_defaults(func=rename_account)
 
     p = sub.add_parser("start", help="启动多账号微信 CLI Agent 服务")
     p.set_defaults(func=start)

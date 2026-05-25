@@ -401,6 +401,32 @@ class CodexAppServerRunner:
             context = self.contexts.get(conversation_key)
         return bool(context and context.running)
 
+    def active_runs(self):
+        default_cwd = self.config["codex"]["workingDirectory"]
+        with self.lock:
+            contexts = [
+                (conversation_key, context)
+                for conversation_key, context in self.contexts.items()
+                if context and context.running
+            ]
+        runs = []
+        for conversation_key, _context in sorted(contexts, key=lambda item: item[0]):
+            session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))
+            codex_account = resolve_session_codex_account(self.config, session)
+            server = self.servers.get(self._server_key(codex_account))
+            process = getattr(server, "process", None) if server else None
+            model_selection = resolve_session_model(self.config, session)
+            runs.append(
+                {
+                    "agent": "codex",
+                    "conversationKey": conversation_key,
+                    "pid": getattr(process, "pid", None),
+                    "model": model_selection.get("model") or "",
+                    "effort": model_selection.get("reasoningEffort") or "",
+                }
+            )
+        return runs
+
     def run(self, conversation_key, user_message, retry_on_resume_error=True):
         default_cwd = self.config["codex"]["workingDirectory"]
         session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))

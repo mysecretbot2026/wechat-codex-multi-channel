@@ -56,6 +56,15 @@ class FakeRunRunner:
         return None
 
 
+class FakeActiveRunner(FakeRunRunner):
+    def __init__(self, runs):
+        super().__init__()
+        self.runs = runs
+
+    def active_runs(self):
+        return list(self.runs)
+
+
 def make_test_config(state_dir):
     return {
         "stateDir": state_dir,
@@ -166,6 +175,66 @@ class ServicePerformanceTests(unittest.TestCase):
             service._handle_message(account, "user-1", conversation_key, "/status")
 
             self.assertIn("running: true", sent[-1])
+
+    def test_status_includes_current_agent_session_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="codex", codexThreadId="thread-1234567890")
+
+            service._handle_message(account, "user-1", conversation_key, "/status")
+
+            self.assertIn("sessionId: thread-1234567890", sent[-1])
+
+    def test_active_command_lists_grouped_running_users(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeActiveRunner(
+                [
+                    {
+                        "agent": "claude",
+                        "conversationKey": "acc123:user789",
+                        "pid": 25164,
+                    },
+                    {
+                        "agent": "claude",
+                        "conversationKey": "acc123:user456",
+                        "pid": 17140,
+                        "model": "opus",
+                        "effort": "medium",
+                    },
+                ]
+            )
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/active")
+
+            self.assertEqual(
+                sent[-1],
+                "claude (2 个)：\n"
+                "- acc123:user456 (pid=17140 model=opus effort=medium)\n"
+                "- acc123:user789 (pid=25164)\n"
+                "共 2 个用户正在交互中",
+            )
+
+    def test_active_command_reports_empty_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.codex = FakeActiveRunner([])
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/active")
+
+            self.assertEqual(sent[-1], "当前没有用户正在交互中。")
 
     def test_sessions_command_lists_and_uses_codex_session(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -348,6 +417,13 @@ class ServicePerformanceTests(unittest.TestCase):
     def test_restart_can_run_without_conversation_lock(self):
         self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/restart"))
 
+    def test_active_can_run_without_conversation_lock(self):
+        self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/active"))
+
+    def test_user_commands_can_run_without_conversation_lock(self):
+        self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/users"))
+        self.assertTrue(MultiWechatCodexService._can_run_without_conversation_lock("/user rename 用户1 主号"))
+
     def test_login_seeds_session_for_new_account(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = make_test_config(tmp)
@@ -376,8 +452,119 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertEqual(started, ["acct-new"])
             self.assertIn("新增账号已连接: acct-new", sent[-1])
             self.assertEqual([item["accountId"] for item in accounts], ["acct-new"])
+            self.assertEqual(accounts[0]["nickname"], "用户1")
             self.assertEqual(session["cwd"], tmp)
             self.assertEqual(session["agent"], "codex")
+
+    def test_login_accepts_account_nickname(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["adminUsers"] = ["admin-1"]
+            service = MultiWechatCodexService(config)
+            sent = []
+            started = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._start_account_monitor = lambda account: started.append(account["nickname"])
+            current_account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "admin-1")
+            new_account = {
+                "accountId": "acct-new",
+                "userId": "user-new",
+                "token": "token-new",
+                "baseUrl": "https://example.test",
+            }
+
+            with patch("wechat_codex_multi.service.login_with_qr", return_value=new_account):
+                service._handle_message(current_account, "admin-1", conversation_key, "/login 主号")
+
+            accounts = service.state.list_accounts()
+            self.assertEqual(accounts[0]["nickname"], "主号")
+            self.assertEqual(started, ["主号"])
+            self.assertIn("昵称: 主号", sent[-1])
+
+    def test_login_rejects_duplicate_nickname_before_qr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["adminUsers"] = ["admin-1"]
+            service = MultiWechatCodexService(config)
+            service.state.upsert_account({"accountId": "acct-existing", "nickname": "主号"})
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "admin-1")
+
+            with patch("wechat_codex_multi.service.login_with_qr") as login:
+                service._handle_message(account, "admin-1", conversation_key, "/login 主号")
+
+            login.assert_not_called()
+            self.assertEqual(sent[-1], "用户昵称已存在: 主号")
+
+    def test_accounts_command_lists_nicknames(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.state.upsert_account({"accountId": "acct-1", "userId": "user-1", "nickname": "主号"})
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/accounts")
+
+            self.assertIn("1. 主号 accountId=acct-1 userId=user-1", sent[-1])
+
+    def test_user_rename_and_delete_require_admin_and_update_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["adminUsers"] = ["admin-1"]
+            service = MultiWechatCodexService(config)
+            service.state.upsert_account({"accountId": "acct-1", "userId": "user-1", "nickname": "旧名"})
+            service.state.update_session("acct-1:user-1", cwd=tmp)
+            service.state.set_context_token("acct-1", "user-1", "ctx")
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "admin-1")
+
+            service._handle_message(account, "admin-1", conversation_key, "/user rename 旧名 新名")
+            service._handle_message(account, "admin-1", conversation_key, "/user delete 新名")
+
+            self.assertIn("已修改用户昵称: 旧名 -> 新名", sent[-2])
+            self.assertIn("已删除用户: 新名", sent[-1])
+            self.assertEqual(service.state.list_accounts(), [])
+            self.assertIn("acct-1", service.monitor_disabled_accounts)
+            self.assertNotIn("acct-1:user-1", service.state.state["sessions"])
+
+    def test_user_delete_requires_admin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service.state.upsert_account({"accountId": "acct-1", "nickname": "主号"})
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/user delete 主号")
+
+            self.assertEqual(sent[-1], "只有 adminUsers 可以删除用户。")
+            self.assertEqual(len(service.state.list_accounts()), 1)
+
+    def test_user_can_delete_current_account_and_still_reply_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["adminUsers"] = ["admin-1"]
+            service = MultiWechatCodexService(config)
+            service.state.upsert_account({"accountId": "acct-current", "userId": "bot-user", "nickname": "当前号"})
+            service.state.set_context_token("acct-current", "admin-1", "ctx-current")
+            sent = []
+            service._send_text_with_context_token = lambda account, user_id, token, text: sent.append((token, text))
+            account = {"accountId": "acct-current"}
+            conversation_key = service.state.conversation_key("acct-current", "admin-1")
+
+            service._handle_message(account, "admin-1", conversation_key, "/user delete 当前号")
+
+            self.assertEqual(sent[-1][0], "ctx-current")
+            self.assertIn("已删除用户: 当前号", sent[-1][1])
+            self.assertEqual(service.state.list_accounts(), [])
 
     def test_login_sends_qr_to_admin_before_waiting(self):
         with tempfile.TemporaryDirectory() as tmp:

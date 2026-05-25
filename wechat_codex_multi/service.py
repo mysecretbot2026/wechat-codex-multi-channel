@@ -84,6 +84,7 @@ class MultiWechatCodexService:
         self.pending_guidance_guard = threading.Lock()
         self.session_selection_cache = {}
         self.monitor_accounts = set()
+        self.monitor_disabled_accounts = set()
         self._model_options = None
         self._claude_model_options = None
 
@@ -130,6 +131,7 @@ class MultiWechatCodexService:
         account_id = account["accountId"]
         if account_id in self.monitor_accounts:
             return
+        self.monitor_disabled_accounts.discard(account_id)
         self.monitor_accounts.add(account_id)
         thread = threading.Thread(target=self._monitor_account, args=(account,), daemon=True)
         thread.start()
@@ -140,21 +142,27 @@ class MultiWechatCodexService:
         get_updates_buf = account.get("getUpdatesBuf") or ""
         log.info(f"monitor started accountId={account_id}")
         failures = 0
-        while not self.stop_event.is_set():
-            try:
-                response = client.get_updates(get_updates_buf)
-                failures = 0
-                if response.get("get_updates_buf"):
-                    get_updates_buf = response["get_updates_buf"]
-                    self.state.update_account(account_id, getUpdatesBuf=get_updates_buf)
-                for msg in response.get("msgs") or []:
-                    if msg.get("message_type") != MESSAGE_TYPE_USER:
-                        continue
-                    self._submit_message(account, msg)
-            except Exception as err:
-                failures += 1
-                log.error(f"monitor error accountId={account_id}: {err}")
-                time.sleep(30 if failures >= 3 else 2)
+        try:
+            while not self.stop_event.is_set() and account_id not in self.monitor_disabled_accounts:
+                try:
+                    response = client.get_updates(get_updates_buf)
+                    if account_id in self.monitor_disabled_accounts:
+                        break
+                    failures = 0
+                    if response.get("get_updates_buf"):
+                        get_updates_buf = response["get_updates_buf"]
+                        self.state.update_account(account_id, getUpdatesBuf=get_updates_buf)
+                    for msg in response.get("msgs") or []:
+                        if msg.get("message_type") != MESSAGE_TYPE_USER:
+                            continue
+                        self._submit_message(account, msg)
+                except Exception as err:
+                    failures += 1
+                    log.error(f"monitor error accountId={account_id}: {err}")
+                    time.sleep(30 if failures >= 3 else 2)
+        finally:
+            self.monitor_accounts.discard(account_id)
+            log.info(f"monitor stopped accountId={account_id}")
 
     def _submit_message(self, account, msg):
         account_id = account["accountId"]
@@ -292,6 +300,9 @@ class MultiWechatCodexService:
         return first in {
             "/help",
             "/accounts",
+            "/users",
+            "/user",
+            "/active",
             "/status",
             "/usage",
             "/agents",
@@ -314,6 +325,154 @@ class MultiWechatCodexService:
     def _agent_label(agent):
         return "Claude" if str(agent or "").lower() == "claude" else "Codex"
 
+    @staticmethod
+    def _account_nickname(account):
+        return str((account or {}).get("nickname") or "").strip()
+
+    def _format_accounts(self):
+        accounts = self.state.list_accounts()
+        if not accounts:
+            return "没有已连接用户。"
+        lines = ["已连接用户："]
+        for index, item in enumerate(accounts, start=1):
+            nickname = self._account_nickname(item) or f"用户{index}"
+            user_id = item.get("userId") or "-"
+            lines.append(f"{index}. {nickname} accountId={item.get('accountId')} userId={user_id}")
+        lines.extend(
+            [
+                "",
+                "添加：/login [昵称]",
+                "改名：/user rename <当前昵称|accountId|编号> <新昵称>",
+                "删除：/user delete <昵称|accountId|编号>",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _handle_user_command(self, account, user_id, command):
+        parts = command.split(maxsplit=3)
+        if command == "/users" or command == "/user" or (len(parts) >= 2 and parts[1].lower() in {"list", "ls"}):
+            self._send_text(account, user_id, self._format_accounts())
+            return
+        action = parts[1].lower() if len(parts) >= 2 else ""
+        if action in {"rename", "nick", "nickname"}:
+            if not self._is_admin(user_id):
+                self._send_text(account, user_id, "只有 adminUsers 可以修改用户昵称。")
+                return
+            if len(parts) < 4:
+                self._send_text(account, user_id, "用法：/user rename <当前昵称|accountId|编号> <新昵称>")
+                return
+            selector = parts[2].strip()
+            nickname = parts[3].strip()
+            try:
+                renamed = self.state.rename_account(selector, nickname)
+            except ValueError as err:
+                self._send_text(account, user_id, str(err))
+                return
+            if not renamed:
+                self._send_text(account, user_id, f"没有找到用户: {selector}")
+                return
+            self._send_text(
+                account,
+                user_id,
+                f"已修改用户昵称: {selector} -> {renamed.get('nickname')}\naccountId: {renamed.get('accountId')}",
+            )
+            return
+        if action in {"delete", "remove", "del", "rm"}:
+            if not self._is_admin(user_id):
+                self._send_text(account, user_id, "只有 adminUsers 可以删除用户。")
+                return
+            if len(parts) < 3:
+                self._send_text(account, user_id, "用法：/user delete <昵称|accountId|编号>")
+                return
+            selector = parts[2].strip()
+            target = self.state.find_account(selector)
+            if not target:
+                self._send_text(account, user_id, f"没有找到用户: {selector}")
+                return
+            reply_context_token = self.state.get_context_token(account["accountId"], user_id)
+            account_id = target.get("accountId")
+            prefix = f"{account_id}:"
+            for run in self._active_runs():
+                conversation_key = str(run.get("conversationKey") or "")
+                if conversation_key.startswith(prefix):
+                    self._cancel_runner(conversation_key, reset_session=True)
+                    self._clear_pending_guidance(conversation_key)
+            deleted = self.state.delete_account(account_id)
+            if not deleted:
+                self._send_text(account, user_id, f"没有找到用户: {selector}")
+                return
+            self.monitor_disabled_accounts.add(account_id)
+            message = f"已删除用户: {deleted.get('nickname')}\naccountId: {account_id}"
+            if account_id == account.get("accountId"):
+                self._send_text_with_context_token(account, user_id, reply_context_token, message)
+            else:
+                self._send_text(account, user_id, message)
+            return
+        self._send_text(
+            account,
+            user_id,
+            "\n".join(
+                [
+                    "用户命令：",
+                    "/users 查看已连接用户",
+                    "/login [昵称] 新增用户",
+                    "/user rename <当前昵称|accountId|编号> <新昵称>",
+                    "/user delete <昵称|accountId|编号>",
+                ]
+            ),
+        )
+
+    def _active_runs(self):
+        if hasattr(self.codex, "active_runs"):
+            return self.codex.active_runs()
+        return []
+
+    @staticmethod
+    def _format_active_runs(runs):
+        cleaned = []
+        for run in runs or []:
+            conversation_key = str(run.get("conversationKey") or run.get("conversation") or "").strip()
+            if not conversation_key:
+                continue
+            agent = str(run.get("agent") or "codex").strip().lower() or "codex"
+            cleaned.append(
+                {
+                    "agent": agent,
+                    "conversationKey": conversation_key,
+                    "pid": run.get("pid"),
+                    "model": str(run.get("model") or "").strip(),
+                    "effort": str(run.get("effort") or "").strip(),
+                }
+            )
+        if not cleaned:
+            return "当前没有用户正在交互中。"
+
+        agent_order = ["claude", "codex"]
+        agent_order.extend(sorted({item["agent"] for item in cleaned if item["agent"] not in agent_order}))
+        lines = []
+        for agent in agent_order:
+            entries = sorted(
+                [item for item in cleaned if item["agent"] == agent],
+                key=lambda item: item["conversationKey"],
+            )
+            if not entries:
+                continue
+            if lines:
+                lines.append("")
+            lines.append(f"{agent} ({len(entries)} 个)：")
+            for item in entries:
+                details = []
+                if item.get("pid") is not None:
+                    details.append(f"pid={item.get('pid')}")
+                if item.get("model"):
+                    details.append(f"model={item.get('model')}")
+                if item.get("effort"):
+                    details.append(f"effort={item.get('effort')}")
+                suffix = f" ({' '.join(details)})" if details else ""
+                lines.append(f"- {item['conversationKey']}{suffix}")
+        lines.append(f"共 {len(cleaned)} 个用户正在交互中")
+        return "\n".join(lines)
+
     def _handle_message(self, account, user_id, base_conversation_key, text, conversation_key=None):
         conversation_key = conversation_key or base_conversation_key
         command = text.strip()
@@ -321,11 +480,13 @@ class MultiWechatCodexService:
             self._send_text(account, user_id, self._help_text(account["accountId"]))
             return
         if command == "/accounts":
-            self._send_text(
-                account,
-                user_id,
-                "已连接账号：\n" + "\n".join(a["accountId"] for a in self.state.list_accounts()),
-            )
+            self._send_text(account, user_id, self._format_accounts())
+            return
+        if command == "/users" or command == "/user" or command.startswith("/user "):
+            self._handle_user_command(account, user_id, command)
+            return
+        if command == "/active":
+            self._send_text(account, user_id, self._format_active_runs(self._active_runs()))
             return
         if command == "/ws" or command.startswith("/ws "):
             self._handle_workspace_command(account, user_id, base_conversation_key, conversation_key, command)
@@ -338,6 +499,7 @@ class MultiWechatCodexService:
             model_selection = resolve_session_model(self.config, session)
             claude_model = resolve_session_claude_model(self.config, session)
             workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
+            session_id = session.get("claudeSessionId") if agent == "claude" else session.get("codexThreadId")
             lines = [
                 f"accountId: {account['accountId']}",
                 f"conversation: {conversation_key}",
@@ -345,6 +507,7 @@ class MultiWechatCodexService:
                 f"cwd: {session.get('cwd')}",
                 f"agent: {agent}",
                 f"running: {str(self.codex.is_running(conversation_key)).lower()}",
+                f"sessionId: {session_id or '-'}",
             ]
             if agent == "claude":
                 lines.extend(
@@ -388,7 +551,13 @@ class MultiWechatCodexService:
                         f"codexThreadId: {(session.get('codexThreadId') or '')[:12]}",
                     ]
                 )
-            lines.append("accounts: " + ", ".join(a["accountId"] for a in self.state.list_accounts()))
+            lines.append(
+                "accounts: "
+                + ", ".join(
+                    f"{self._account_nickname(a) or a['accountId']}({a['accountId']})"
+                    for a in self.state.list_accounts()
+                )
+            )
             self._send_text(account, user_id, "\n".join(lines))
             return
         if command == "/sessions" or command.startswith("/sessions "):
@@ -463,10 +632,19 @@ class MultiWechatCodexService:
             selector = command[len("/runner"):].strip()
             self._handle_runner_switch(account, user_id, selector)
             return
-        if command == "/login":
+        if command == "/login" or command.startswith("/login "):
             if not self._is_admin(user_id):
                 self._send_text(account, user_id, "只有 adminUsers 可以通过微信触发 /login。")
                 return
+            nickname = command[len("/login"):].strip()
+            if nickname:
+                error = StateStore.validate_account_nickname(nickname)
+                if error:
+                    self._send_text(account, user_id, error)
+                    return
+                if not self.state.account_nickname_available(nickname):
+                    self._send_text(account, user_id, f"用户昵称已存在: {nickname}")
+                    return
             self._send_text(account, user_id, "正在生成新增 Bot 账号登录二维码，请在微信中扫码确认。")
 
             def send_qr(qr_content, _qr):
@@ -484,10 +662,20 @@ class MultiWechatCodexService:
                 project_dir=PROJECT_DIR,
                 on_qr=send_qr,
             )
-            self.state.upsert_account(new_account)
+            if nickname:
+                new_account["nickname"] = nickname
+            try:
+                new_account = self.state.upsert_account(new_account)
+            except ValueError as err:
+                self._send_text(account, user_id, f"新增账号失败：{err}")
+                return
             self._ensure_account_session(new_account)
             self._start_account_monitor(new_account)
-            self._send_text(account, user_id, f"新增账号已连接: {new_account['accountId']}")
+            self._send_text(
+                account,
+                user_id,
+                f"新增账号已连接: {new_account['accountId']}\n昵称: {new_account.get('nickname')}",
+            )
             return
         if command == "/restart":
             if not self._is_admin(user_id):
@@ -1518,11 +1706,17 @@ class MultiWechatCodexService:
         return stop
 
     def _send_text(self, account, user_id, text):
-        client = self._api_for_account(account)
         context_token = self.state.get_context_token(account["accountId"], user_id)
         if not context_token:
             log.error(f"cannot reply: missing context_token account={account['accountId']} user={user_id}")
             return
+        self._send_text_with_context_token(account, user_id, context_token, text)
+
+    def _send_text_with_context_token(self, account, user_id, context_token, text):
+        if not context_token:
+            log.error(f"cannot reply: missing context_token account={account['accountId']} user={user_id}")
+            return
+        client = self._api_for_account(account)
         for chunk in split_text(text, int(self.config.get("textChunkLimit") or 4000)):
             client.send_text(user_id, context_token, chunk)
 
@@ -1573,8 +1767,11 @@ class MultiWechatCodexService:
                 "/ws add <名称> <路径> 添加项目工作区",
                 "/ws agent <名称> <codex|claude> 设置指定工作区 Agent",
                 "/ws run <名称> <任务> 指定工作区派活",
-                "/accounts 查看已连接 Bot 账号",
-                "/login 新增 Bot 账号（adminUsers only）",
+                "/active 查看正在交互中的用户",
+                "/accounts 或 /users 查看已连接用户",
+                "/login [昵称] 新增用户（adminUsers only）",
+                "/user rename <昵称|accountId|编号> <新昵称> 修改用户昵称（adminUsers only）",
+                "/user delete <昵称|accountId|编号> 删除用户（adminUsers only）",
                 "/restart 重启后台服务（adminUsers only）",
                 "/help 查看帮助",
                 "",

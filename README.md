@@ -80,13 +80,20 @@ npm run status
 继续添加微信 Bot 账号：
 
 ```bash
-python3 -m wechat_codex_multi add-account
+python3 -m wechat_codex_multi add-account [昵称]
 ```
 
 查看本地状态：
 
 ```bash
 python3 -m wechat_codex_multi status
+```
+
+本地改名或删除微信用户：
+
+```bash
+python3 -m wechat_codex_multi rename-user 用户1 主号
+python3 -m wechat_codex_multi delete-user 主号
 ```
 
 使用自定义配置文件：
@@ -226,7 +233,8 @@ cp config.example.json config.json
 | `/usage claude` | 查看当前工作区 Claude 账号用量 |
 | `/usage codex all` | 查看所有 Codex 账号用量 |
 | `/usage claude all` | 查看所有 Claude 账号用量 |
-| `/accounts` | 查看已连接的微信 Bot 账号 |
+| `/accounts` 或 `/users` | 查看已连接用户的昵称、accountId 和 userId |
+| `/active` | 查看当前正在交互中的用户，按 Agent 显示 conversation、pid、模型和 effort |
 | `/agents` | 查看可用 Agent |
 | `/agent` | 查看当前工作区使用的 Agent |
 | `/agent codex` | 切换当前工作区到 Codex CLI |
@@ -264,7 +272,9 @@ cp config.example.json config.json
 | `/guide <补充要求>` | 当前任务运行中追加补充引导；直接发送普通消息也会追加 |
 | `/interrupt` 或 `/cancel` | 立刻中断当前任务，保留当前 Agent 会话 |
 | `/interrupt <新任务>` | 中断当前任务，保留当前 Agent 会话，并在当前进程退出后自动执行新任务 |
-| `/login` | 新增微信 Bot 账号，仅 `adminUsers` 可用 |
+| `/login [昵称]` | 新增微信用户；未传昵称时自动保存为 `用户1`、`用户2` 等，仅 `adminUsers` 可用 |
+| `/user rename <昵称|accountId|编号> <新昵称>` | 修改用户昵称，仅 `adminUsers` 可用 |
+| `/user delete <昵称|accountId|编号>` | 删除用户并清理该用户会话，仅 `adminUsers` 可用 |
 | `/restart` | 重启后台服务，仅 `adminUsers` 可用 |
 
 常见用法：
@@ -274,6 +284,10 @@ cp config.example.json config.json
 /usage
 /usage all
 /usage claude
+/users
+/login 主号
+/user rename 主号 工作号
+/user delete 工作号
 
 /agents
 /agent claude
@@ -323,7 +337,7 @@ cp config.example.json config.json
 
 `/codex` 是切到 Codex CLI 的快捷命令，可同时切 Codex 账号；`/claude` 是切到 Claude Code CLI 的快捷命令，可同时切 Claude 账号。只切 Agent 不会清空另一个 Agent 已保存的会话 ID，切换账号才会重置对应 Agent 会话。`/model` 切换的是当前 Agent 的模型和 effort/reasoning，会重置当前 Agent 的会话。
 
-`/status` 会显示当前工作区是否有任务正在运行：`running: true` 或 `running: false`。这个状态和 `/ws` 里的 `[running]` / `[idle]` 使用同一套运行表。
+`/status` 会显示当前工作区是否有任务正在运行：`running: true` 或 `running: false`。同时会显示当前 Agent 对应的完整 `sessionId`，Codex 时对应 `codexThreadId`，Claude 时对应 `claudeSessionId`，可用于 `/session use <sessionId前缀>` 切回会话。这个运行状态和 `/ws` 里的 `[running]` / `[idle]` 使用同一套运行表。
 
 `/sessions` 从本机 CLI 会话存储读取可恢复会话。Codex 读取当前 `CODEX_HOME/state_5.sqlite` 的 threads 表，优先显示 Codex 生成的 title；必要时回退到 `session_index.jsonl`。Claude 读取当前 `CLAUDE_CONFIG_DIR` 下的 `usage-data/session-meta/*.json` 和 `projects/**/*.jsonl`，用 `first_prompt` 或第一条用户消息作为标题。列表按更新时间倒序，编号只在当前工作区最近一次 `/sessions` 输出中有效。
 
@@ -824,7 +838,7 @@ launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
 - `PATH` 要包含 `codex` 和 `claude` 所在目录。Apple Silicon Homebrew 通常是 `/opt/homebrew/bin`，Intel Mac Homebrew 通常是 `/usr/local/bin`。
 - 如果 Codex 使用多个 `CODEX_HOME`，确保这些目录都已经单独 `codex login`。
 - 如果 Claude 使用多个 `CLAUDE_CONFIG_DIR`，确保这些目录都已经单独 `claude auth login`。
-- `/login` 会把登录二维码发送给管理员微信，同时也会在运行服务的终端输出二维码作为兜底。
+- `/login [昵称]` 会把登录二维码发送给管理员微信，同时也会在运行服务的终端输出二维码作为兜底。昵称不传时自动生成 `用户1`、`用户2` 等；也可以用 `/user rename` 后续修改，用 `/user delete` 按昵称删除。
 
 ## 开发和验证
 
@@ -865,7 +879,7 @@ accountId:userId:workspaceName
 
 `default` 工作区继续使用基础会话 key，兼容原有会话。`/ws run <名称> <任务>` 会直接使用指定工作区的 key，因此同一个微信用户可以同时让不同项目工作区并发执行。
 
-当同一个工作区有任务正在运行时，新的普通消息会立即作为补充引导处理。`/status`、`/usage`、`/agents`、`/agent`、`/account`、`/codex-accounts`、`/codex`、`/claude-accounts`、`/claude`、`/model`、`/models`、`/sessions`、`/session`、`/accounts`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/interrupt` 和 `/cancel` 可取消当前任务并保留会话，`/reset` 可取消当前工作区正在运行的任务并重置会话，`/ws reset <名称>` 可取消指定工作区。
+当同一个工作区有任务正在运行时，新的普通消息会立即作为补充引导处理。`/status`、`/active`、`/usage`、`/agents`、`/agent`、`/account`、`/codex-accounts`、`/codex`、`/claude-accounts`、`/claude`、`/model`、`/models`、`/sessions`、`/session`、`/accounts`、`/users`、`/user`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/interrupt` 和 `/cancel` 可取消当前任务并保留会话，`/reset` 可取消当前工作区正在运行的任务并重置会话，`/ws reset <名称>` 可取消指定工作区。
 
 超时、服务停止或 `/reset` 取消时，服务会清理当前 CLI 进程组，避免残留进程继续占用会话。
 

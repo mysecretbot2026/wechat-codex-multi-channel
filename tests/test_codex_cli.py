@@ -104,6 +104,39 @@ class CodexCliRunnerTests(unittest.TestCase):
         self.assertFalse(runner.cancel("conversation-1", reset_session=False))
         self.assertEqual(state.reset_keys, [])
 
+    def test_active_runs_reports_running_process_model_and_pid(self):
+        state = FakeState(str(Path.cwd()))
+        state.session_updates = {"codexModel": "gpt-5.5", "codexReasoningEffort": "high"}
+        runner = CodexCliRunner(
+            {
+                "codex": {
+                    "bin": "codex",
+                    "workingDirectory": str(Path.cwd()),
+                    "timeoutMs": 1000,
+                    "model": "gpt-default",
+                    "reasoningEffort": "medium",
+                }
+            },
+            state,
+        )
+        process = Mock()
+        process.pid = 12345
+        process.poll.return_value = None
+        runner._register_process("acct-1:user-1", process)
+
+        self.assertEqual(
+            runner.active_runs(),
+            [
+                {
+                    "agent": "codex",
+                    "conversationKey": "acct-1:user-1",
+                    "pid": 12345,
+                    "model": "gpt-5.5",
+                    "effort": "high",
+                }
+            ],
+        )
+
     def test_cancelled_run_raises_cancelled_without_retrying(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {
