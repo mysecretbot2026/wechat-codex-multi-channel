@@ -24,7 +24,14 @@ from .claude_models import (
     format_claude_model_option,
     resolve_session_claude_model,
 )
-from .claude_usage import format_claude_usage, format_claude_usage_all, read_claude_auth_status, read_claude_usage
+from .claude_usage import (
+    format_claude_admin_usage,
+    format_claude_usage,
+    format_claude_usage_all,
+    read_claude_admin_usage,
+    read_claude_auth_status,
+    read_claude_usage,
+)
 from .codex_app_server import CodexAppServerRunner
 from .codex_accounts import (
     adjacent_codex_account,
@@ -522,7 +529,7 @@ class MultiWechatCodexService:
                 try:
                     auth = read_claude_auth_status(
                         self.config.get("claude", {}).get("bin") or "claude",
-                        timeout_s=int(self.config.get("claude", {}).get("usageTimeoutSeconds") or 2),
+                        timeout_s=int(self.config.get("claude", {}).get("authStatusTimeoutSeconds") or 5),
                         claude_config_dir=claude_account.get("claudeConfigDir") or "",
                     )
                     lines.append(f"claudeLogin: {'logged in' if auth.get('loggedIn') else 'not logged in'}")
@@ -983,14 +990,26 @@ class MultiWechatCodexService:
                 results[index] = result
         return format_codex_usage_all([result for result in results if result is not None])
 
-    def _read_claude_usage_for_account(self, claude_account):
+    def _read_claude_usage_for_account(self, claude_account, cwd=""):
+        claude_config = self.config.get("claude", {}) or {}
         usage = read_claude_usage(
-            self.config.get("claude", {}).get("bin") or "claude",
-            timeout_s=int(self.config.get("claude", {}).get("usageTimeoutSeconds") or 2),
+            claude_config.get("bin") or "claude",
+            timeout_s=int(claude_config.get("usageTimeoutSeconds") or 30),
             claude_config_dir=claude_account.get("claudeConfigDir") or "",
-            permission_mode=self.config.get("claude", {}).get("permissionMode") or "",
+            permission_mode=claude_config.get("permissionMode") or "",
+            cwd=cwd,
+            include_admin_usage=False,
         )
         return format_claude_usage(usage, claude_account)
+
+    def _read_claude_admin_usage(self, days=None):
+        claude_config = self.config.get("claude", {}) or {}
+        usage = read_claude_admin_usage(
+            days=int(days or claude_config.get("adminUsageDays") or 7),
+            timeout_s=int(claude_config.get("adminUsageTimeoutSeconds") or 60),
+            keychain_service=claude_config.get("adminKeychainService") or "",
+        )
+        return format_claude_admin_usage(usage)
 
     def _read_all_claude_usage(self):
         accounts = list_claude_accounts(self.config)
@@ -1003,9 +1022,11 @@ class MultiWechatCodexService:
             try:
                 usage = read_claude_usage(
                     self.config.get("claude", {}).get("bin") or "claude",
-                    timeout_s=int(self.config.get("claude", {}).get("usageTimeoutSeconds") or 2),
+                    timeout_s=int(self.config.get("claude", {}).get("usageTimeoutSeconds") or 30),
                     claude_config_dir=claude_account.get("claudeConfigDir") or "",
                     permission_mode=self.config.get("claude", {}).get("permissionMode") or "",
+                    cwd=self.config.get("claude", {}).get("workingDirectory") or self.config["codex"]["workingDirectory"],
+                    include_admin_usage=False,
                 )
                 return index, {"account": claude_account, "usage": usage}
             except Exception as err:
@@ -1028,6 +1049,10 @@ class MultiWechatCodexService:
         values = [str(arg or "").strip().lower() for arg in args if str(arg or "").strip()]
         session = self._get_session(conversation_key)
         current_agent = resolve_session_agent(self.config, session)
+        if len(values) >= 2 and values[0] == "claude" and values[1] in {"api", "admin"}:
+            if len(values) > 3 or (len(values) == 3 and not values[2].isdigit()):
+                return "用法：/usage claude api [days]\n例如：/usage claude api 7"
+            return self._read_claude_admin_usage(int(values[2]) if len(values) == 3 else None)
         if not values:
             target = current_agent
             scope = "current"
@@ -1041,7 +1066,7 @@ class MultiWechatCodexService:
             target = values[0]
             scope = "all"
         else:
-            return "用法：/usage、/usage all、/usage codex、/usage claude、/usage codex all、/usage claude all"
+            return "用法：/usage、/usage all、/usage codex、/usage claude、/usage claude api [days]、/usage codex all、/usage claude all"
 
         if target == "all":
             return self._read_all_agent_usage()
@@ -1057,7 +1082,7 @@ class MultiWechatCodexService:
         if scope == "all":
             return self._read_all_claude_usage()
         claude_account = resolve_session_claude_account(self.config, session)
-        return self._read_claude_usage_for_account(claude_account)
+        return self._read_claude_usage_for_account(claude_account, cwd=session.get("cwd") or "")
 
     def _workspace_name_from_key(self, base_conversation_key, conversation_key):
         if conversation_key == base_conversation_key:

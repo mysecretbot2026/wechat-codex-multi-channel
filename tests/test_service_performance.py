@@ -841,13 +841,16 @@ class ServicePerformanceTests(unittest.TestCase):
 
             with patch("wechat_codex_multi.service.read_claude_usage") as read_usage:
                 read_usage.return_value = {
-                    "subscription": {"text": "subscription ok"},
-                    "stats": {"exists": False, "path": "/tmp/missing"},
+                    "interactive": {
+                        "source": "interactive-pty",
+                        "durationSeconds": 3.0,
+                        "text": "Claude Usage\n5-hour limit: 10%",
+                    },
                 }
                 service._handle_message(account, "user-1", conversation_key, "/usage")
 
             self.assertIn("Claude 用量", sent[-1])
-            self.assertIn("subscription ok", sent[-1])
+            self.assertIn("5-hour limit: 10%", sent[-1])
 
     def test_usage_all_includes_codex_and_claude(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -863,6 +866,21 @@ class ServicePerformanceTests(unittest.TestCase):
 
             self.assertIn("Codex 全部账号用量", sent[-1])
             self.assertIn("Claude 全部账号用量", sent[-1])
+
+    def test_usage_claude_api_command_reads_admin_usage_for_days(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            sent = []
+            calls = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            service._read_claude_admin_usage = lambda days=None: calls.append(days) or "Claude Admin API 用量：ok"
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+
+            service._handle_message(account, "user-1", conversation_key, "/usage claude api 30")
+
+            self.assertEqual(calls, [30])
+            self.assertEqual(sent[-1], "Claude Admin API 用量：ok")
 
     def test_workspace_agent_command_sets_agent_for_named_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:

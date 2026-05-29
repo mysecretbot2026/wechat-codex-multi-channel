@@ -148,7 +148,11 @@ cp config.example.json config.json
     "effort": "",
     "modelOptions": [],
     "timeoutMs": 7200000,
-    "usageTimeoutSeconds": 2,
+    "usageTimeoutSeconds": 30,
+    "authStatusTimeoutSeconds": 5,
+    "adminUsageDays": 7,
+    "adminUsageTimeoutSeconds": 60,
+    "adminKeychainService": "wechat-codex-multi.anthropic-admin-key",
     "permissionMode": "bypassPermissions",
     "defaultAccount": "main",
     "accounts": [
@@ -204,7 +208,11 @@ cp config.example.json config.json
 - `claude.effort`：默认 effort level，非空时传给 `claude --effort`。Claude Code 2.1.119 支持 `low`、`medium`、`high`、`xhigh`、`max`。
 - `claude.modelOptions`：固定 `/models` 在 Claude Agent 下展示的模型选项；为空时使用内置默认列表。
 - `claude.timeoutMs`：单次 Claude 执行超时，默认 2 小时。
-- `claude.usageTimeoutSeconds`：Claude `/usage` 订阅状态 best-effort 读取超时，默认 2 秒；模型 token 统计仍会从本地缓存读取。
+- `claude.usageTimeoutSeconds`：Claude TUI `/usage` 交互式查询超时，默认 30 秒。
+- `claude.authStatusTimeoutSeconds`：`/status` 中 Claude 登录状态读取超时，默认 5 秒。
+- `claude.adminUsageDays`：Anthropic Admin API 默认查询天数，默认 7，日粒度接口最大 31。
+- `claude.adminUsageTimeoutSeconds`：Anthropic Admin API 请求超时，默认 60 秒。
+- `claude.adminKeychainService`：macOS Keychain 中保存 Admin Key 的 service 名，默认 `wechat-codex-multi.anthropic-admin-key`。
 - `claude.permissionMode`：传给 `claude --permission-mode`，默认 `bypassPermissions`。
 - `claude.defaultAccount`：默认 Claude 账号名。
 - `claude.accounts`：多个 Claude 登录配置。`claudeConfigDir` 为空表示使用 Claude Code 默认登录态；非空时作为独立 `CLAUDE_CONFIG_DIR`。
@@ -231,6 +239,7 @@ cp config.example.json config.json
 | `/usage all` | 查看配置里所有 Codex 和 Claude 账号的用量 |
 | `/usage codex` | 查看当前工作区 Codex 账号用量 |
 | `/usage claude` | 查看当前工作区 Claude 账号用量 |
+| `/usage claude api [days]` | 通过 Anthropic Admin API 查看组织级 Claude API token 和 cost 用量 |
 | `/usage codex all` | 查看所有 Codex 账号用量 |
 | `/usage claude all` | 查看所有 Claude 账号用量 |
 | `/accounts` 或 `/users` | 查看已连接用户的昵称、accountId 和 userId |
@@ -365,18 +374,35 @@ Claude Code 暂只支持 `exec/headless` 方式。运行中补充消息会进入
 
 ### 通用用量命令
 
-`/usage` 会根据当前工作区 Agent 自动分发。当前是 Codex 时读取 Codex 限额；当前是 Claude 时调用 `claude auth status` / `claude auth status --text` 读取登录身份，并补充本地 `stats-cache.json` 模型 token 统计。
+`/usage` 会根据当前工作区 Agent 自动分发。当前是 Codex 时读取 Codex 限额；当前是 Claude 时会启动 Claude Code TUI，自动发送 `/usage`，等待终端输出稳定后提取屏幕内容并清理进程树。Claude 普通用量查询不再读取本地 `stats-cache.json`。
 
 ```text
 /usage
 /usage all
 /usage codex
 /usage claude
+/usage claude api
+/usage claude api 30
 /usage codex all
 /usage claude all
 ```
 
-Claude Code 目前不会像 Codex 那样返回 5 小时/周窗口百分比。服务会用 `claude auth status` 展示登录状态、邮箱、组织和认证方式；模型 token、会话数和消息数来自 Claude 本地 `stats-cache.json`。如果缓存不存在，会明确提示无缓存。
+Claude 交互式查询会使用当前工作区目录；如果 Claude TUI 出现 trust folder 提示，服务会自动输入 `1` 确认。查询完成或超时后会终止 Claude 进程组，避免残留 node 子进程。
+
+`/usage claude api [days]` 仍然保留为 Anthropic Admin API 查询，使用官方 `/v1/organizations/usage_report/messages` 和 `/v1/organizations/cost_report`，需要 `sk-ant-admin...` Admin Key；个人账号不可用，必须是组织 Admin。不要把 key 写进 `config.json`。macOS 推荐保存到 Keychain：
+
+```bash
+security add-generic-password -a "$USER" -s wechat-codex-multi.anthropic-admin-key -w "sk-ant-admin-xxx" -U
+```
+
+也可以临时用环境变量：
+
+```bash
+export ANTHROPIC_ADMIN_KEY=sk-ant-admin-xxx
+python3 -m wechat_codex_multi claude-usage --days 7
+```
+
+如果服务由 launchd 启动，普通 shell 里的 `export` 不会自动传给后台服务；优先用上面的 Keychain 方式，或在启动前执行 `launchctl setenv ANTHROPIC_ADMIN_KEY sk-ant-admin-xxx` 后重启服务。
 
 ### 运行中引导和中断
 

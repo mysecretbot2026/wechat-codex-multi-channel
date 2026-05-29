@@ -40,7 +40,11 @@ DEFAULT_CONFIG = {
         "effort": "",
         "modelOptions": [],
         "timeoutMs": 7200_000,
-        "usageTimeoutSeconds": 2,
+        "usageTimeoutSeconds": 30,
+        "authStatusTimeoutSeconds": 5,
+        "adminUsageDays": 7,
+        "adminUsageTimeoutSeconds": 60,
+        "adminKeychainService": "wechat-codex-multi.anthropic-admin-key",
         "permissionMode": "bypassPermissions",
         "defaultAccount": "main",
         "accounts": [

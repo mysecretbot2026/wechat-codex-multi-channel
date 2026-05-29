@@ -6,6 +6,7 @@ from pathlib import Path
 from . import logging as log
 from .config import PROJECT_DIR, load_config
 from .codex_accounts import default_codex_account
+from .claude_usage import format_claude_admin_usage, read_claude_admin_usage
 from .login import login_with_qr
 from .media_outbox import queue_media
 from .media_tool import run_media_generator
@@ -105,6 +106,18 @@ def rename_account(args):
     print(f"state: {state.file}")
 
 
+def claude_usage(args):
+    config = load_config(args.config)
+    claude = config.get("claude") or {}
+    usage = read_claude_admin_usage(
+        api_key=args.key or "",
+        days=args.days,
+        timeout_s=int(claude.get("adminUsageTimeoutSeconds") or 60),
+        keychain_service=claude.get("adminKeychainService") or "",
+    )
+    print(format_claude_admin_usage(usage))
+
+
 def media_generate(args):
     print(run_media_generator(args.name, args.prompt))
 
@@ -150,6 +163,11 @@ def main(argv=None):
 
     p = sub.add_parser("status", help="查看本地状态")
     p.set_defaults(func=status)
+
+    p = sub.add_parser("claude-usage", help="通过 Anthropic Admin API 查看 Claude API 用量")
+    p.add_argument("--days", type=int, default=7, help="查询最近 N 天，接口日粒度最大 31 天")
+    p.add_argument("--key", default="", help="直接传入 Anthropic Admin API Key；默认读取环境变量或 macOS Keychain")
+    p.set_defaults(func=claude_usage)
 
     p = sub.add_parser("media-generate", help="调用配置的媒体生成器")
     p.add_argument("name")
