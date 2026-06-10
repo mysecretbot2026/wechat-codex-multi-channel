@@ -118,10 +118,13 @@ class ClaudeCliRunner:
             args.extend(["--permission-mode", self.permission_mode])
         selected_model = str(model or self.model or "").strip()
         selected_effort = str(effort or self.effort or "").strip()
-        if selected_model:
+        if selected_model and selected_model != "default":
             args.extend(["--model", selected_model])
-        if selected_effort:
-            args.extend(["--effort", selected_effort])
+        cli_effort = "xhigh" if selected_effort == "ultracode" else selected_effort
+        if cli_effort:
+            args.extend(["--effort", cli_effort])
+        if selected_effort == "ultracode":
+            args.extend(["--settings", json.dumps({"ultracode": True}, separators=(",", ":"))])
         system_prompt = self._system_prompt()
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])

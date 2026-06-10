@@ -1489,10 +1489,17 @@ class MultiWechatCodexService:
             return self._model_options
         return model_options(self.config)
 
-    def _available_claude_model_options(self):
+    def _available_claude_model_options(self, session=None):
         if self._claude_model_options is not None:
             return self._claude_model_options
-        return claude_model_options(self.config)
+        session = session or {}
+        account = resolve_session_claude_account(self.config, session)
+        cwd = session.get("cwd") or (self.config.get("claude") or {}).get("workingDirectory") or self.config["codex"]["workingDirectory"]
+        return claude_model_options(
+            self.config,
+            claude_config_dir=account.get("claudeConfigDir") or "",
+            cwd=cwd,
+        )
 
     @staticmethod
     def _format_model_options_for_wechat(options):
@@ -1511,16 +1518,44 @@ class MultiWechatCodexService:
     @staticmethod
     def _format_claude_model_options_for_wechat(options):
         lines = ["可切换 Claude 模型（发送 /model 编号 切换）："]
-        last_model = None
+        last_group = None
         for index, option in enumerate(options, start=1):
-            model = option.get("model") or ""
-            if model != last_model:
-                if last_model is not None:
+            group = option.get("groupLabel")
+            if not group and option.get("effort"):
+                group = option.get("model") or ""
+            if group and group != last_group:
+                if last_group is not None:
                     lines.append("")
-                lines.append(model)
-                last_model = model
+                lines.append(group)
+                last_group = group
             lines.append(f"{index}. {format_claude_model_option(option)}")
+        lines.extend(MultiWechatCodexService._claude_effort_note_lines(options))
         return "\n".join(lines)
+
+    @staticmethod
+    def _claude_effort_note_lines(options):
+        efforts = []
+        sources = set()
+        for option in options:
+            for effort in option.get("efforts") or []:
+                effort = str(effort or "").strip()
+                if effort and effort not in efforts:
+                    efforts.append(effort)
+            source = str(option.get("effortSource") or "").strip()
+            if source:
+                sources.add(source)
+        if not efforts:
+            return []
+        lines = ["", f"CLI 全局 --effort: {', '.join(efforts)}"]
+        if "cli-help-global" in sources:
+            lines.append("说明：这些 effort 来自 claude --help 的全局参数，不是逐模型验证矩阵。")
+        elif "fallback-global" in sources:
+            lines.append("说明：当前未查询到 Claude CLI，以上 effort 是兜底提示，不是逐模型验证矩阵。")
+        else:
+            lines.append("说明：这些 effort 是选项附带的全局提示，不是逐模型验证矩阵。")
+        lines.append("编号只切模型；如需指定 CLI effort，可发送 /model sonnet:high。")
+        lines.append("ultracode 属于 Claude 交互式 /effort 会话模式，本服务不会把它枚举到所有模型。")
+        return lines
 
     def _handle_model_switch(self, account, user_id, conversation_key, selector, list_only=False):
         session = self._get_session(conversation_key)
@@ -1578,12 +1613,12 @@ class MultiWechatCodexService:
         self._send_text(account, user_id, f"已经切换到 {format_model_option(target)} 模型\n已重置当前 Codex thread。")
 
     def _handle_claude_model_switch(self, account, user_id, conversation_key, selector, list_only=False):
+        session = self._get_session(conversation_key)
         try:
-            options = self._available_claude_model_options()
+            options = self._available_claude_model_options(session)
         except Exception as exc:
             self._send_text(account, user_id, f"无法获取 Claude 模型列表：{exc}")
             return
-        session = self._get_session(conversation_key)
         current = resolve_session_claude_model(self.config, session)
         if not options:
             self._send_text(account, user_id, "没有可用 Claude 模型选项。可在 config.json 的 claude.modelOptions 中配置。")
@@ -1604,9 +1639,13 @@ class MultiWechatCodexService:
             for index, option in enumerate(options, start=1):
                 marker = "*" if (
                     option.get("model") == current.get("model")
-                    and option.get("effort") == current.get("effort")
+                    and (
+                        option.get("effort") == current.get("effort")
+                        or not option.get("effort")
+                    )
                 ) else "-"
                 lines.append(f"{marker} {index}. {format_claude_model_option(option)}")
+            lines.extend(self._claude_effort_note_lines(options))
             lines.extend(["", "切换：/model <编号或 model:effort>", "例如：/model 2 或 /model sonnet:high"])
             self._send_text(account, user_id, "\n".join(lines))
             return

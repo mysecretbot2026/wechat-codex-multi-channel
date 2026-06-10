@@ -39,6 +39,8 @@
     "model": "sonnet",
     "effort": "",
     "modelOptions": [],
+    "modelDiscoveryTimeoutSeconds": 5,
+    "modelDiscoveryCacheSeconds": 300,
     "timeoutMs": 7200000,
     "usageTimeoutSeconds": 30,
     "authStatusTimeoutSeconds": 5,

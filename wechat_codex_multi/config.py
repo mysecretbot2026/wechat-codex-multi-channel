@@ -39,6 +39,8 @@ DEFAULT_CONFIG = {
         "model": "sonnet",
         "effort": "",
         "modelOptions": [],
+        "modelDiscoveryTimeoutSeconds": 5,
+        "modelDiscoveryCacheSeconds": 300,
         "timeoutMs": 7200_000,
         "usageTimeoutSeconds": 30,
         "authStatusTimeoutSeconds": 5,

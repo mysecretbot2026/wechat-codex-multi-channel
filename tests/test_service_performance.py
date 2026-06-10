@@ -830,6 +830,60 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertEqual(session["claudeSessionId"], "")
             self.assertIn("已经切换到 sonnet:high", sent[-1])
 
+    def test_models_command_lists_stream_json_claude_matrix_by_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            service = MultiWechatCodexService(make_test_config(tmp))
+            service._claude_model_options = [
+                {
+                    "model": "default",
+                    "effort": "low",
+                    "groupLabel": "Default (recommended) — Opus 4.8 with 1M context",
+                    "modelSource": "stream-json",
+                },
+                {
+                    "model": "default",
+                    "effort": "ultracode",
+                    "groupLabel": "Default (recommended) — Opus 4.8 with 1M context",
+                    "modelSource": "stream-json",
+                },
+                {
+                    "model": "sonnet",
+                    "effort": "low",
+                    "groupLabel": "Sonnet — Sonnet 4.6",
+                    "modelSource": "stream-json",
+                },
+                {
+                    "model": "sonnet",
+                    "effort": "max",
+                    "groupLabel": "Sonnet — Sonnet 4.6",
+                    "modelSource": "stream-json",
+                },
+                {
+                    "model": "haiku",
+                    "effort": "",
+                    "groupLabel": "Haiku — Haiku 4.5",
+                    "modelSource": "stream-json",
+                },
+            ]
+            sent = []
+            service._send_text = lambda account, user_id, text: sent.append(text)
+            account = {"accountId": "acct-1"}
+            conversation_key = service.state.conversation_key("acct-1", "user-1")
+            service.state.update_session(conversation_key, agent="claude")
+
+            service._handle_model_switch(account, "user-1", conversation_key, "", list_only=True)
+
+            self.assertIn("Default (recommended) — Opus 4.8 with 1M context", sent[-1])
+            self.assertIn("1. default:low", sent[-1])
+            self.assertIn("2. default:ultracode", sent[-1])
+            self.assertIn("Sonnet — Sonnet 4.6", sent[-1])
+            self.assertIn("3. sonnet:low", sent[-1])
+            self.assertIn("4. sonnet:max", sent[-1])
+            self.assertIn("5. haiku", sent[-1])
+            self.assertNotIn("sonnet:xhigh", sent[-1])
+            self.assertNotIn("sonnet:ultracode", sent[-1])
+            self.assertNotIn("CLI 全局 --effort", sent[-1])
+
     def test_usage_command_uses_current_claude_agent(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = MultiWechatCodexService(make_test_config(tmp))

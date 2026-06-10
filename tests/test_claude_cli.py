@@ -88,6 +88,39 @@ class ClaudeCliRunnerTests(unittest.TestCase):
             self.assertEqual(state.updates[-1][1]["claudeModel"], "sonnet")
             self.assertEqual(state.updates[-1][1]["claudeEffort"], "high")
 
+    def test_base_args_omits_default_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ClaudeCliRunner(
+                {
+                    "codex": {"workingDirectory": tmp},
+                    "claude": {"bin": "claude", "timeoutMs": 1000},
+                    "media": {"generators": []},
+                },
+                FakeState(tmp),
+            )
+
+            args = runner._base_args("default", "high", "")
+
+        self.assertNotIn("--model", args)
+        self.assertEqual(args[args.index("--effort") + 1], "high")
+
+    def test_base_args_maps_ultracode_to_xhigh_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = ClaudeCliRunner(
+                {
+                    "codex": {"workingDirectory": tmp},
+                    "claude": {"bin": "claude", "timeoutMs": 1000},
+                    "media": {"generators": []},
+                },
+                FakeState(tmp),
+            )
+
+            args = runner._base_args("claude-fable-5[1m]", "ultracode", "")
+
+        self.assertEqual(args[args.index("--model") + 1], "claude-fable-5[1m]")
+        self.assertEqual(args[args.index("--effort") + 1], "xhigh")
+        self.assertEqual(args[args.index("--settings") + 1], '{"ultracode":true}')
+
     def test_timeout_terminates_process_group_and_resets_claude_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {
