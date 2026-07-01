@@ -11,6 +11,7 @@ from .claude_accounts import default_claude_account, resolve_session_claude_acco
 from .claude_models import resolve_session_claude_model
 from .codex_cli import CodexCancelled
 from .media_outbox import media_outbox_path
+from .prompting import prompt_version
 
 
 class ClaudeAccumulator:
@@ -106,7 +107,7 @@ class ClaudeCliRunner:
         claude_cwd = (self.config.get("claude") or {}).get("workingDirectory") or ""
         return claude_cwd or self.config["codex"]["workingDirectory"]
 
-    def _base_args(self, model="", effort="", session_id=""):
+    def _base_args(self, model="", effort="", session_id="", system_prompt=None):
         args = [
             self._resolve_bin(),
             "-p",
@@ -125,7 +126,8 @@ class ClaudeCliRunner:
             args.extend(["--effort", cli_effort])
         if selected_effort == "ultracode":
             args.extend(["--settings", json.dumps({"ultracode": True}, separators=(",", ":"))])
-        system_prompt = self._system_prompt()
+        if system_prompt is None:
+            system_prompt = self._system_prompt()
         if system_prompt:
             args.extend(["--append-system-prompt", system_prompt])
         if session_id:
@@ -159,6 +161,9 @@ class ClaudeCliRunner:
         if extra:
             instructions.extend(["", extra])
         return "\n".join(instructions)
+
+    def _prompt_version(self):
+        return prompt_version(self._system_prompt())
 
     @staticmethod
     def _is_resume_error(error):
@@ -275,7 +280,15 @@ class ClaudeCliRunner:
         selected_model = model_selection.get("model") or ""
         selected_effort = model_selection.get("effort") or ""
         existing_session_id = session.get("claudeSessionId") or ""
-        args = self._base_args(selected_model, selected_effort, existing_session_id)
+        system_prompt = self._system_prompt()
+        current_prompt_version = prompt_version(system_prompt)
+        inject_prompt = (not existing_session_id) or session.get("claudePromptVersion") != current_prompt_version
+        args = self._base_args(
+            selected_model,
+            selected_effort,
+            existing_session_id,
+            system_prompt if inject_prompt else "",
+        )
         args.append(user_message)
 
         log.info(
@@ -359,6 +372,7 @@ class ClaudeCliRunner:
                     claudeAccount=claude_account_name,
                     claudeModel=selected_model,
                     claudeEffort=selected_effort,
+                    claudePromptVersion=current_prompt_version,
                 )
             text = accumulator.text()
             if return_code == 0 and text and not accumulator.errors:

@@ -10,6 +10,7 @@ from . import logging as log
 from .codex_accounts import default_codex_account, resolve_session_codex_account
 from .codex_models import resolve_session_model
 from .media_outbox import media_outbox_path
+from .prompting import prompt_version
 
 
 class CodexCancelled(RuntimeError):
@@ -134,7 +135,7 @@ class CodexCliRunner:
             "只有在 media-send 不可用时，才在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
         ]
 
-    def _build_prompt(self, user_message, fresh_session, media_generators):
+    def _instruction_text(self, media_generators):
         instructions = [
             "默认用中文回复，除非用户明确使用其他语言。",
             "回复尽量直接、简洁、可执行。",
@@ -156,9 +157,15 @@ class CodexCliRunner:
         extra = str(self.config["codex"].get("extraPrompt") or "").strip()
         if extra:
             instructions.extend(["", extra])
-        if fresh_session:
-            return "\n".join(instructions + ["", f"用户消息：{user_message}"])
-        return "\n".join(self._media_instructions() + ["", f"用户消息：{user_message}"])
+        return "\n".join(instructions)
+
+    def _prompt_version(self, media_generators):
+        return prompt_version(self._instruction_text(media_generators))
+
+    def _build_prompt(self, user_message, inject_prompt, media_generators):
+        if inject_prompt:
+            return "\n".join([self._instruction_text(media_generators), "", f"用户消息：{user_message}"])
+        return str(user_message or "")
 
     @staticmethod
     def _is_transient_resume_error(error):
@@ -285,14 +292,16 @@ class CodexCliRunner:
         selected_model = model_selection.get("model") or ""
         selected_reasoning = model_selection.get("reasoningEffort") or ""
         existing_thread_id = session.get("codexThreadId") or ""
-        fresh = not existing_thread_id
+        media_generators = self.config.get("media", {}).get("generators") or []
+        current_prompt_version = self._prompt_version(media_generators)
+        inject_prompt = (not existing_thread_id) or session.get("codexExecPromptVersion") != current_prompt_version
         args = self._base_args(cwd, selected_model, selected_reasoning) + ["exec"]
         if existing_thread_id:
             args.extend(["resume", existing_thread_id])
         prompt = self._build_prompt(
             user_message,
-            fresh,
-            self.config.get("media", {}).get("generators") or [],
+            inject_prompt,
+            media_generators,
         )
         args.extend(["--skip-git-repo-check", "--json", prompt])
 
@@ -377,6 +386,7 @@ class CodexCliRunner:
                     codexAccount=codex_account_name,
                     codexModel=selected_model,
                     codexReasoningEffort=selected_reasoning,
+                    codexExecPromptVersion=current_prompt_version,
                 )
             text = accumulator.text()
             if return_code == 0 and text:

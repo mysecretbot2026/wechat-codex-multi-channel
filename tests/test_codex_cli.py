@@ -230,6 +230,64 @@ class CodexCliRunnerTests(unittest.TestCase):
             self.assertIn("-c", args)
             self.assertEqual(args[args.index("-c") + 1], 'model_reasoning_effort="high"')
 
+    def test_resume_with_current_prompt_version_sends_only_user_message(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "codex": {
+                    "bin": "codex",
+                    "workingDirectory": tmp,
+                    "timeoutMs": 1000,
+                    "bypassApprovalsAndSandbox": True,
+                },
+                "media": {"generators": []},
+            }
+            state = FakeState(tmp)
+            runner = CodexCliRunner(config, state)
+            state.session_updates = {"codexExecPromptVersion": runner._prompt_version([])}
+            process = Mock()
+            process.pid = 12345
+            process.stdout = ['{"type":"item.completed","item":{"type":"agent_message","id":"msg-1","text":"ok"}}\n']
+            process.stderr = []
+            process.poll.return_value = None
+            process.wait.return_value = 0
+
+            with patch("wechat_codex_multi.codex_cli.subprocess.Popen", return_value=process) as popen:
+                result = runner.run("conversation-1", "hello")
+
+            self.assertEqual(result, "ok")
+            prompt = popen.call_args.args[0][-1]
+            self.assertEqual(prompt, "hello")
+            self.assertNotIn("local_agent_tools", prompt)
+            self.assertEqual(state.updates[-1][1]["codexExecPromptVersion"], runner._prompt_version([]))
+
+    def test_resume_with_old_prompt_version_reinjects_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "codex": {
+                    "bin": "codex",
+                    "workingDirectory": tmp,
+                    "timeoutMs": 1000,
+                    "bypassApprovalsAndSandbox": True,
+                },
+                "media": {"generators": []},
+            }
+            state = FakeState(tmp)
+            state.session_updates = {"codexExecPromptVersion": "old"}
+            process = Mock()
+            process.pid = 12345
+            process.stdout = ['{"type":"item.completed","item":{"type":"agent_message","id":"msg-1","text":"ok"}}\n']
+            process.stderr = []
+            process.poll.return_value = None
+            process.wait.return_value = 0
+
+            with patch("wechat_codex_multi.codex_cli.subprocess.Popen", return_value=process) as popen:
+                result = CodexCliRunner(config, state).run("conversation-1", "hello")
+
+            self.assertEqual(result, "ok")
+            prompt = popen.call_args.args[0][-1]
+            self.assertIn("local_agent_tools", prompt)
+            self.assertIn("用户消息：hello", prompt)
+
     def test_run_returns_generated_image_when_rollout_record_fails(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as codex_home:
             config = {

@@ -9,6 +9,7 @@ from . import logging as log
 from .codex_accounts import default_codex_account, resolve_session_codex_account
 from .codex_cli import CodexCancelled
 from .codex_models import resolve_session_model
+from .prompting import prompt_version
 
 
 class JsonRpcError(RuntimeError):
@@ -328,12 +329,16 @@ class CodexAppServerRunner:
             instructions.extend(["", extra])
         return "\n".join(instructions)
 
-    def _thread_params(self, cwd, model="", reasoning_effort=""):
+    def _prompt_version(self, instructions=None):
+        return prompt_version(instructions if instructions is not None else self._instructions())
+
+    def _thread_params(self, cwd, model="", reasoning_effort="", include_instructions=True, instructions=None):
         params = {
             "cwd": str(cwd),
-            "baseInstructions": self._instructions(),
-            "developerInstructions": "",
         }
+        if include_instructions:
+            params["baseInstructions"] = instructions if instructions is not None else self._instructions()
+            params["developerInstructions"] = ""
         if model:
             params["model"] = model
         if reasoning_effort:
@@ -358,8 +363,21 @@ class CodexAppServerRunner:
             params["sandboxPolicy"] = {"type": "dangerFullAccess"}
         return params
 
-    def _ensure_thread(self, server, context, conversation_key, session, cwd, model, reasoning_effort, codex_account_name):
+    def _ensure_thread(
+        self,
+        server,
+        context,
+        conversation_key,
+        session,
+        cwd,
+        model,
+        reasoning_effort,
+        codex_account_name,
+        current_prompt_version,
+        instructions,
+    ):
         thread_id = session.get("codexThreadId") or ""
+        inject_prompt = (not thread_id) or session.get("codexAppServerPromptVersion") != current_prompt_version
         if not thread_id:
             context.thread_id = ""
             server.unregister_context(context)
@@ -369,7 +387,17 @@ class CodexAppServerRunner:
             try:
                 server.request(
                     "thread/resume",
-                    dict(self._thread_params(cwd, model, reasoning_effort), threadId=thread_id, excludeTurns=True),
+                    dict(
+                        self._thread_params(
+                            cwd,
+                            model,
+                            reasoning_effort,
+                            include_instructions=inject_prompt,
+                            instructions=instructions,
+                        ),
+                        threadId=thread_id,
+                        excludeTurns=True,
+                    ),
                     timeout_s=30,
                 )
                 return thread_id
@@ -378,7 +406,11 @@ class CodexAppServerRunner:
                 self.state.reset_session(conversation_key)
                 context.thread_id = ""
                 server.unregister_context(context)
-        result = server.request("thread/start", self._thread_params(cwd, model, reasoning_effort), timeout_s=30)
+        result = server.request(
+            "thread/start",
+            self._thread_params(cwd, model, reasoning_effort, include_instructions=True, instructions=instructions),
+            timeout_s=30,
+        )
         thread = (result or {}).get("thread") or {}
         thread_id = thread.get("id")
         if not thread_id:
@@ -392,6 +424,7 @@ class CodexAppServerRunner:
             codexAccount=codex_account_name,
             codexModel=model,
             codexReasoningEffort=reasoning_effort,
+            codexAppServerPromptVersion=current_prompt_version,
         )
         return thread_id
 
@@ -435,6 +468,8 @@ class CodexAppServerRunner:
         model_selection = resolve_session_model(self.config, session)
         selected_model = model_selection.get("model") or self.model
         selected_reasoning = model_selection.get("reasoningEffort") or self.reasoning_effort
+        instructions = self._instructions()
+        current_prompt_version = self._prompt_version(instructions)
         server = self._server_for_account(codex_account)
         context = self._context(conversation_key, session.get("codexThreadId") or "")
         thread_id = self._ensure_thread(
@@ -446,6 +481,8 @@ class CodexAppServerRunner:
             selected_model,
             selected_reasoning,
             codex_account_name,
+            current_prompt_version,
+            instructions,
         )
         log.info(
             f"[app-server] start turn conversation={conversation_key} account={codex_account_name} "
@@ -475,6 +512,7 @@ class CodexAppServerRunner:
             codexAccount=codex_account_name,
             codexModel=selected_model,
             codexReasoningEffort=selected_reasoning,
+            codexAppServerPromptVersion=current_prompt_version,
         )
         return context.text()
 

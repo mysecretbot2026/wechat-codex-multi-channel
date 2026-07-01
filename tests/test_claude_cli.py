@@ -124,6 +124,57 @@ class ClaudeCliRunnerTests(unittest.TestCase):
         self.assertEqual(args[args.index("--effort") + 1], "xhigh")
         self.assertEqual(args[args.index("--settings") + 1], '{"ultracode":true}')
 
+    def test_resume_with_current_prompt_version_omits_system_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "codex": {"workingDirectory": tmp},
+                "claude": {"bin": "claude", "timeoutMs": 1000},
+                "media": {"generators": []},
+            }
+            state = FakeState(tmp)
+            runner = ClaudeCliRunner(config, state)
+            state.session_updates = {"claudePromptVersion": runner._prompt_version()}
+            process = Mock()
+            process.pid = 12345
+            process.stdout = ['{"type":"result","session_id":"session-old","result":"ok"}\n']
+            process.stderr = []
+            process.poll.return_value = None
+            process.wait.return_value = 0
+
+            with patch("wechat_codex_multi.claude_cli.subprocess.Popen", return_value=process) as popen:
+                result = runner.run("conversation-1", "hello")
+
+            self.assertEqual(result, "ok")
+            args = popen.call_args.args[0]
+            self.assertNotIn("--append-system-prompt", args)
+            self.assertEqual(args[args.index("--resume") + 1], "session-old")
+            self.assertEqual(args[-1], "hello")
+            self.assertEqual(state.updates[-1][1]["claudePromptVersion"], runner._prompt_version())
+
+    def test_resume_with_old_prompt_version_appends_system_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "codex": {"workingDirectory": tmp},
+                "claude": {"bin": "claude", "timeoutMs": 1000},
+                "media": {"generators": []},
+            }
+            state = FakeState(tmp)
+            state.session_updates = {"claudePromptVersion": "old"}
+            process = Mock()
+            process.pid = 12345
+            process.stdout = ['{"type":"result","session_id":"session-old","result":"ok"}\n']
+            process.stderr = []
+            process.poll.return_value = None
+            process.wait.return_value = 0
+
+            with patch("wechat_codex_multi.claude_cli.subprocess.Popen", return_value=process) as popen:
+                result = ClaudeCliRunner(config, state).run("conversation-1", "hello")
+
+            self.assertEqual(result, "ok")
+            args = popen.call_args.args[0]
+            self.assertIn("--append-system-prompt", args)
+            self.assertIn("local_agent_tools", args[args.index("--append-system-prompt") + 1])
+
     def test_timeout_terminates_process_group_and_resets_claude_session(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = {
