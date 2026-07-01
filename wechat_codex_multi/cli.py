@@ -123,7 +123,11 @@ def media_generate(args):
 
 
 def media_send(args):
-    outbox = args.outbox or os.environ.get("WECHAT_CODEX_MULTI_MEDIA_OUTBOX")
+    outbox = (
+        args.outbox
+        or os.environ.get("LOCAL_AGENT_MEDIA_OUTBOX")
+        or os.environ.get("WECHAT_CODEX_MULTI_MEDIA_OUTBOX")
+    )
     if not outbox:
         raise RuntimeError("缺少媒体 outbox。请在 Agent 会话中使用，或显式传 --outbox。")
     actions = queue_media(outbox, args.paths, kind=args.kind or "")

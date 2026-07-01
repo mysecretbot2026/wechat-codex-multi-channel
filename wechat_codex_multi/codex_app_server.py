@@ -125,7 +125,7 @@ class AppServerProcess:
         self.request(
             "initialize",
             {
-                "clientInfo": {"name": "wechat-codex-multi-channel", "version": "0.1"},
+                "clientInfo": {"name": "local-agent-bridge", "version": "0.1"},
                 "capabilities": {"experimentalApi": True},
             },
             timeout_s=15,
@@ -300,20 +300,19 @@ class CodexAppServerRunner:
 
     def _instructions(self):
         instructions = [
-            "你通过微信与用户交流。",
             "默认用中文回复，除非用户明确使用其他语言。",
             "回复尽量直接、简洁、可执行。",
-            "微信不渲染 Markdown，尽量输出纯文本。",
+            "无法渲染 Markdown，尽量输出纯文本。",
             "",
-            "你可以生成本地图片、文件或视频，然后让微信通道发送。",
+            "你可以生成本地图片、文件或视频，然后让当前通道发送。",
             "发送本地媒体时，在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
             "媒体标记路径必须是真实存在的本地绝对路径。",
             "不要原样输出占位路径，例如 /absolute/path/to/image.png、/Users/bot/.../xxx.png 或 真实绝对路径。",
-            "如果 Codex 生成图片后输出 Saved to: file:///Users/.../image.png，也可以直接保留这个 file:// 路径，微信通道会自动发送。",
-            "这些标记会被微信通道解析并发送，用户不会看到标记文本。",
+            "如果 Codex 生成图片后输出 Saved to: file:///Users/.../image.png，也可以直接保留这个 file:// 路径，当前通道会自动发送。",
+            "这些标记会被当前通道解析并发送，用户不会看到标记文本。",
             "",
             "如果需要调用可配置媒体生成器，可在 shell 中运行：",
-            "python3 -m wechat_codex_multi media-generate <name> <prompt>",
+            "python3 -m local_agent_tools media-generate <name> <prompt>",
             "命令会输出生成文件路径。然后使用对应 send_image/send_video/send_file 标记发送。",
         ]
         media_generators = self.config.get("media", {}).get("generators") or []

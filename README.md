@@ -663,16 +663,16 @@ Claude 的固定可选项配置在 `claude.modelOptions`：
 
 ## 媒体发送协议
 
-推荐使用项目内置 `send-media` skill/命令登记媒体文件。Agent 运行时会收到 `WECHAT_CODEX_MULTI_MEDIA_OUTBOX` 环境变量，直接调用：
+推荐使用项目内置 `send-media` skill/命令登记媒体文件。Agent 运行时会收到 `LOCAL_AGENT_MEDIA_OUTBOX` 环境变量，直接调用：
 
 ```bash
-python3 -m wechat_codex_multi media-send /absolute/path/to/image.png
-python3 -m wechat_codex_multi media-send /absolute/path/to/report.pdf
-python3 -m wechat_codex_multi media-send /absolute/path/to/archive.zip
-python3 -m wechat_codex_multi media-send --kind video /absolute/path/to/video.mp4
+python3 -m local_agent_tools media-send /absolute/path/to/image.png
+python3 -m local_agent_tools media-send /absolute/path/to/report.pdf
+python3 -m local_agent_tools media-send /absolute/path/to/archive.zip
+python3 -m local_agent_tools media-send --kind video /absolute/path/to/video.mp4
 ```
 
-`media-send` 会校验文件存在，并把图片、视频、文档、压缩包等本地文件登记到当前微信会话的媒体 outbox。当前 Agent 任务结束后，服务读取 outbox 并发送媒体。
+`media-send` 会校验文件存在，并把图片、视频、文档、压缩包等本地文件登记到当前会话的媒体 outbox。当前 Agent 任务结束后，服务读取 outbox 并发送媒体。
 
 项目也提供了给 Agent 阅读的 skill 文档：
 
@@ -721,13 +721,13 @@ Codex CLI 返回 `image_generation_end` 事件时，服务会按当前 `CODEX_HO
 Codex 可以调用：
 
 ```bash
-python3 -m wechat_codex_multi media-generate image "生成一张产品海报"
+python3 -m local_agent_tools media-generate image "生成一张产品海报"
 ```
 
 然后用 `media-send` 登记生成的文件：
 
 ```bash
-python3 -m wechat_codex_multi media-send /path/from/generator.png
+python3 -m local_agent_tools media-send /path/from/generator.png
 ```
 
 这可以接入 OpenAI API、本地 Stable Diffusion、ComfyUI、Sora 或任意自定义服务。

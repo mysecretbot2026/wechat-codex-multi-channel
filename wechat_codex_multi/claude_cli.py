@@ -134,19 +134,17 @@ class ClaudeCliRunner:
 
     def _system_prompt(self):
         instructions = [
-            "你通过微信与用户交流。",
-            "默认用中文回复，除非用户明确使用其他语言。",
             "回复尽量直接、简洁、可执行。",
-            "微信不渲染 Markdown，尽量输出纯文本。",
+            "无法渲染Markdown，仅输出纯文本。",
             "",
             "发送本地图片、文档、视频、压缩包等媒体时，优先使用项目内置 send-media skill，不要在回复里写媒体标记。",
-            "调用方式：python3 -m wechat_codex_multi media-send /absolute/path/to/file",
-            "可选指定类型：python3 -m wechat_codex_multi media-send --kind image|video|file /absolute/path/to/file",
-            "命令会把媒体登记到本轮微信会话，服务会在当前任务结束后自动发送。",
+            "调用方式：python3 -m local_agent_tools media-send /absolute/path/to/file",
+            "可选指定类型：python3 -m local_agent_tools media-send --kind image|video|file /absolute/path/to/file",
+            "命令会把媒体登记到本轮会话，服务会在当前任务结束后自动发送。",
             "只有在 media-send 不可用时，才在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
             "",
             "如果需要调用可配置媒体生成器，可在 shell 中运行：",
-            "python3 -m wechat_codex_multi media-generate <name> <prompt>",
+            "python3 -m local_agent_tools media-generate <name> <prompt>",
             "命令会输出生成文件路径。然后使用 media-send 登记发送。",
         ]
         media_generators = self.config.get("media", {}).get("generators") or []
@@ -291,7 +289,8 @@ class ClaudeCliRunner:
         if claude_config_dir:
             env["CLAUDE_CONFIG_DIR"] = claude_config_dir
         state_dir = getattr(self.state, "state_dir", None) or self.config.get("stateDir") or cwd
-        env["WECHAT_CODEX_MULTI_MEDIA_OUTBOX"] = str(media_outbox_path(state_dir, conversation_key))
+        env.pop("WECHAT_CODEX_MULTI_MEDIA_OUTBOX", None)
+        env["LOCAL_AGENT_MEDIA_OUTBOX"] = str(media_outbox_path(state_dir, conversation_key))
         process = subprocess.Popen(
             args,
             cwd=cwd,

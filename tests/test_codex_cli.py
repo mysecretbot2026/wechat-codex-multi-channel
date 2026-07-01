@@ -62,6 +62,9 @@ class CodexCliRunnerTests(unittest.TestCase):
                         runner.run("conversation-1", "hello")
 
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            env = popen.call_args.kwargs["env"]
+            self.assertIn("LOCAL_AGENT_MEDIA_OUTBOX", env)
+            self.assertNotIn("WECHAT_CODEX_MULTI_MEDIA_OUTBOX", env)
             killpg.assert_called_once_with(12345, signal.SIGTERM)
             self.assertEqual(state.reset_keys, ["conversation-1"])
             self.assertEqual(runner.processes, set())

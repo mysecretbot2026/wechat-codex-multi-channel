@@ -83,7 +83,10 @@ class ClaudeCliRunnerTests(unittest.TestCase):
             self.assertEqual(args[args.index("--permission-mode") + 1], "bypassPermissions")
             self.assertEqual(args[args.index("--resume") + 1], "session-old")
             self.assertEqual(args[-1], "hello")
-            self.assertEqual(popen.call_args.kwargs["env"]["CLAUDE_CONFIG_DIR"], claude_dir)
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(env["CLAUDE_CONFIG_DIR"], claude_dir)
+            self.assertIn("LOCAL_AGENT_MEDIA_OUTBOX", env)
+            self.assertNotIn("WECHAT_CODEX_MULTI_MEDIA_OUTBOX", env)
             self.assertEqual(state.updates[-1][1]["claudeSessionId"], "session-new")
             self.assertEqual(state.updates[-1][1]["claudeModel"], "sonnet")
             self.assertEqual(state.updates[-1][1]["claudeEffort"], "high")

@@ -1,23 +1,23 @@
 ---
 name: send-media
-description: Use when an Agent needs to send a local image, video, document, PDF, archive, or other file to the WeChat user from this project. Register media with the project CLI instead of writing send_image/send_file/send_video marker text in the final reply.
+description: Use when an Agent needs to send a local image, video, document, PDF, archive, or other file to the current chat. Register media with the project CLI instead of writing send_image/send_file/send_video marker text in the final reply.
 ---
 
 # Send Media
 
-Use this skill whenever a local file should be sent to the WeChat user.
+Use this skill whenever a local file should be sent to the user in the current chat.
 
 Preferred command for one file:
 
 ```bash
-python3 -m wechat_codex_multi media-send /absolute/path/to/file
+python3 -m local_agent_tools media-send /absolute/path/to/file
 ```
 
 Multiple files are allowed:
 
 ```bash
-python3 -m wechat_codex_multi media-send /absolute/path/a.png /absolute/path/report.pdf
-python3 -m wechat_codex_multi media-send /absolute/path/a.png /absolute/path/b.mp4 /absolute/path/archive.zip
+python3 -m local_agent_tools media-send /absolute/path/a.png /absolute/path/report.pdf
+python3 -m local_agent_tools media-send /absolute/path/a.png /absolute/path/b.mp4 /absolute/path/archive.zip
 ```
 
 When sending mixed file types in one command, omit `--kind`. The project will infer:
@@ -29,9 +29,9 @@ When sending mixed file types in one command, omit `--kind`. The project will in
 Optional explicit kind:
 
 ```bash
-python3 -m wechat_codex_multi media-send --kind image /absolute/path/to/image.png
-python3 -m wechat_codex_multi media-send --kind video /absolute/path/to/video.mp4
-python3 -m wechat_codex_multi media-send --kind file /absolute/path/to/archive.zip
+python3 -m local_agent_tools media-send --kind image /absolute/path/to/image.png
+python3 -m local_agent_tools media-send --kind video /absolute/path/to/video.mp4
+python3 -m local_agent_tools media-send --kind file /absolute/path/to/archive.zip
 ```
 
 Rules:
