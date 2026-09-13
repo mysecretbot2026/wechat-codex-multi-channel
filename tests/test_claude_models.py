@@ -244,13 +244,38 @@ class ClaudeModelTests(unittest.TestCase):
         )
         self.assertEqual(options, [{"model": "fable", "effort": "high"}])
 
-    def test_claude_model_options_falls_back_to_defaults_when_discovery_times_out(self):
+    def test_claude_model_options_raises_when_live_discovery_fails(self):
         with patch("wechat_codex_multi.claude_models.discover_claude_model_options") as discover:
             discover.side_effect = subprocess.TimeoutExpired(["claude", "--help"], 5)
-            options = claude_model_options({"claude": {"bin": "claude-dev", "modelOptions": []}})
 
-        self.assertTrue(any(option["model"] == "fable" for option in options))
-        self.assertTrue(any(option["model"] == "sonnet" for option in options))
+            with self.assertRaisesRegex(RuntimeError, "无法实时发现 Claude 模型列表"):
+                claude_model_options({"claude": {"bin": "claude-dev", "modelOptions": []}})
+
+    def test_claude_model_options_does_not_cache_by_default(self):
+        with patch("wechat_codex_multi.claude_models.discover_claude_model_options") as discover:
+            discover.side_effect = [[{"model": "sonnet", "effort": "high"}], [{"model": "opus", "effort": "max"}]]
+
+            first = claude_model_options({"claude": {"bin": "claude-dev", "modelOptions": []}})
+            second = claude_model_options({"claude": {"bin": "claude-dev", "modelOptions": []}})
+
+        self.assertEqual(first, [{"model": "sonnet", "effort": "high"}])
+        self.assertEqual(second, [{"model": "opus", "effort": "max"}])
+        self.assertEqual(discover.call_count, 2)
+
+    def test_claude_model_options_uses_cache_when_configured(self):
+        with patch("wechat_codex_multi.claude_models.discover_claude_model_options") as discover:
+            discover.return_value = [{"model": "sonnet", "effort": "high"}]
+
+            first = claude_model_options(
+                {"claude": {"bin": "claude-dev", "modelOptions": [], "modelDiscoveryCacheSeconds": 300}}
+            )
+            second = claude_model_options(
+                {"claude": {"bin": "claude-dev", "modelOptions": [], "modelDiscoveryCacheSeconds": 300}}
+            )
+
+        self.assertEqual(first, [{"model": "sonnet", "effort": "high"}])
+        self.assertEqual(second, [{"model": "sonnet", "effort": "high"}])
+        discover.assert_called_once()
 
     def test_configured_claude_model_options_skip_discovery(self):
         configured = [{"model": "custom-claude", "effort": "high"}]

@@ -1,8 +1,16 @@
-import unittest
+import json
 import subprocess
+import unittest
 from unittest.mock import patch
 
-from wechat_codex_multi.codex_models import find_model_option, format_model_option, model_options
+from wechat_codex_multi.codex_models import (
+    default_model_options,
+    discover_model_options,
+    find_model_option,
+    format_model_option,
+    model_options,
+    normalize_model_option,
+)
 
 
 class CodexModelTests(unittest.TestCase):
@@ -20,6 +28,69 @@ class CodexModelTests(unittest.TestCase):
             format_model_option({"model": "gpt-5.5", "reasoningEffort": "high", "label": "GPT-5.5"}),
             "gpt-5.5:high (GPT-5.5)",
         )
+
+    def test_normalize_model_option_accepts_cli_defined_reasoning_levels(self):
+        self.assertEqual(
+            normalize_model_option({"model": "gpt-next", "reasoningEffort": "ultra"}),
+            {"model": "gpt-next", "reasoningEffort": "ultra"},
+        )
+
+    def test_discovery_preserves_per_model_levels_and_filters_hidden_models(self):
+        payload = {
+            "models": [
+                {
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "visibility": "list",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"},
+                        {"effort": "max"},
+                        {"effort": "ultra"},
+                    ],
+                },
+                {
+                    "slug": "gpt-5.6-luna",
+                    "display_name": "GPT-5.6-Luna",
+                    "visibility": "list",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}],
+                },
+                {
+                    "slug": "gpt-reserve",
+                    "display_name": "GPT-Reserve",
+                    "visibility": "hide",
+                    "supported_reasoning_levels": [{"effort": "max"}],
+                },
+            ]
+        }
+        completed = subprocess.CompletedProcess(
+            ["codex", "debug", "models"],
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        with patch("wechat_codex_multi.codex_models.subprocess.run", return_value=completed):
+            options = discover_model_options()
+
+        self.assertEqual(
+            [(option["model"], option["reasoningEffort"]) for option in options],
+            [
+                ("gpt-5.6-sol", "low"),
+                ("gpt-5.6-sol", "max"),
+                ("gpt-5.6-sol", "ultra"),
+                ("gpt-5.6-luna", "low"),
+                ("gpt-5.6-luna", "max"),
+            ],
+        )
+
+    def test_default_options_match_current_per_model_reasoning_levels(self):
+        options = default_model_options()
+        keys = {(option["model"], option["reasoningEffort"]) for option in options}
+
+        self.assertIn(("gpt-5.6-sol", "ultra"), keys)
+        self.assertIn(("gpt-5.6-terra", "ultra"), keys)
+        self.assertIn(("gpt-5.6-luna", "max"), keys)
+        self.assertNotIn(("gpt-5.6-luna", "ultra"), keys)
+        self.assertFalse(any(model in {"gpt-reserve", "codex-auto-review"} for model, _ in keys))
 
     def test_model_options_discovers_models_when_not_configured(self):
         with patch("wechat_codex_multi.codex_models.discover_model_options") as discover:

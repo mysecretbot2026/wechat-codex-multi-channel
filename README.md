@@ -150,7 +150,7 @@ cp config.example.json config.json
     "modelDiscoveryTimeoutSeconds": 5,
     "modelDiscoveryCacheSeconds": 300,
     "timeoutMs": 7200000,
-    "usageTimeoutSeconds": 30,
+    "usageTimeoutSeconds": 60,
     "authStatusTimeoutSeconds": 5,
     "adminUsageDays": 7,
     "adminUsageTimeoutSeconds": 60,
@@ -209,10 +209,10 @@ cp config.example.json config.json
 - `claude.model`：默认 Claude 模型，非空时传给 `claude --model`，例如 `sonnet`。
 - `claude.effort`：默认 effort level，非空时传给 `claude --effort`；`ultracode` 会转换为 `--effort xhigh --settings {"ultracode":true}`。
 - `claude.modelOptions`：固定 `/models` 在 Claude Agent 下展示的模型选项；为空时通过 Claude Code stream-json 初始化协议实时查询官方模型清单和逐模型 effort 档位。
-- `claude.modelDiscoveryTimeoutSeconds`：Claude stream-json 模型发现的超时时间，默认 5 秒；失败或未发现模型时会回退到 `claude --help` 和内置默认列表。
-- `claude.modelDiscoveryCacheSeconds`：Claude 模型发现缓存时间，默认 300 秒；缓存按 `claude.bin`、当前 `CLAUDE_CONFIG_DIR` 和工作目录区分。
+- `claude.modelDiscoveryTimeoutSeconds`：Claude stream-json 模型发现的超时时间，默认 20 秒；失败或未发现模型时会直接提示错误，避免展示过期硬编码模型。
+- `claude.modelDiscoveryCacheSeconds`：Claude 模型发现缓存时间，默认 0 秒，即每次实时查询；大于 0 时缓存按 `claude.bin`、当前 `CLAUDE_CONFIG_DIR` 和工作目录区分。
 - `claude.timeoutMs`：单次 Claude 执行超时，默认 2 小时。
-- `claude.usageTimeoutSeconds`：Claude TUI `/usage` 交互式查询超时，默认 30 秒。
+- `claude.usageTimeoutSeconds`：Claude TUI `/usage` 交互式查询超时，默认 60 秒。
 - `claude.authStatusTimeoutSeconds`：`/status` 中 Claude 登录状态读取超时，默认 5 秒。
 - `claude.adminUsageDays`：Anthropic Admin API 默认查询天数，默认 7，日粒度接口最大 31。
 - `claude.adminUsageTimeoutSeconds`：Anthropic Admin API 请求超时，默认 60 秒。
@@ -921,7 +921,7 @@ accountId:userId:workspaceName
 
 当前 Agent 是 Codex 时，如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。查询会使用默认 Codex 账号的 `CODEX_HOME`，超时时间由 `codex.modelDiscoveryTimeoutSeconds` 控制，默认 30 秒；如果查询超时，会回退到内置模型列表。
 
-当前 Agent 是 Claude 时，`/models` 优先使用 `claude.modelOptions`；为空时运行 `claude --output-format stream-json --input-format stream-json --verbose` 并发送 `control_request initialize`，读取 Claude Code 返回的 `models` 清单。这个清单和交互式 `/model` 选单同源，每个模型带自己的 `supportedEffortLevels`，所以 Sonnet 这类没有 `xhigh` 的模型不会显示 `xhigh` 或 `ultracode`。查询失败或没有发现模型时，会退回到 `claude --help` 和内置默认模型列表。
+当前 Agent 是 Claude 时，`/models` 优先使用 `claude.modelOptions`；为空时运行 `claude --output-format stream-json --input-format stream-json --verbose` 并发送 `control_request initialize`，读取 Claude Code 返回的 `models` 清单。这个清单和交互式 `/model` 选单同源，每个模型带自己的 `supportedEffortLevels`，所以 Sonnet 这类没有 `xhigh` 的模型不会显示 `xhigh` 或 `ultracode`。默认每次实时查询；查询失败或没有发现模型时会提示错误，不再退回过期硬编码模型。
 
 `ultracode` 在 Claude Code 中是 `xhigh + dynamic workflow orchestration` 的会话模式，不是独立模型；服务只会给支持 `xhigh` 的模型补这个选项。运行时会传 `--effort xhigh --settings {"ultracode":true}`，等效于交互界面里选择 ultracode。选择 `default` 时不传 `--model`，由 Claude Code 跟随官方默认模型。
 

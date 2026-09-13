@@ -273,8 +273,25 @@ def _looks_like_usage_result(text):
         return False
     lowered = str(text or "").lower()
     compact = re.sub(r"\s+", "", lowered)
-    markers = ("usage", "limit", "tokens", "cost", "resets", "用量", "token")
-    return any(marker in lowered or marker in compact for marker in markers)
+    if "loading usage data" in lowered or "loadingusagedata" in compact:
+        return False
+    final_markers = (
+        "current session",
+        "currentsession",
+        "current week",
+        "currentweek",
+        "usage credits",
+        "usagecredits",
+        "what's contributing",
+        "whatscontributing",
+        "resets",
+        "用量",
+    )
+    if any(marker in lowered or marker in compact for marker in final_markers):
+        return True
+    if re.search(r"\b[0-9]+(?:\.[0-9]+)?%\s*used\b", lowered):
+        return True
+    return "claude usage" in lowered and any(marker in lowered for marker in ("limit", "tokens", "cost", "token"))
 
 
 def _kill_process_tree(process, grace_s=1.0):

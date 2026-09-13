@@ -9,10 +9,9 @@ import uuid
 from pathlib import Path
 
 
-DEFAULT_CLAUDE_MODEL_NAMES = ["fable", "sonnet", "opus", "claude-fable-5", "claude-sonnet-4-6"]
 DEFAULT_CLAUDE_EFFORT_LEVELS = ["low", "medium", "high", "xhigh"]
-DEFAULT_CLAUDE_MODEL_DISCOVERY_TIMEOUT_SECONDS = 5
-DEFAULT_CLAUDE_MODEL_DISCOVERY_CACHE_SECONDS = 300
+DEFAULT_CLAUDE_MODEL_DISCOVERY_TIMEOUT_SECONDS = 20
+DEFAULT_CLAUDE_MODEL_DISCOVERY_CACHE_SECONDS = 0
 CLAUDE_MODEL_SOURCE_STREAM_JSON = "stream-json"
 CLAUDE_EFFORT_SOURCE_CLI_HELP = "cli-help-global"
 CLAUDE_EFFORT_SOURCE_FALLBACK = "fallback-global"
@@ -22,18 +21,6 @@ QUOTED_VALUE_RE = re.compile(r"'([^']+)'")
 HELP_OPTION_START_RE = re.compile(r"^\s*(?:-\w,\s*)?--[A-Za-z0-9][A-Za-z0-9-]*\b")
 SAFE_CLAUDE_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*(?:\[[A-Za-z0-9_.-]+\])?$")
 _MODEL_OPTIONS_CACHE = {}
-
-
-def default_claude_model_options():
-    return [
-        {
-            "model": model,
-            "effort": "",
-            "efforts": list(DEFAULT_CLAUDE_EFFORT_LEVELS),
-            "effortSource": CLAUDE_EFFORT_SOURCE_FALLBACK,
-        }
-        for model in DEFAULT_CLAUDE_MODEL_NAMES
-    ]
 
 
 def clear_claude_model_options_cache():
@@ -416,6 +403,7 @@ def claude_model_options(config, claude_config_dir="", cwd=""):
     if configured:
         return configured
     claude = config.get("claude") or {}
+    errors = []
     try:
         timeout_s = int(
             claude.get("modelDiscoveryTimeoutSeconds") or DEFAULT_CLAUDE_MODEL_DISCOVERY_TIMEOUT_SECONDS
@@ -436,18 +424,11 @@ def claude_model_options(config, claude_config_dir="", cwd=""):
         if discovered:
             _store_cached_options(key, discovered, cache_ttl_s)
             return discovered
-    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
-        pass
-    try:
-        timeout_s = int(
-            claude.get("modelDiscoveryTimeoutSeconds") or DEFAULT_CLAUDE_MODEL_DISCOVERY_TIMEOUT_SECONDS
-        )
-        discovered = discover_claude_help_model_options(claude.get("bin") or "claude", timeout_s=timeout_s)
-        if discovered:
-            return discovered
-    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError):
-        pass
-    return default_claude_model_options()
+        errors.append("stream-json 初始化未返回可用模型")
+    except (OSError, RuntimeError, subprocess.TimeoutExpired, ValueError) as exc:
+        errors.append(str(exc) or exc.__class__.__name__)
+    detail = "; ".join(error for error in errors if error)
+    raise RuntimeError(f"无法实时发现 Claude 模型列表{f'：{detail}' if detail else ''}")
 
 
 def find_claude_model_option(options, selector):

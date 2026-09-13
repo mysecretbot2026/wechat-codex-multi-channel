@@ -167,6 +167,27 @@ class ClaudeUsageTests(unittest.TestCase):
         self.assertTrue(_is_trust_prompt(trust))
         self.assertFalse(_looks_like_usage_result(trust))
 
+    def test_usage_detection_rejects_loading_state(self):
+        loading = (
+            "Session\n"
+            "  Total cost: $0.0000\n"
+            "  Tokens: input 0, output 0, cache read 0, cache write 0\n"
+            "Loading usage data…"
+        )
+
+        self.assertFalse(_looks_like_usage_result(loading))
+
+    def test_usage_detection_accepts_loaded_usage_state(self):
+        loaded = (
+            "Session\n"
+            "  Total cost: $0.0000\n"
+            "Current session\n"
+            "  2% used\n"
+            "  Resets 7pm (Asia/Shanghai)"
+        )
+
+        self.assertTrue(_looks_like_usage_result(loaded))
+
     @unittest.skipIf(os.name != "posix", "PTY test requires POSIX")
     def test_interactive_usage_confirms_trust_prompt_before_usage(self):
         with tempfile.TemporaryDirectory() as tmp:

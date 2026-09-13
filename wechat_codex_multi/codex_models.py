@@ -4,23 +4,19 @@ import shutil
 import subprocess
 
 
-REASONING_LEVELS = {"low", "medium", "high", "xhigh"}
-DEFAULT_MODEL_NAMES = [
-    "gpt-5.5",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.3-codex",
-    "gpt-5.2",
-    "codex-auto-review",
+DEFAULT_MODEL_REASONING_LEVELS = [
+    ("gpt-5.6-sol", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+    ("gpt-5.6-terra", ["low", "medium", "high", "xhigh", "max", "ultra"]),
+    ("gpt-5.6-luna", ["low", "medium", "high", "xhigh", "max"]),
+    ("gpt-5.5", ["low", "medium", "high", "xhigh"]),
 ]
-DEFAULT_REASONING_LEVELS = ["low", "medium", "high", "xhigh"]
 
 
 def default_model_options():
     return [
         {"model": model, "reasoningEffort": reasoning}
-        for model in DEFAULT_MODEL_NAMES
-        for reasoning in DEFAULT_REASONING_LEVELS
+        for model, reasoning_levels in DEFAULT_MODEL_REASONING_LEVELS
+        for reasoning in reasoning_levels
     ]
 
 
@@ -42,8 +38,6 @@ def normalize_model_option(raw):
         or option.get("default_reasoning_level")
         or ""
     ).strip()
-    if reasoning and reasoning not in REASONING_LEVELS:
-        return None
     label = str(option.get("name") or option.get("label") or option.get("display_name") or "").strip()
     normalized = {"model": model, "reasoningEffort": reasoning}
     if label:
@@ -90,6 +84,9 @@ def discover_model_options(codex_bin="codex", timeout_s=30, codex_home=""):
     options = []
     seen = set()
     for model in data.get("models") or []:
+        visibility = str(model.get("visibility") or "").strip().lower()
+        if visibility and visibility != "list":
+            continue
         slug = str(model.get("slug") or "").strip()
         if not slug:
             continue
