@@ -254,6 +254,8 @@ cp config.example.json config.json
 | `/agent claude` | 切换当前工作区到 Claude Code CLI |
 | `/account` | 查看当前 Agent 使用的账号 |
 | `/account <编号|名称|next|prev>` | 切换当前 Agent 账号，并重置当前 Agent 会话 |
+| `/codex-login [账号名] [期望邮箱]` | 管理员远程启动指定 Codex 账号的设备码登录，无需 LLM |
+| `/codex-login status|cancel [账号名]` | 管理员查看或取消 Codex 设备码登录 |
 | `/codex-accounts` | 查看可用 Codex 账号 |
 | `/codex` | 切换当前工作区到 Codex CLI，并显示当前 Codex 账号 |
 | `/codex <编号|名称|next|prev>` | 切换当前工作区到 Codex CLI，可同时切换 Codex 账号；账号变化时重置当前 Codex thread |
@@ -446,6 +448,8 @@ python3 -m wechat_codex_multi claude-usage --days 7
 ## 多 Codex 账号
 
 Codex 账号通过 `CODEX_HOME` 隔离。每个账号使用一套独立目录，目录内包含 `config.toml`、`auth.json`、sessions、sqlite 状态等。
+
+已连接的微信管理员可以发送 `/codex-login backup2 user@example.com`。服务直接运行该账号目录下的 `codex login --device-auth`，然后将官方登录地址和一次性代码发给管理员；用户需在浏览器登录并输入代码。完成后服务检查 CLI 登录状态和本地缓存中的邮箱，并将结果发回微信。使用 `/codex-login status backup2` 查看状态，或使用 `/codex-login cancel backup2` 取消。此命令只接受 `config.json` 中配置的 Codex 账号名，不接受任意文件路径；`/login` 仍用于新增微信 Bot 账号。设备码登录需先在 ChatGPT 安全设置或工作区权限中启用。
 
 先准备独立目录并登录：
 

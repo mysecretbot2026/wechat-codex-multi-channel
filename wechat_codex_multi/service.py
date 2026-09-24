@@ -42,6 +42,7 @@ from .codex_accounts import (
     resolve_session_codex_account,
 )
 from .codex_cli import CodexCancelled, CodexCliRunner
+from .codex_device_login import CodexDeviceLoginManager, cached_email, login_status
 from .codex_models import find_model_option, format_model_option, model_options, resolve_session_model
 from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
 from .config import PROJECT_DIR
@@ -75,6 +76,7 @@ class MultiWechatCodexService:
             codex_factory=lambda cfg, state: self._create_codex_runner(cfg),
             claude_factory=lambda cfg, state: self._create_claude_runner(cfg),
         )
+        self.codex_device_login = CodexDeviceLoginManager(config["codex"].get("bin") or "codex")
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(config.get("concurrency", {}).get("maxWorkers") or 4)
         )
@@ -129,6 +131,7 @@ class MultiWechatCodexService:
 
     def stop(self):
         self.stop_event.set()
+        self.codex_device_login.stop()
         self.codex.terminate_all()
         self.command_executor.shutdown(wait=False, cancel_futures=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
@@ -317,6 +320,7 @@ class MultiWechatCodexService:
             "/account",
             "/codex-accounts",
             "/codex",
+            "/codex-login",
             "/claude-accounts",
             "/claude",
             "/model",
@@ -485,6 +489,9 @@ class MultiWechatCodexService:
         command = text.strip()
         if command == "/help":
             self._send_text(account, user_id, self._help_text(account["accountId"]))
+            return
+        if command == "/codex-login" or command.startswith("/codex-login "):
+            self._handle_codex_login(account, user_id, conversation_key, command)
             return
         if command == "/accounts":
             self._send_text(account, user_id, self._format_accounts())
@@ -1419,6 +1426,74 @@ class MultiWechatCodexService:
             "\n".join(lines),
         )
 
+    def _handle_codex_login(self, account, user_id, conversation_key, command):
+        if not self._is_admin(user_id):
+            self._send_text(account, user_id, "只有 adminUsers 可以远程登录 Codex CLI。")
+            return
+        parts = command.split()
+        action = parts[1].lower() if len(parts) > 1 else ""
+        if action in {"status", "cancel"}:
+            if len(parts) > 3:
+                self._send_text(account, user_id, "用法：/codex-login status|cancel [账号名]")
+                return
+            selector = parts[2] if len(parts) == 3 else ""
+        else:
+            if len(parts) > 3:
+                self._send_text(account, user_id, "用法：/codex-login [账号名] [期望邮箱]")
+                return
+            selector = parts[1] if len(parts) > 1 else ""
+        target = (find_codex_account(self.config, selector) if selector else
+                  resolve_session_codex_account(self.config, self._get_session(conversation_key)))
+        if not target:
+            self._send_text(account, user_id, f"未知 Codex 账号：{selector}。发送 /codex-accounts 查看可用账号。")
+            return
+        name = target["name"]
+        home = target["codexHome"]
+        if action == "status":
+            logged_in, status = login_status(self.config["codex"].get("bin") or "codex", home)
+            email = cached_email(home) if logged_in else ""
+            lines = [f"Codex 账号：{name}", f"CODEX_HOME：{home}",
+                     f"设备码登录进行中：{'是' if self.codex_device_login.is_running(home) else '否'}",
+                     f"CLI 登录状态：{status or ('已登录' if logged_in else '未登录')}"]
+            if email:
+                lines.append(f"邮箱：{email}")
+            self._send_text(account, user_id, "\n".join(lines))
+            return
+        if action == "cancel":
+            cancelled = self.codex_device_login.cancel(home)
+            self._send_text(account, user_id, f"已取消 {name} 的设备码登录。" if cancelled else f"{name} 当前没有进行中的设备码登录。")
+            return
+        expected_email = parts[2] if len(parts) > 2 else ""
+        if expected_email and ("@" not in expected_email or len(expected_email) > 254):
+            self._send_text(account, user_id, "期望邮箱格式无效。用法：/codex-login [账号名] [期望邮箱]")
+            return
+        if self.codex_device_login.is_running(home):
+            self._send_text(account, user_id, f"{name} 的设备码登录已在进行中。发送 /codex-login status {name} 查看状态。")
+            return
+        for run in self._active_runs():
+            if run.get("agent") != "codex":
+                continue
+            running_session = self._get_session(run.get("conversationKey"))
+            if resolve_session_codex_account(self.config, running_session).get("codexHome") == home:
+                self._send_text(account, user_id, f"{name} 当前有 Codex 任务运行，请任务结束后再登录。")
+                return
+
+        def on_code(url, code):
+            lines = [f"请为 Codex 账号 {name} 完成登录：", f"打开：{url}", f"输入一次性代码：{code}",
+                     "代码 15 分钟后过期。仅在你本人发起此命令时继续。"]
+            if expected_email:
+                lines.append(f"请在官方页面选择账号：{expected_email}")
+            self._send_text(account, user_id, "\n".join(lines))
+
+        def on_done(message):
+            self._send_text(account, user_id, f"Codex 账号 {name}：{message}")
+
+        started = self.codex_device_login.start(home, on_code, on_done, expected_email=expected_email)
+        if started:
+            self._send_text(account, user_id, f"正在为 {name} 启动 Codex 设备码登录。登录地址和代码将单独发送。")
+        else:
+            self._send_text(account, user_id, f"{name} 的设备码登录已在进行中。")
+
     def _handle_claude_switch(self, account, user_id, conversation_key, selector):
         session = self._get_session(conversation_key)
         current_agent = resolve_session_agent(self.config, session)
@@ -1823,6 +1898,8 @@ class MultiWechatCodexService:
                 "/account 查看或切换当前 Agent 账号",
                 "/account <编号|名称|next> 切换当前 Agent 账号",
                 "/codex [编号|名称|next] 切到 Codex，可同时切账号",
+                "/codex-login [账号名] [期望邮箱] 远程登录 Codex CLI（adminUsers only）",
+                "/codex-login status|cancel [账号名] 查看或取消设备码登录（adminUsers only）",
                 "/claude [编号|名称|next] 切到 Claude，可同时切账号",
                 "/model 查看或切换当前 Agent 的模型和 effort",
                 "/runner 查看或切换 Codex exec/app-server runner",
