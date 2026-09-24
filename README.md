@@ -1,711 +1,228 @@
 # wechat-codex-multi-channel
 
-把多个微信 Bot 账号接到同一个本地 AI coding CLI 服务上。默认使用 Codex CLI，也可以在微信里切换到 Claude Code CLI，同时保留本机 `codex` / `claude` 登录态、工作目录、模型和 reasoning/effort 的控制权。
-
-## 功能概览
-
-- 多个微信 Bot 账号同时在线，统一由本地服务轮询和回复。
-- 每个 `accountId:userId` 可创建多个项目工作区，每个工作区独立保存工作目录、Agent、CLI 会话、账号和模型选择。
-- 不同会话或不同工作区可并发处理；同一工作区默认串行，避免同一个 CLI 会话被并发写入。
-- 同一工作区运行中继续发消息默认作为补充引导；`app-server` runner 会调用 Codex 原生 `turn/steer`，`exec` runner 会退回到队列续跑。
-- 支持 `/agent codex`、`/agent claude`、`/codex`、`/claude` 在 Codex CLI 与 Claude Code CLI 之间切换。
-- 支持 `/account`、`/codex` 在多个 `CODEX_HOME` 登录账号之间切换。
-- 支持 `/account`、`/claude` 在多个 `CLAUDE_CONFIG_DIR` 登录配置之间切换。
-- 支持 `/models` 查看模型列表，`/model <编号|model:reasoning>` 切换模型。
-- 支持 `/cwd` 为当前工作区切换 CLI 工作目录，支持 `/ws` 管理同一微信用户下的多个项目工作区。
-- 支持 `/usage` 查看当前 Agent 用量，`/usage all` 汇总 Codex 与 Claude 配置账号。
-- 支持文本、图片、文件、视频收发；入站媒体会下载到本地后把路径交给当前 Agent。
-- 支持 CLI 回复媒体发送标记，把本地图片、文件、视频发回微信。
-- 支持可配置的图片/视频生成器，以及 Codex 原生 `image_generation_end` 事件转微信图片。
-- 支持 macOS `launchd` 开机自启和异常退出自动重启。
-
-## 目录
-
-- [快速开始](#快速开始)
-- [配置说明](#配置说明)
-- [微信命令](#微信命令)
-- [Agent 和 Claude Code](#agent-和-claude-code)
-- [多 Codex 账号](#多-codex-账号)
-- [多 Claude 账号](#多-claude-账号)
-- [模型和 Reasoning 切换](#模型和-reasoning-切换)
-- [媒体发送协议](#媒体发送协议)
-- [媒体生成器](#媒体生成器)
-- [macOS 后台运行](#macos-后台运行)
-- [开发和验证](#开发和验证)
-- [常见问题](#常见问题)
+把多个微信 Bot 账号接到同一台机器上的 Codex CLI 或 Claude Code CLI。下列微信命令由本地服务按固定规则处理；其他消息交给所选 Agent。每个微信用户可以维护多个项目工作区，工作区分别保存目录、Agent、登录账号、模型和 CLI 会话。
 
 ## 快速开始
 
-### 环境要求
-
-- macOS 或 Linux。
-- Python 3.10+。
-- 已安装并登录本机 Codex CLI。需要 Claude Code 支持时，也要安装并登录 `claude`。
-- 可访问微信 Bot 接口。
-
-确认 Codex CLI 可用：
+要求：macOS 或 Linux、Python 3.9+、Node.js/npm、可访问微信 Bot 接口。要运行 Codex 或 Claude 任务，机器上还需安装对应 CLI。Codex 可以在 Bot 启动后通过微信完成设备码登录。
 
 ```bash
-codex login status
-```
-
-确认 Claude Code CLI 可用：
-
-```bash
-claude auth status --text
-claude -p --verbose --output-format stream-json "只回复 OK"
-```
-
-安装并启动：
-
-```bash
-cd /path/to/project
+cd /path/to/wechat-codex-multi-channel
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
 npm install
 cp config.example.json config.json
+```
+
+先编辑 `config.json`：将 `codex.workingDirectory` 设为实际项目目录，检查 `codex.accounts` 中的账号目录。示例文件含 `main`、`backup`、`work`，这些目录需要分别登录；不使用的账号可以从数组中删除。
+
+添加第一个微信 Bot 账号，按终端提示扫码：
+
+```bash
 python3 -m wechat_codex_multi add-account
-python3 -m wechat_codex_multi start
-```
-
-也可以用 npm 脚本：
-
-```bash
-npm run setup
-npm run start
-npm run status
-```
-
-继续添加微信 Bot 账号：
-
-```bash
-python3 -m wechat_codex_multi add-account [昵称]
-```
-
-查看本地状态：
-
-```bash
 python3 -m wechat_codex_multi status
 ```
 
-本地改名或删除微信用户：
+终端 `status` 中的 `userId` 是扫码登录的微信用户 ID。如果此用户就是管理员，将它写入 `config.json` 的 `adminUsers`；如需限制访问，也写入 `allowedUsers`。然后启动：
 
 ```bash
-python3 -m wechat_codex_multi rename-user 用户1 主号
-python3 -m wechat_codex_multi delete-user 主号
+python3 -m wechat_codex_multi start
 ```
 
-使用自定义配置文件：
+在微信里发送 `/status` 检查连接。如果管理员不是扫码登录的人，可以先在空 `allowedUsers` 下让他发送 `/status`，从返回的 `conversation: accountId:userId` 取最后一段 `userId`，写入 `adminUsers` 后重启。首次使用 Codex 时，可在本机执行 `codex login`，或以管理员身份发送 `/codex-login main user@example.com` 完成远程设备码登录。要使用 Claude，先在对应 `CLAUDE_CONFIG_DIR` 执行 `claude auth login`。这里的 `user@example.com` 仅是示例邮箱，替换为你自己的账号。
 
-```bash
-WECHAT_CODEX_MULTI_CONFIG=/path/to/config.json python3 -m wechat_codex_multi start
-python3 -m wechat_codex_multi --config /path/to/config.json start
-```
+已有微信 Bot 账号时，直接运行 `start`，不必再次扫码。自定义配置文件可用 `python3 -m wechat_codex_multi --config /path/to/config.json start`，或设置 `WECHAT_CODEX_MULTI_CONFIG`。
 
-## 配置说明
+## 账号、用户与数据目录
 
-推荐从 `config.example.json` 复制一份本地配置：
+| 名称 | 用途 | 存放位置 |
+| --- | --- | --- |
+| 微信 Bot 账号 | 接收和发送微信消息；可同时连接多个 | `stateDir/state.json` |
+| 微信用户 | 向 Bot 发消息的人；用消息发送者的 `userId` 控制访问和管理员权限 | `config.json` 中的名单、`stateDir/state.json` 中的会话 |
+| Codex 账号 | 运行 Codex CLI；每个账号对应独立 `CODEX_HOME` | `codex.accounts[].codexHome` |
+| Claude 账号 | 运行 Claude Code CLI；可设置独立 `CLAUDE_CONFIG_DIR` | `claude.accounts[].claudeConfigDir` |
 
-```bash
-cp config.example.json config.json
-```
+`/login` 添加微信 Bot 账号；`/codex-login` 授权 Codex CLI。这两个命令处理的是不同的登录。`/codex-login` 只接受配置中已有的 Codex 账号名，不接受任意磁盘路径。
 
-常用配置：
+`stateDir` 包含微信 Bot 凭据、会话状态和接收的媒体；Codex 的 `auth.json` 也包含登录凭据。不要把这些文件或 `config.json` 提交到仓库。默认 `allowedUsers: []` 会响应所有能联系该 Bot 的微信用户；按实际使用范围配置访问名单。默认 `codex.bypassApprovalsAndSandbox: true` 会让 Codex 以较高本机权限运行。
+
+## 配置
+
+`config.example.json` 是完整配置样例，`wechat_codex_multi/config.py` 给出运行时默认值。无需把所有字段复制到自己的配置里；只写需要覆盖的字段即可。常用项：
+
+| 字段 | 作用 |
+| --- | --- |
+| `stateDir` | 微信账号、会话和媒体的本地状态目录 |
+| `defaultAgent` | 新工作区默认使用 `codex` 或 `claude` |
+| `wechat.baseUrl`、`botType`、`routeTag` | 微信 Bot 接口设置；`routeTag` 非空时作为请求头发送 |
+| `codex.bin`、`claude.bin` | CLI 命令名或绝对路径 |
+| `codex.workingDirectory` | 默认项目目录；`claude.workingDirectory` 为空时沿用此目录 |
+| `codex.runner` | `exec` 或 `app-server`；默认 `exec` |
+| `codex.defaultAccount`、`codex.accounts` | 默认 Codex 账号和各账号的 `codexHome` |
+| `claude.defaultAccount`、`claude.accounts` | 默认 Claude 账号和各账号的 `claudeConfigDir`；空路径使用系统默认登录态 |
+| `codex.model`、`codex.reasoningEffort` | Codex 默认模型和 reasoning 档位 |
+| `claude.model`、`claude.effort` | Claude 默认模型和 effort 档位 |
+| `codex.modelOptions`、`claude.modelOptions` | 固定微信中的可选模型列表；空数组时由 CLI 发现 |
+| `codex.modelDiscoveryTimeoutSeconds` | Codex 模型发现超时，默认 30 秒 |
+| `claude.modelDiscoveryTimeoutSeconds`、`modelDiscoveryCacheSeconds` | Claude 模型发现超时和缓存，默认 20 秒、0 秒 |
+| `codex.timeoutMs`、`claude.timeoutMs` | 单次任务超时，默认 2 小时 |
+| `codex.bypassApprovalsAndSandbox` | 是否给 Codex 传入跳过审批与沙箱的参数，默认 `true` |
+| `claude.permissionMode` | Claude Code 权限模式，默认 `bypassPermissions` |
+| `codex.extraPrompt`、`claude.extraPrompt` | 追加到对应 Agent 的提示 |
+| `concurrency.maxWorkers`、`commandWorkers` | 普通任务与命令任务的线程数，默认 4、2 |
+| `concurrency.perConversationSerial` | 是否串行处理同一工作区，默认 `true` |
+| `state.saveDebounceMs` | 状态文件写入防抖时间，默认 1000 毫秒 |
+| `media.maxFileBytes`、`maxConcurrentTransfers` | 单文件发送上限与媒体传输并发数 |
+| `media.generators` | 可选的外部图片、视频等媒体生成命令 |
+| `allowedUsers`、`adminUsers` | 可访问用户与管理员的微信 `userId` 列表 |
+| `textChunkLimit`、`logLevel` | 微信文本分片长度和日志级别 |
+
+例如添加独立 Codex 账号：
 
 ```json
 {
-  "stateDir": "~/.wechat-codex-multi",
-  "defaultAgent": "codex",
-  "wechat": {
-    "baseUrl": "https://ilinkai.weixin.qq.com",
-    "botType": "3",
-    "routeTag": null
-  },
   "codex": {
-    "runner": "exec",
-    "bin": "codex",
-    "workingDirectory": ".",
-    "model": "",
-    "reasoningEffort": "",
-    "modelOptions": [],
-    "modelDiscoveryTimeoutSeconds": 30,
-    "timeoutMs": 7200000,
-    "bypassApprovalsAndSandbox": true,
     "defaultAccount": "main",
     "accounts": [
-      {
-        "name": "main",
-        "codexHome": "~/.codex"
-      }
-    ],
-    "extraPrompt": ""
+      {"name": "main", "codexHome": "~/.codex"},
+      {"name": "backup", "codexHome": "~/.codex-accounts/backup"}
+    ]
   },
-  "claude": {
-    "bin": "claude",
-    "workingDirectory": "",
-    "model": "sonnet",
-    "effort": "",
-    "modelOptions": [],
-    "modelDiscoveryTimeoutSeconds": 5,
-    "modelDiscoveryCacheSeconds": 300,
-    "timeoutMs": 7200000,
-    "usageTimeoutSeconds": 60,
-    "authStatusTimeoutSeconds": 5,
-    "adminUsageDays": 7,
-    "adminUsageTimeoutSeconds": 60,
-    "adminKeychainService": "wechat-codex-multi.anthropic-admin-key",
-    "permissionMode": "bypassPermissions",
-    "defaultAccount": "main",
-    "accounts": [
-      {
-        "name": "main",
-        "claudeConfigDir": ""
-      }
-    ],
-    "extraPrompt": ""
-  },
-  "concurrency": {
-    "maxWorkers": 4,
-    "commandWorkers": 2,
-    "perConversationSerial": true
-  },
-  "state": {
-    "saveDebounceMs": 1000
-  },
-  "media": {
-    "enabled": true,
-    "maxFileBytes": 52428800,
-    "maxConcurrentTransfers": 1,
-    "generators": []
-  },
-  "allowedUsers": [],
-  "adminUsers": [],
-  "textChunkLimit": 4000,
-  "logLevel": "INFO"
+  "adminUsers": ["你的微信 userId"],
+  "allowedUsers": ["你的微信 userId"]
 }
 ```
 
-字段说明：
-
-- `stateDir`：保存 Bot 账号、会话、`context_token` 和入站媒体文件。
-- `wechat.baseUrl`：微信 Bot API 地址。
-- `wechat.botType`：微信 Bot 类型，默认 `"3"`。
-- `wechat.routeTag`：非空时作为 `SKRouteTag` 请求头发送。
-- `codex.runner`：Codex 运行方式，`exec` 为兼容模式，`app-server` 使用 Codex 原生 app-server 支持运行中引导和 turn 中断。
-- `codex.bin`：Codex CLI 路径，可以是 `codex` 或绝对路径。
-- `codex.workingDirectory`：默认工作目录，微信中可用 `/cwd <path>` 覆盖当前工作区。
-- `codex.model`：默认模型，非空时传给 `codex -m`。
-- `codex.reasoningEffort`：默认 reasoning level，非空时传 `-c model_reasoning_effort="<level>"`。
-- `codex.modelOptions`：固定 `/models` 展示的模型选项；为空时每次通过 `codex debug models` 实时查询 Codex CLI 可用模型。
-- `codex.modelDiscoveryTimeoutSeconds`：`codex debug models` 的超时时间，默认 30 秒；超时会回退到内置模型列表。
-- `codex.timeoutMs`：单次 Codex 执行超时，默认 2 小时。
-- `codex.bypassApprovalsAndSandbox`：为 true 时传 `--dangerously-bypass-approvals-and-sandbox`。
-- `codex.defaultAccount`：默认 Codex 账号名。
-- `codex.accounts`：多个 Codex 登录账号，每个账号对应一个独立 `CODEX_HOME`。
-- `codex.extraPrompt`：追加到发给 Codex 的系统提示。
-- `claude.bin`：Claude Code CLI 路径，可以是 `claude` 或绝对路径。
-- `claude.workingDirectory`：Claude 默认工作目录；为空时沿用 `codex.workingDirectory`，微信中仍可用 `/cwd <path>` 覆盖当前工作区。
-- `claude.model`：默认 Claude 模型，非空时传给 `claude --model`，例如 `sonnet`。
-- `claude.effort`：默认 effort level，非空时传给 `claude --effort`；`ultracode` 会转换为 `--effort xhigh --settings {"ultracode":true}`。
-- `claude.modelOptions`：固定 `/models` 在 Claude Agent 下展示的模型选项；为空时通过 Claude Code stream-json 初始化协议实时查询官方模型清单和逐模型 effort 档位。
-- `claude.modelDiscoveryTimeoutSeconds`：Claude stream-json 模型发现的超时时间，默认 20 秒；失败或未发现模型时会直接提示错误，避免展示过期硬编码模型。
-- `claude.modelDiscoveryCacheSeconds`：Claude 模型发现缓存时间，默认 0 秒，即每次实时查询；大于 0 时缓存按 `claude.bin`、当前 `CLAUDE_CONFIG_DIR` 和工作目录区分。
-- `claude.timeoutMs`：单次 Claude 执行超时，默认 2 小时。
-- `claude.usageTimeoutSeconds`：Claude TUI `/usage` 交互式查询超时，默认 60 秒。
-- `claude.authStatusTimeoutSeconds`：`/status` 中 Claude 登录状态读取超时，默认 5 秒。
-- `claude.adminUsageDays`：Anthropic Admin API 默认查询天数，默认 7，日粒度接口最大 31。
-- `claude.adminUsageTimeoutSeconds`：Anthropic Admin API 请求超时，默认 60 秒。
-- `claude.adminKeychainService`：macOS Keychain 中保存 Admin Key 的 service 名，默认 `wechat-codex-multi.anthropic-admin-key`。
-- `claude.permissionMode`：传给 `claude --permission-mode`，默认 `bypassPermissions`。
-- `claude.defaultAccount`：默认 Claude 账号名。
-- `claude.accounts`：多个 Claude 登录配置。`claudeConfigDir` 为空表示使用 Claude Code 默认登录态；非空时作为独立 `CLAUDE_CONFIG_DIR`。
-- `claude.extraPrompt`：追加到 Claude Code 的系统提示。
-- `concurrency.maxWorkers`：普通 Agent 任务线程数。
-- `concurrency.commandWorkers`：微信命令处理线程数，避免 `/status`、`/models` 被长任务阻塞。
-- `concurrency.perConversationSerial`：同一会话是否串行处理。
-- `state.saveDebounceMs`：状态文件防抖写入间隔。
-- `media.maxFileBytes`：允许发送的单个媒体文件最大字节数。
-- `media.maxConcurrentTransfers`：媒体上传/下载并发数。
-- `media.generators`：外部媒体生成器配置。
-- `allowedUsers`：为空允许所有用户；非空时只响应列表内用户。
-- `adminUsers`：允许通过微信触发 `/login` 的用户。
-- `textChunkLimit`：长文本回复分片大小。
-- `logLevel`：日志级别。
+修改 `config.json` 后重启服务才会加载新设置。微信中的 `/runner` 切换仅作用于当前服务进程，重启后仍采用配置文件中的值。
 
 ## 微信命令
 
+命令由服务直接处理，不会作为普通提示发给 LLM。以下命令都在与 Bot 的聊天中发送。
+
+### 状态和用量
+
 | 命令 | 作用 |
 | --- | --- |
-| `/help` | 查看帮助 |
-| `/status` | 查看当前工作区、Agent、账号、模型、工作目录和 Bot 连接状态 |
-| `/usage` | 查看当前 Agent 当前账号用量 |
-| `/usage all` | 查看配置里所有 Codex 和 Claude 账号的用量 |
-| `/usage codex` | 查看当前工作区 Codex 账号用量 |
-| `/usage claude` | 查看当前工作区 Claude 账号用量 |
-| `/usage claude api [days]` | 通过 Anthropic Admin API 查看组织级 Claude API token 和 cost 用量 |
-| `/usage codex all` | 查看所有 Codex 账号用量 |
-| `/usage claude all` | 查看所有 Claude 账号用量 |
-| `/accounts` 或 `/users` | 查看已连接用户的昵称、accountId 和 userId |
-| `/active` | 查看当前正在交互中的用户，按 Agent 显示 conversation、pid、模型和 effort |
-| `/agents` | 查看可用 Agent |
-| `/agent` | 查看当前工作区使用的 Agent |
-| `/agent codex` | 切换当前工作区到 Codex CLI |
-| `/agent claude` | 切换当前工作区到 Claude Code CLI |
-| `/account` | 查看当前 Agent 使用的账号 |
-| `/account <编号|名称|next|prev>` | 切换当前 Agent 账号，并重置当前 Agent 会话 |
-| `/codex-login [账号名] [期望邮箱]` | 管理员远程启动指定 Codex 账号的设备码登录，无需 LLM |
-| `/codex-login status|cancel [账号名]` | 管理员查看或取消 Codex 设备码登录 |
-| `/codex-accounts` | 查看可用 Codex 账号 |
-| `/codex` | 切换当前工作区到 Codex CLI，并显示当前 Codex 账号 |
-| `/codex <编号|名称|next|prev>` | 切换当前工作区到 Codex CLI，可同时切换 Codex 账号；账号变化时重置当前 Codex thread |
-| `/codex-use <name>` | 兼容旧命令，等价于 `/codex <name>` |
-| `/claude-accounts` | 查看可用 Claude 账号 |
-| `/claude` | 切换当前工作区到 Claude Code CLI，并显示当前 Claude 账号 |
-| `/claude <编号|名称|next|prev>` | 切换当前工作区到 Claude Code CLI，可同时切换 Claude 账号；账号变化时重置当前 Claude session |
-| `/models` | 查看可切换模型列表 |
-| `/model` | 查看当前模型和模型切换说明 |
-| `/model <编号|model:reasoning>` | 切换当前 Agent 的模型，并重置当前 Agent 会话 |
-| `/runner` | 查看当前 Codex runner |
-| `/runner exec` | 切换到兼容的 `codex exec` runner |
-| `/runner app-server` | 切换到 Codex 原生 app-server runner，支持运行中 `turn/steer` |
-| `/cwd` | 查看当前工作区工作目录 |
-| `/cwd <path>` | 修改当前工作区工作目录，并重置当前工作区 Codex thread 和 Claude session |
-| `/sessions` | 查看当前 Agent、当前账号下可恢复的 sessions，按更新时间倒序 |
-| `/sessions codex` | 查看当前 Codex 账号下可恢复的 Codex sessions |
-| `/sessions claude` | 查看当前 Claude 账号下可恢复的 Claude sessions |
-| `/sessions all` | 合并查看当前 Codex 和 Claude 账号下可恢复的 sessions |
-| `/session use <编号|sessionId前缀>` | 把当前工作区切换到指定 Codex thread 或 Claude session |
-| `/session new [codex|claude]` | 新建当前工作区当前 Agent 或指定 Agent 会话 |
-| `/ws` 或 `/ws list` | 查看当前微信用户的项目工作区、运行状态、工作目录和当前 Agent session |
-| `/ws add <名称> <路径>` | 添加项目工作区 |
-| `/ws use <名称>` | 切换当前工作区；之后普通消息会进入该工作区 |
+| `/help` | 查看命令帮助 |
+| `/status` | 查看当前工作区、目录、Agent、账号、模型、会话与运行状态 |
+| `/active` | 查看正在运行的任务 |
+| `/accounts`、`/users` | 列出已连接的微信 Bot 账号和用户信息 |
+| `/usage` | 查看当前 Agent、当前账号用量 |
+| `/usage codex`、`/usage claude` | 查看当前工作区对应的 Codex 或 Claude 账号用量 |
+| `/usage all`、`/usage codex all`、`/usage claude all` | 汇总配置中的全部账号用量 |
+| `/usage claude api [days]` | 用 Anthropic Admin API 查看组织级 Claude API 用量；需要 Admin Key |
+
+Claude 普通用量查询通过本机 Claude Code TUI 的 `/usage` 完成；组织级 `api` 查询是另一条路径。`ANTHROPIC_ADMIN_KEY` 可通过环境变量或 macOS Keychain 提供，Keychain service 默认是 `wechat-codex-multi.anthropic-admin-key`。相关超时、查询天数和 Keychain service 可在 `claude.*` 中配置。
+
+### Agent、账号和模型
+
+| 命令 | 作用 |
+| --- | --- |
+| `/agents`、`/agent` | 查看可用 Agent 或当前 Agent |
+| `/agent codex`、`/agent claude` | 切换当前工作区使用的 CLI |
+| `/account [编号|名称|next|prev]` | 查看或切换当前 Agent 的登录账号 |
+| `/codex-accounts`、`/claude-accounts` | 列出对应 CLI 的配置账号 |
+| `/codex [编号|名称|next|prev]` | 切到 Codex，可同时选择 Codex 账号 |
+| `/claude [编号|名称|next|prev]` | 切到 Claude，可同时选择 Claude 账号 |
+| `/models`、`/model` | 查看当前 Agent 的模型选项与选择说明 |
+| `/model <编号|model:档位>` | 切换模型或 reasoning/effort，重置当前 Agent 会话 |
+| `/runner [exec|app-server]` | 查看或临时切换 Codex runner |
+
+`/codex-use <名称>` 是旧版兼容命令，等价于 `/codex <名称>`。账号选择支持编号、完整名称和唯一前缀；切换账号会重置该 Agent 的会话 ID。切换 Agent 时，Codex 和 Claude 各自的会话 ID 分开保存。
+
+当 `modelOptions` 为空时，Codex 使用默认账号的 `CODEX_HOME` 调用 `codex debug models`；发现超时才退回内置列表。Claude 通过 CLI 的 stream-json 初始化协议发现模型；失败时会提示错误。模型清单取决于已安装的 CLI 和账号，README 不固定列出某个版本的清单。`/model <编号>` 中的编号以刚查询到的列表为准。
+
+Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不是独立模型。切换模型或档位会清空当前 Agent 的会话 ID，下次任务会开启新会话。
+
+### 工作区和会话
+
+| 命令 | 作用 |
+| --- | --- |
+| `/cwd [路径]` | 查看或修改当前工作区目录；修改后重置两种 Agent 的会话 |
+| `/ws`、`/ws list` | 列出当前微信用户的项目工作区 |
+| `/ws add <名称> <路径>` | 添加工作区；`default` 为保留名称 |
+| `/ws use <名称>` | 切换当前工作区 |
 | `/ws agent <名称> <codex|claude>` | 设置指定工作区使用的 Agent |
-| `/ws run <名称> <任务>` | 不切换当前工作区，直接在指定工作区派发当前 Agent 任务 |
-| `/ws reset <名称>` | 取消运行中的任务并重置指定工作区当前 Agent 会话 |
-| `/reset` | 重置当前工作区当前 Agent 会话；如果任务正在运行，会先取消进程 |
-| `/guide <补充要求>` | 当前任务运行中追加补充引导；直接发送普通消息也会追加 |
-| `/interrupt` 或 `/cancel` | 立刻中断当前任务，保留当前 Agent 会话 |
-| `/interrupt <新任务>` | 中断当前任务，保留当前 Agent 会话，并在当前进程退出后自动执行新任务 |
-| `/login [昵称]` | 新增微信用户；未传昵称时自动保存为 `用户1`、`用户2` 等，仅 `adminUsers` 可用 |
-| `/user rename <昵称|accountId|编号> <新昵称>` | 修改用户昵称，仅 `adminUsers` 可用 |
-| `/user delete <昵称|accountId|编号>` | 删除用户并清理该用户会话，仅 `adminUsers` 可用 |
-| `/restart` | 重启后台服务，仅 `adminUsers` 可用 |
+| `/ws run <名称> <任务>` | 不切换当前工作区，直接向指定工作区派发任务 |
+| `/ws reset <名称>` | 取消任务并重置指定工作区的当前 Agent 会话 |
+| `/sessions [codex|claude|all]` | 按更新时间列出本机可恢复的 CLI 会话 |
+| `/session use <编号|sessionId前缀>` | 将当前工作区切换到指定会话 |
+| `/session new [codex|claude]` | 新建当前工作区的 CLI 会话 |
+| `/reset` | 取消当前任务并重置当前 Agent 会话 |
 
-常见用法：
+每个 `accountId:userId` 有自己的默认工作区；额外工作区的会话 key 为 `accountId:userId:workspaceName`。同一用户可以让不同工作区并行执行。工作区分别保存目录、Agent、Codex 与 Claude 会话、账号和模型选择。
+
+`/sessions` 读取本机 CLI 会话数据，不请求模型。列表中的编号只对当前工作区最近一次查询有效；`/session use` 在当前任务运行时会拒绝切换。
+
+### 运行中的任务
+
+| 命令 | 作用 |
+| --- | --- |
+| 普通消息 | 正在运行时视为补充引导 |
+| `/guide <内容>` | 显式追加补充引导 |
+| `/interrupt`、`/cancel` | 中断任务并保留当前 Agent 会话 |
+| `/interrupt <新任务>` | 中断任务后在同一会话处理新任务 |
+
+默认同一工作区串行执行。Codex `app-server` runner 支持原生 `turn/steer`；Codex `exec` 和 Claude headless runner 会把补充引导排队，在当前任务完成后继续。`/runner` 可切换 Codex runner；Claude 只使用 headless 方式。需要丢弃上下文时使用 `/reset`。
+
+### 管理员命令
+
+`adminUsers` 中的微信 `userId` 才能使用下列命令。空 `adminUsers` 表示无人拥有管理员权限。
+
+| 命令 | 作用 |
+| --- | --- |
+| `/login [昵称]` | 扫码添加微信 Bot 账号 |
+| `/user rename <昵称|accountId|编号> <新昵称>` | 修改微信用户昵称 |
+| `/user delete <昵称|accountId|编号>` | 删除微信用户并清理会话 |
+| `/codex-login [账号名] [期望邮箱]` | 为配置中的 Codex 账号发起设备码登录 |
+| `/codex-login status [账号名]` | 查看 Codex CLI 登录状态和正在进行的设备码流程 |
+| `/codex-login cancel [账号名]` | 取消正在进行的设备码流程 |
+| `/restart` | 重启后台服务；需有 launchd 等监护进程自动拉起 |
+
+`/accounts`、`/users` 可由允许访问 Bot 的用户查询；修改、登录和重启操作需要 `adminUsers`。如果你不希望普通用户看到账号列表，应只允许可信用户访问 Bot。终端也可运行 `python3 -m wechat_codex_multi rename-user <选择器> <新昵称>` 或 `delete-user <选择器>`。
+
+## 远程登录 Codex
+
+先在 `config.json` 注册独立账号目录，例如 `backup` 对应 `~/.codex-accounts/backup`。如果要用 `~/.codex-accounts/backup2`，就在 `codex.accounts` 中添加 `{"name":"backup2","codexHome":"~/.codex-accounts/backup2"}`。后台服务需要能够调用 `codex`，但此目录可以尚未登录。新增配置后重启服务。
+
+管理员在微信中发送：
 
 ```text
-/status
-/usage
-/usage all
-/usage claude
-/users
-/login 主号
-/user rename 主号 工作号
-/user delete 工作号
+/codex-login backup user@example.com
+```
 
-/agents
-/agent claude
-/agent codex
+服务直接启动 `CODEX_HOME=~/.codex-accounts/backup codex login --device-auth`，然后发送官方登录地址和一次性代码。账号持有人在浏览器中登录、输入代码；成功后服务检查 CLI 登录状态，并在本地凭据可读取时比对邮箱。`期望邮箱` 用来核对结果，不能强制官方登录页面选择该账号。代码约 15 分钟有效，过期后重新发送命令。设备码登录需在 ChatGPT 账号安全设置或工作区权限中启用。
 
-/account
-/account 2
-/account next
-
-/codex-accounts
-/codex
-/codex 2
+```text
+/codex-login status backup
+/codex-login cancel backup
 /codex backup
-/codex next
-
-/claude-accounts
-/claude
-/claude 2
-/claude work
-/claude next
-
-/models
-/model 3
-/model gpt-5.5:high
-/model sonnet:high
-/runner app-server
-
-/cwd /path/to/project-a
-/sessions
-/sessions all
-/session use 1
-/session new
-/reset
-/interrupt 改成先修登录页，不要继续做 README
-
-/ws add a /path/to/project-a
-/ws add b /path/to/project-b
-/ws agent a claude
-/ws
-/ws run a 帮我改 README
-/ws run b 跑测试并修 bug
 ```
 
-`/agent` 切换当前工作区使用的 CLI。Codex 和 Claude 的会话 ID 分开保存，切换 Agent 不会共享上下文。
-
-`/account` 切换的是当前 Agent 的登录账号。当前 Agent 是 Codex 时切换不同的 `CODEX_HOME`，会清空当前工作区的 `codexThreadId`；当前 Agent 是 Claude 时切换不同的 `CLAUDE_CONFIG_DIR`，会清空当前工作区的 `claudeSessionId`。
-
-`/codex` 是切到 Codex CLI 的快捷命令，可同时切 Codex 账号；`/claude` 是切到 Claude Code CLI 的快捷命令，可同时切 Claude 账号。只切 Agent 不会清空另一个 Agent 已保存的会话 ID，切换账号才会重置对应 Agent 会话。`/model` 切换的是当前 Agent 的模型和 effort/reasoning，会重置当前 Agent 的会话。
-
-`/status` 会显示当前工作区是否有任务正在运行：`running: true` 或 `running: false`。同时会显示当前 Agent 对应的完整 `sessionId`，Codex 时对应 `codexThreadId`，Claude 时对应 `claudeSessionId`，可用于 `/session use <sessionId前缀>` 切回会话。这个运行状态和 `/ws` 里的 `[running]` / `[idle]` 使用同一套运行表。
-
-`/sessions` 从本机 CLI 会话存储读取可恢复会话。Codex 读取当前 `CODEX_HOME/state_5.sqlite` 的 threads 表，优先显示 Codex 生成的 title；必要时回退到 `session_index.jsonl`。Claude 读取当前 `CLAUDE_CONFIG_DIR` 下的 `usage-data/session-meta/*.json` 和 `projects/**/*.jsonl`，用 `first_prompt` 或第一条用户消息作为标题。列表按更新时间倒序，编号只在当前工作区最近一次 `/sessions` 输出中有效。
-
-`/session use <编号|sessionId前缀>` 会把当前工作区切到指定 session，并同步 Agent、账号、工作目录和会话 ID。当前工作区任务运行中时会拒绝切换，避免把正在执行的 CLI 会话状态写乱。
-
-## Agent 和 Claude Code
-
-服务启动时默认使用 `defaultAgent`，可设为 `codex` 或 `claude`。运行中也可以在微信里切换：
-
-```text
-/agents
-/agent claude
-/agent codex
-```
-
-Claude Code runner 使用新版 headless 接口：
+前两条检查或取消授权，最后一条才把当前工作区切换到该账号。也可在机器上直接运行：
 
 ```bash
-claude -p --verbose --output-format stream-json --model sonnet --effort low --permission-mode bypassPermissions "任务内容"
+CODEX_HOME="$HOME/.codex-accounts/backup" codex login --device-auth
+CODEX_HOME="$HOME/.codex-accounts/backup" codex login status
 ```
 
-当前已在 Claude Code 2.1.119 上验证：`stream-json` 必须搭配 `--verbose`；输出事件中的 `system`、`assistant`、`result` 都带 `session_id`，服务会把它保存为 `claudeSessionId` 并在下一轮用 `--resume <session_id>` 续会话。
+登录状态只说明本地 CLI 有凭据；如果实际请求仍返回 401，应在相同的 `CODEX_HOME` 重新登录。每个机器和账号目录应维护自己的新鲜授权，不要反复复制旧的 `auth.json` 覆盖已经刷新的文件。
 
-Claude Code 暂只支持 `exec/headless` 方式。运行中补充消息会进入服务层队列，当前任务结束后继续处理；不像 Codex `app-server` runner 那样支持原生 `turn/steer`。
+## 媒体
 
-### 通用用量命令
+入站支持文字、微信提供的语音转写、图片、文件和视频。图片、文件、视频会下载到 `stateDir/inbound_media`，本地路径交给当前 Agent。
 
-`/usage` 会根据当前工作区 Agent 自动分发。当前是 Codex 时读取 Codex 限额；当前是 Claude 时会启动 Claude Code TUI，自动发送 `/usage`，等待终端输出稳定后提取屏幕内容并清理进程树。Claude 普通用量查询不再读取本地 `stats-cache.json`。
-
-```text
-/usage
-/usage all
-/usage codex
-/usage claude
-/usage claude api
-/usage claude api 30
-/usage codex all
-/usage claude all
-```
-
-Claude 交互式查询会使用当前工作区目录；如果 Claude TUI 出现 trust folder 提示，服务会自动输入 `1` 确认。查询完成或超时后会终止 Claude 进程组，避免残留 node 子进程。
-
-`/usage claude api [days]` 仍然保留为 Anthropic Admin API 查询，使用官方 `/v1/organizations/usage_report/messages` 和 `/v1/organizations/cost_report`，需要 `sk-ant-admin...` Admin Key；个人账号不可用，必须是组织 Admin。不要把 key 写进 `config.json`。macOS 推荐保存到 Keychain：
+推荐由 Agent 使用内置 `send-media` skill 登记本地文件；服务在当前任务结束后发送：
 
 ```bash
-security add-generic-password -a "$USER" -s wechat-codex-multi.anthropic-admin-key -w "sk-ant-admin-xxx" -U
-```
-
-也可以临时用环境变量：
-
-```bash
-export ANTHROPIC_ADMIN_KEY=sk-ant-admin-xxx
-python3 -m wechat_codex_multi claude-usage --days 7
-```
-
-如果服务由 launchd 启动，普通 shell 里的 `export` 不会自动传给后台服务；优先用上面的 Keychain 方式，或在启动前执行 `launchctl setenv ANTHROPIC_ADMIN_KEY sk-ant-admin-xxx` 后重启服务。
-
-### 运行中引导和中断
-
-默认开启同一工作区串行处理时，当前 Agent 正在运行期间，同一微信用户继续发送普通消息不会被拒绝，而是作为补充引导处理。
-
-如果 `codex.runner` 为 `app-server`，服务会调用 Codex 原生 `turn/steer`，让当前 active turn 在运行中调整方向。
-
-如果 `codex.runner` 为 `exec` 或当前 Agent 是 Claude，由于 CLI 是一次性进程，服务会退回到补充引导队列：当前任务返回后合并补充要求并沿用当前工作区会话续跑。
-
-斜杠开头的系统命令不会被识别为引导，例如 `/status`、`/usage`、`/reset`、`/interrupt` 会按命令单独处理。
-
-可显式发送：
-
-```text
-/guide 标题改短一点，结尾加行动项
-```
-
-也可以直接发送普通文本，效果相同。运行中不需要特意输入 `/guide`。
-
-需要放弃当前运行中的任务时：
-
-```text
-/interrupt
-/cancel
-```
-
-需要立刻改做另一件事时：
-
-```text
-/interrupt 不要继续重构，先修复登录报错并跑测试
-```
-
-注意：`exec` runner 和 Claude runner 的中断会终止当前子进程，但默认保留当前工作区对应的会话 ID；`/interrupt <新任务>` 会在同一会话上下文里继续新任务。`app-server` runner 会优先调用 Codex 原生 `turn/interrupt`，失败时再由服务层做降级处理。需要主动丢弃上下文时，用 `/reset` 或 `/ws reset <名称>`。
-
-运行时可以用 `/runner exec` 或 `/runner app-server` 临时切换当前服务进程内的 runner。切换时会关闭旧 runner 的后台进程；服务重启后仍以 `config.json` 里的 `codex.runner` 为准。
-
-## 多 Codex 账号
-
-Codex 账号通过 `CODEX_HOME` 隔离。每个账号使用一套独立目录，目录内包含 `config.toml`、`auth.json`、sessions、sqlite 状态等。
-
-已连接的微信管理员可以发送 `/codex-login backup2 user@example.com`。服务直接运行该账号目录下的 `codex login --device-auth`，然后将官方登录地址和一次性代码发给管理员；用户需在浏览器登录并输入代码。完成后服务检查 CLI 登录状态和本地缓存中的邮箱，并将结果发回微信。使用 `/codex-login status backup2` 查看状态，或使用 `/codex-login cancel backup2` 取消。此命令只接受 `config.json` 中配置的 Codex 账号名，不接受任意文件路径；`/login` 仍用于新增微信 Bot 账号。设备码登录需先在 ChatGPT 安全设置或工作区权限中启用。
-
-先准备独立目录并登录：
-
-```bash
-CODEX_HOME=$HOME/.codex-accounts/backup codex login
-CODEX_HOME=$HOME/.codex-accounts/backup codex login status
-```
-
-加入 `config.json`：
-
-```json
-{
-  "codex": {
-    "defaultAccount": "main",
-    "accounts": [
-      {
-        "name": "main",
-        "codexHome": "~/.codex"
-      },
-      {
-        "name": "backup",
-        "codexHome": "~/.codex-accounts/backup"
-      },
-      {
-        "name": "work",
-        "codexHome": "~/.codex-accounts/work"
-      }
-    ]
-  }
-}
-```
-
-微信里查看和切换：
-
-```text
-/codex-accounts
-/codex
-/account
-/codex 2
-/codex backup
-/codex next
-/codex prev
-```
-
-当前 Agent 是 Codex 时，`/account <编号或名称>` 和 `/codex <编号或名称>` 都支持编号、完整名称、唯一前缀。`/codex` 会先切到 Codex Agent；切换账号时会清空当前 `codexThreadId`，避免不同 Codex 登录态之间错误 resume。
-
-## 多 Claude 账号
-
-Claude Code 账号通过 `CLAUDE_CONFIG_DIR` 隔离。默认账号建议把 `claudeConfigDir` 留空，这样使用当前系统默认 Claude Code 登录态；额外账号再使用独立 Claude 配置目录。
-
-先准备独立目录并登录：
-
-```bash
-CLAUDE_CONFIG_DIR=$HOME/.claude-accounts/work claude auth login
-CLAUDE_CONFIG_DIR=$HOME/.claude-accounts/work claude auth status --text
-```
-
-加入 `config.json`：
-
-```json
-{
-  "claude": {
-    "defaultAccount": "main",
-    "accounts": [
-      {
-        "name": "main",
-        "claudeConfigDir": ""
-      },
-      {
-        "name": "work",
-        "claudeConfigDir": "~/.claude-accounts/work"
-      }
-    ]
-  }
-}
-```
-
-微信里查看和切换：
-
-```text
-/claude-accounts
-/claude
-/account
-/claude 2
-/claude work
-/claude next
-/claude prev
-```
-
-当前 Agent 是 Claude 时，`/account <编号或名称>` 和 `/claude <编号或名称>` 都支持编号、完整名称、唯一前缀。`/claude` 会先切到 Claude Agent；切换账号时会清空当前 `claudeSessionId`，避免不同 Claude 登录配置之间错误 resume。
-
-## 模型和 Reasoning 切换
-
-微信里发送：
-
-```text
-/models
-```
-
-服务会按当前 Agent 显示可切换项，适合在微信中阅读。Codex 使用 `reasoningEffort`，Claude 使用 `effort`。Claude 自动发现模式通过 stream-json 初始化协议读取官方模型清单，按每个模型真实支持的档位显示。
-
-```text
-可切换模型（发送 /model 编号 切换）：
-gpt-5.5
-1. gpt-5.5:low
-2. gpt-5.5:medium
-3. gpt-5.5:high
-4. gpt-5.5:xhigh
-
-gpt-5.4
-5. gpt-5.4:low
-6. gpt-5.4:medium
-7. gpt-5.4:high
-8. gpt-5.4:xhigh
-
-gpt-5.4-mini
-9. gpt-5.4-mini:low
-10. gpt-5.4-mini:medium
-11. gpt-5.4-mini:high
-12. gpt-5.4-mini:xhigh
-```
-
-切换方式：
-
-```text
-/model 3
-/model gpt-5.5:high
-/model sonnet:high
-```
-
-切换成功后会回复：
-
-```text
-已经切换到 gpt-5.5:high 模型
-已重置当前 Codex thread。
-```
-
-如果当前 Agent 是 Claude，切换成功后会回复：
-
-```text
-已经切换到 sonnet:high 模型
-已重置当前 Claude session。
-```
-
-默认内置模型列表：
-
-```text
-gpt-5.5:low
-gpt-5.5:medium
-gpt-5.5:high
-gpt-5.5:xhigh
-gpt-5.4:low
-gpt-5.4:medium
-gpt-5.4:high
-gpt-5.4:xhigh
-gpt-5.4-mini:low
-gpt-5.4-mini:medium
-gpt-5.4-mini:high
-gpt-5.4-mini:xhigh
-gpt-5.3-codex:low
-gpt-5.3-codex:medium
-gpt-5.3-codex:high
-gpt-5.3-codex:xhigh
-gpt-5.2:low
-gpt-5.2:medium
-gpt-5.2:high
-gpt-5.2:xhigh
-codex-auto-review:low
-codex-auto-review:medium
-codex-auto-review:high
-codex-auto-review:xhigh
-```
-
-也可以在 `config.json` 固定可选项：
-
-```json
-{
-  "codex": {
-    "modelOptions": [
-      {
-        "model": "gpt-5.5",
-        "reasoningEffort": "medium",
-        "label": "GPT-5.5 medium"
-      },
-      {
-        "model": "gpt-5.5",
-        "reasoningEffort": "high",
-        "label": "GPT-5.5 high"
-      }
-    ]
-  }
-}
-```
-
-Claude 的固定可选项配置在 `claude.modelOptions`：
-
-```json
-{
-  "claude": {
-    "modelOptions": [
-      {
-        "model": "sonnet",
-        "effort": "medium",
-        "label": "Claude Sonnet medium"
-      },
-      {
-        "model": "sonnet",
-        "effort": "high",
-        "label": "Claude Sonnet high"
-      }
-    ]
-  }
-}
-```
-
-## 媒体发送协议
-
-推荐使用项目内置 `send-media` skill/命令登记媒体文件。Agent 运行时会收到 `LOCAL_AGENT_MEDIA_OUTBOX` 环境变量，直接调用：
-
-```bash
-python3 -m local_agent_tools media-send /absolute/path/to/image.png
 python3 -m local_agent_tools media-send /absolute/path/to/report.pdf
-python3 -m local_agent_tools media-send /absolute/path/to/archive.zip
-python3 -m local_agent_tools media-send --kind video /absolute/path/to/video.mp4
+python3 -m local_agent_tools media-send --kind image /absolute/path/to/image.png
 ```
 
-`media-send` 会校验文件存在，并把图片、视频、文档、压缩包等本地文件登记到当前会话的媒体 outbox。当前 Agent 任务结束后，服务读取 outbox 并发送媒体。
+Agent 运行时会收到 `LOCAL_AGENT_MEDIA_OUTBOX`，因此通常不需要手动设置 outbox。旧版回复标记仍受支持：`[[send_image:/absolute/path]]`、`[[send_file:/absolute/path]]`、`[[send_video:/absolute/path]]`。Codex 原生图片生成事件也可自动转为微信图片。
 
-项目也提供了给 Agent 阅读的 skill 文档：
-
-```text
-skills/send-media/SKILL.md
-```
-
-兼容旧方式：CLI 最终回复里也可以包含这些标记，服务会发送对应本地文件，并从文本回复里移除标记：
-
-```text
-[[send_image:/absolute/path/to/image.png]]
-[[send_file:/absolute/path/to/report.pdf]]
-[[send_video:/absolute/path/to/video.mp4]]
-```
-
-也支持单独一行的裸标记和 `file://` 路径：
-
-```text
-send_image:/absolute/path/to/image.png
-file:///absolute/path/to/report.pdf
-```
-
-Codex CLI 返回 `image_generation_end` 事件时，服务会按当前 `CODEX_HOME/generated_images/<thread_id>/<call_id>.png` 自动生成图片发送标记。
-
-## 媒体生成器
-
-在 `config.json` 的 `media.generators` 里配置外部命令。命令从 stdin 接收 prompt，stdout 最后一行输出生成文件路径。
-
-示例：
+可在 `media.generators` 中配置自定义生成器。生成命令从 stdin 接收提示，并在 stdout 最后一行输出文件路径；Agent 调用 `python3 -m local_agent_tools media-generate <名称> <提示>`，再用 `media-send` 登记文件。配置示例：
 
 ```json
 {
@@ -715,246 +232,50 @@ Codex CLI 返回 `image_generation_end` 事件时，服务会按当前 `CODEX_HO
         "name": "image",
         "kind": "image",
         "command": "python3 /path/to/generate_image.py",
-        "description": "Receives prompt on stdin and prints an output file path."
+        "description": "本地图片生成器"
       }
     ]
   }
 }
 ```
 
-Codex 可以调用：
+## macOS 后台部署
 
-```bash
-python3 -m local_agent_tools media-generate image "生成一张产品海报"
-```
-
-然后用 `media-send` 登记生成的文件：
-
-```bash
-python3 -m local_agent_tools media-send /path/from/generator.png
-```
-
-这可以接入 OpenAI API、本地 Stable Diffusion、ComfyUI、Sora 或任意自定义服务。
-
-## macOS 后台运行
-
-推荐用 `launchd` 以当前用户身份运行。它可以在登录后自动启动，并在程序异常退出后自动拉起。
-
-### 一键部署
-
-在项目目录运行：
+项目提供 `./scripts/deploy_macos.sh`。它创建或复用虚拟环境、安装 Python 和 npm 依赖、创建缺失的配置、在没有微信账号时扫码添加账号，并写入、启动 launchd 服务：
 
 ```bash
 ./scripts/deploy_macos.sh
 ```
 
-脚本会自动完成：
-
-- 创建或复用项目内 `.venv`，隔离 Python 依赖。
-- 安装 `requirements.txt`。
-- 如果有 `npm`，执行 `npm install`。
-- 如果没有 `config.json`，从 `config.example.json` 创建。
-- 如果还没有微信 Bot 账号，进入交互式扫码添加账号流程。
-- 写入 `~/Library/LaunchAgents/com.wechat-codex-multi.plist`。
-- 加载并启动 launchd 服务，登录后自启动，异常退出自动拉起。
-
-常用选项：
-
-```bash
-./scripts/deploy_macos.sh --skip-account
-./scripts/deploy_macos.sh --no-start
-./scripts/deploy_macos.sh --config /path/to/config.json
-./scripts/deploy_macos.sh --venv /path/to/.venv
-```
-
-说明：
-
-- 脚本不会覆盖已有 `config.json`。
-- 脚本不会自动安装 Codex CLI 或 Claude Code CLI；如果 `codex login status` 失败，会提示先运行 `codex login`。需要 Claude 时请先确认 `claude auth status --text` 正常。
-- 运行时切换 `exec` / `app-server` 可用微信命令 `/runner`；重启后仍以 `config.json` 为准。
-
-查看服务：
+常用选项：`--skip-account`、`--skip-npm`、`--no-start`、`--config /path/to/config.json`、`--venv /path/to/.venv`。脚本不会安装 Codex 或 Claude CLI，也不会覆盖已有配置。默认 launchd label 是 `com.wechat-codex-multi`；如果机器上已经用其他 label 运行本项目，先确认旧服务，避免同时启动两个轮询进程。可以设置 `WECHAT_CODEX_MULTI_LABEL` 使用现有 label。
 
 ```bash
 launchctl print gui/$(id -u)/com.wechat-codex-multi
-tail -f ~/Library/Logs/wechat-codex-multi/stdout.log
 tail -f ~/Library/Logs/wechat-codex-multi/stderr.log
 ```
 
-### 手动部署
+微信管理员可用 `/restart` 重启由 launchd 监护的服务。前台 `start` 模式应在终端停止并重新运行。更新配置或代码后都需要重启进程。
 
-先确认项目路径、虚拟环境、配置文件和微信账号都已经准备好：
+## 排障
 
-```bash
-cd /path/to/project
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-npm install
-cp config.example.json config.json
-python3 -m wechat_codex_multi add-account
-mkdir -p "$HOME/Library/Logs/wechat-codex-multi"
-```
+| 现象 | 检查和处理 |
+| --- | --- |
+| `/codex-login` 提示无权限 | 用微信 `/status` 返回的 `conversation` 找到自己消息对应的 `userId`，写入 `adminUsers` 并重启 |
+| `/codex-login` 找不到账号 | 先把账号名和 `codexHome` 加入 `codex.accounts`，重启后再发送命令 |
+| 设备码过期或未收到 | 重新发送 `/codex-login <账号名> <邮箱>`；确认 CLI 在服务的 `PATH` 内，查看服务日志 |
+| `workspace routing discovery unauthorized (401)` | 用 `/account` 确认实际选中的账号，再查对应 `CODEX_HOME` 的 `codex login status`；必要时重新设备码登录 |
+| refresh token already used | 在发生错误的那台机器、对应 `CODEX_HOME` 重新登录；停止用其他机器或旧备份的 `auth.json` 覆盖它 |
+| `/login` 没有微信二维码 | 确认已安装 npm 依赖；可在本机终端执行 `python3 -m wechat_codex_multi add-account` |
+| `/models` 查询失败 | 检查所选 CLI 是否已安装、可执行，以及账号登录状态；也可在配置中设置固定 `modelOptions` |
+| 修改代码后命令仍旧 | 重启运行中的服务；launchd 模式可由管理员发送 `/restart` |
 
-创建 `~/Library/LaunchAgents/com.wechat-codex-multi.plist`：
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.wechat-codex-multi</string>
-
-  <key>ProgramArguments</key>
-  <array>
-    <string>/path/to/project/.venv/bin/python</string>
-    <string>-m</string>
-    <string>wechat_codex_multi</string>
-    <string>start</string>
-  </array>
-
-  <key>WorkingDirectory</key>
-  <string>/path/to/project</string>
-
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-    <key>WECHAT_CODEX_MULTI_CONFIG</key>
-    <string>/path/to/project/config.json</string>
-  </dict>
-
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-
-  <key>StandardOutPath</key>
-  <string>$HOME/Library/Logs/wechat-codex-multi/stdout.log</string>
-  <key>StandardErrorPath</key>
-  <string>$HOME/Library/Logs/wechat-codex-multi/stderr.log</string>
-</dict>
-</plist>
-```
-
-加载和启动：
-
-```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wechat-codex-multi.plist
-launchctl enable gui/$(id -u)/com.wechat-codex-multi
-launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
-```
-
-查看状态和日志：
-
-```bash
-launchctl print gui/$(id -u)/com.wechat-codex-multi
-tail -f ~/Library/Logs/wechat-codex-multi/stdout.log
-tail -f ~/Library/Logs/wechat-codex-multi/stderr.log
-```
-
-停止、卸载或重载：
-
-```bash
-launchctl bootout gui/$(id -u)/com.wechat-codex-multi
-
-# 修改 plist 后重载
-launchctl bootout gui/$(id -u)/com.wechat-codex-multi 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wechat-codex-multi.plist
-launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
-```
-
-注意：
-
-- `KeepAlive=true` 表示进程退出后会自动重启；临时停服务要先 `bootout`。
-- `PATH` 要包含 `codex` 和 `claude` 所在目录。Apple Silicon Homebrew 通常是 `/opt/homebrew/bin`，Intel Mac Homebrew 通常是 `/usr/local/bin`。
-- 如果 Codex 使用多个 `CODEX_HOME`，确保这些目录都已经单独 `codex login`。
-- 如果 Claude 使用多个 `CLAUDE_CONFIG_DIR`，确保这些目录都已经单独 `claude auth login`。
-- `/login [昵称]` 会把登录二维码发送给管理员微信，同时也会在运行服务的终端输出二维码作为兜底。昵称不传时自动生成 `用户1`、`用户2` 等；也可以用 `/user rename` 后续修改，用 `/user delete` 按昵称删除。
-
-## 开发和验证
-
-运行测试：
-
-```bash
-python3 -m unittest discover -s tests
-```
-
-查看当前 Git 状态：
-
-```bash
-git status --short
-```
-
-本地调试常用命令：
+## 本地 CLI 与开发
 
 ```bash
 python3 -m wechat_codex_multi status
-python3 -m wechat_codex_multi media-generate image "测试图片"
+python3 -m wechat_codex_multi --help
+python3 -m wechat_codex_multi claude-usage --days 7
+python3 -m unittest discover -s tests
 ```
 
-## 重要设计
-
-基础会话 key 是：
-
-```text
-accountId:userId
-```
-
-同一个微信用户在不同 Bot 账号里聊天，会进入不同工作区会话。
-
-项目工作区会把会话 key 扩展为：
-
-```text
-accountId:userId:workspaceName
-```
-
-`default` 工作区继续使用基础会话 key，兼容原有会话。`/ws run <名称> <任务>` 会直接使用指定工作区的 key，因此同一个微信用户可以同时让不同项目工作区并发执行。
-
-当同一个工作区有任务正在运行时，新的普通消息会立即作为补充引导处理。`/status`、`/active`、`/usage`、`/agents`、`/agent`、`/account`、`/codex-accounts`、`/codex`、`/claude-accounts`、`/claude`、`/model`、`/models`、`/sessions`、`/session`、`/accounts`、`/users`、`/user`、`/help`、`/cwd`、`/ws`、`/restart` 可在任务运行中直接响应；`/interrupt` 和 `/cancel` 可取消当前任务并保留会话，`/reset` 可取消当前工作区正在运行的任务并重置会话，`/ws reset <名称>` 可取消指定工作区。
-
-超时、服务停止或 `/reset` 取消时，服务会清理当前 CLI 进程组，避免残留进程继续占用会话。
-
-`codex exec` 和 Claude headless runner 每次任务都会启动一个子进程。任务完成、失败、超时或被取消后，服务会从运行表中移除该进程；正常完成的进程会自动释放，不需要手动清理。Codex `app-server` runner 会维护对应的后台 app-server 进程。
-
-## 常见问题
-
-### `/models` 显示哪些模型？
-
-当前 Agent 是 Codex 时，如果 `config.json` 没有配置 `codex.modelOptions`，服务会在每次执行 `/models` 或 `/model` 时调用 `codex debug models` 实时查询当前 Codex CLI 返回的模型和 reasoning levels。查询会使用默认 Codex 账号的 `CODEX_HOME`，超时时间由 `codex.modelDiscoveryTimeoutSeconds` 控制，默认 30 秒；如果查询超时，会回退到内置模型列表。
-
-当前 Agent 是 Claude 时，`/models` 优先使用 `claude.modelOptions`；为空时运行 `claude --output-format stream-json --input-format stream-json --verbose` 并发送 `control_request initialize`，读取 Claude Code 返回的 `models` 清单。这个清单和交互式 `/model` 选单同源，每个模型带自己的 `supportedEffortLevels`，所以 Sonnet 这类没有 `xhigh` 的模型不会显示 `xhigh` 或 `ultracode`。默认每次实时查询；查询失败或没有发现模型时会提示错误，不再退回过期硬编码模型。
-
-`ultracode` 在 Claude Code 中是 `xhigh + dynamic workflow orchestration` 的会话模式，不是独立模型；服务只会给支持 `xhigh` 的模型补这个选项。运行时会传 `--effort xhigh --settings {"ultracode":true}`，等效于交互界面里选择 ultracode。选择 `default` 时不传 `--model`，由 Claude Code 跟随官方默认模型。
-
-### `/model 1` 切换后为什么要重置会话？
-
-CLI 会话和模型、effort/reasoning、账号登录态有关。切换模型后会清空当前 Agent 的 `codexThreadId` 或 `claudeSessionId`，下一次请求会用新模型启动新会话，避免旧上下文混用。
-
-### `/login` 看不到二维码怎么办？
-
-如果微信里没有收到二维码图片，先确认已经运行 `npm install` 安装 Node 依赖；仍不可用时，可以在可见终端里执行：
-
-```bash
-python3 -m wechat_codex_multi add-account
-```
-
-### 修改代码后如何让后台服务生效？
-
-如果使用 `launchd` 且配置了 `KeepAlive=true`，管理员可以在微信里发送：
-
-```text
-/restart
-```
-
-服务会先回复确认消息，然后退出当前进程，由 `launchd` 自动拉起新版本。也可以在机器上执行：
-
-```bash
-launchctl kickstart -k gui/$(id -u)/com.wechat-codex-multi
-```
-
-### 为什么普通消息会提示“上一条消息还在处理中”？
-
-这是为了保护同一工作区的 CLI 会话不被并发写入。命令类消息走独立 worker，通常仍可立即响应。
+本地账号管理命令还有 `add-account [昵称]`、`rename-user <选择器> <新昵称>`、`delete-user <选择器>`，均以 `python3 -m wechat_codex_multi` 开头。`npm run setup`、`npm run start`、`npm run status` 分别用于初始化、启动和查看状态。主要实现位于 `wechat_codex_multi/`；媒体命令位于 `local_agent_tools/`，使用说明见 `skills/send-media/SKILL.md`。
