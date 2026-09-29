@@ -195,6 +195,22 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertIn("归档会话", self.command("/d-sessions archived"))
         self.assertIn("已恢复", self.command("/d-session unarchive 1"))
 
+    def test_desktop_pagination_and_number_shortcut(self):
+        threads = [dict(self.fake.thread, id=f"thread-{index:03d}", title=f"会话{index}",
+                        updatedAt=100 - index) for index in range(1, 46)]
+        self.fake.threads = lambda account, archived=False: [] if archived else [dict(item) for item in threads]
+        first_page = self.command("/d-sessions all")
+        self.assertIn("第 1/3 页", first_page)
+        self.assertIn("下一页：/d-sessions all 2", first_page)
+        self.assertNotIn("21. 会话21", first_page)
+        second_page = self.command("/d-sessions page 2")
+        self.assertIn("21. 会话21", second_page)
+        self.assertIn("上一页：/d-sessions all 1", second_page)
+        self.assertIn("下一页：/d-sessions all 3", second_page)
+        self.assertIn("最新结果", self.command("/d-session 21"))
+        self.assertEqual(self.service._get_session(self.key)["codexThreadId"], "thread-021")
+        self.assertIn("第 2/3 页", self.command("/d-sessions 1 2"))
+
     def test_new_project_creates_workspace_and_fresh_cli_session(self):
         target = Path(self.tmp.name) / "随行助手"
         result = self.command(f"/new-project {target}")

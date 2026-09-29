@@ -158,7 +158,9 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 | `/d-projects` | 列出当前 Codex 账号的桌面原生项目 |
 | `/d-project use <项目编号>` | 切换已有桌面项目，并准备新会话 |
 | `/d-sessions [all|项目编号] [页码]` | 列出全部项目或指定项目的 Codex 会话，20 条一页 |
+| `/d-sessions page <页码>` | 快速查看全部项目的指定页 |
 | `/d-sessions archived [all|项目编号] [页码]` | 列出桌面归档会话 |
+| `/d-session <会话编号>` | 按最近一次会话列表的编号快速切换并查看最新结果 |
 | `/d-session view|status|use <会话编号>` | 查看最新结果、状态或选中会话；选中后直接发送消息续聊 |
 | `/d-session new` | 在当前桌面项目准备一个全新的会话 |
 | `/d-session guide <会话编号> <内容>`、`/d-session interrupt <会话编号>` | 引导或打断本 Bot 发起的回合 |
@@ -176,6 +178,8 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 `/sessions` 读取本机 CLI 会话数据，不请求模型。列表中的编号只对当前工作区最近一次查询有效；列出归档会话后，编号用于 `/session unarchive` 或 `/session delete`。`/session use` 在当前任务运行时会拒绝切换。Codex CLI 与桌面 Codex 共用本地会话库，因此归档和删除 Codex CLI 会话也会影响桌面端。Claude Code 没有原生归档命令；`/session archive` 对 Claude 只在本 Bot 的列表中隐藏会话，`/session unarchive` 可恢复显示，本机 Claude CLI 仍可找到它。删除 Claude 会话会移除该账号 `projects` 中对应的会话 JSONL 和 `usage-data/session-meta` 元数据；这不代表清除 Claude Code 的所有缓存或其他副本。
 
 `/d-` 前缀表示桌面 Codex；旧版 `/desktop` 命令继续兼容。桌面命令通过同一 `CODEX_HOME` 的 Codex App Server 协议读写原生项目和会话。桌面应用与微信使用同一份本地项目、会话数据；桌面窗口可能需要刷新才能看到外部进程新建的项目或会话。`status` 显示最后保存的回合状态，只有本 Bot 发起的回合能显示实时运行状态并接受 `guide` 或 `interrupt`。普通 ChatGPT Chat/Work 对话不在此命令范围内。会话编号以最近一次 `/d-sessions` 列表为准；切换账号后需重新列出。归档和删除可能影响派生子会话；删除不可恢复。
+
+翻页示例：`/d-sessions all 2` 或 `/d-sessions page 2` 查看所有项目的第 2 页；`/d-sessions 3 2` 查看项目 3 的第 2 页。单独的 `/d-sessions 2` 表示“项目 2”，不是“第 2 页”。每页 20 条，第 2 页的编号从 21 开始；发送 `/d-session 21` 或 `/d-session use 21` 就能切到第 21 条。编号以最近一次列表为准，列表末尾会给出上一页和下一页命令。
 
 同一微信用户可以在桌面会话 A 执行期间用 `/d-session use` 切到 B，并向 B 发起另一个任务。各会话独立运行；后台会话完成时暂不主动发送结果。切回 A 时，若仍在运行则回复“正在执行中”，若已完成则发送 A 最新回合的完整最终回答。当前选中的会话完成时会直接回复微信；`/d-session view` 只读取指定会话的最新结果，不回放历史回合。
 

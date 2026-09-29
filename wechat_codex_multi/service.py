@@ -1224,9 +1224,10 @@ class MultiWechatCodexService:
             "/d-account [账号] 选择本地 Codex 账号",
             "/d-projects 列桌面原生项目并编号",
             "/d-project use <编号> 切换桌面项目并准备新会话",
-            "/d-sessions [all|项目编号] [页码] 列会话",
+            "/d-sessions all 2 或 /d-sessions page 2 查看全部会话第 2 页",
+            "/d-sessions <项目编号> [页码] 查看指定项目会话",
             "/d-sessions archived [all|项目编号] [页码] 列归档会话",
-            "/d-session view|status|use <编号> 查看结果、状态或选中续聊",
+            "/d-session <编号> 快速切换；view|status|use <编号> 查看结果、状态或选中续聊",
             "/d-session new 在当前桌面项目准备新会话",
             "/d-session guide <编号> <内容> 引导本 Bot 发起的运行",
             "/d-session interrupt <编号> 打断本 Bot 发起的运行",
@@ -1338,6 +1339,12 @@ class MultiWechatCodexService:
     def _handle_desktop_command(self, account, user_id, conversation_key, arg):
         parts = str(arg or "").strip().split()
         action = parts[0].lower() if parts else "help"
+        if len(parts) == 1 and action.isdigit():
+            parts = ["use", action]
+            action = "use"
+        elif action in {"switch", "select"}:
+            parts[0] = "use"
+            action = "use"
         codex_account = self._desktop_account(conversation_key)
         if action in {"help", "?"}:
             self._send_text(account, user_id, self._desktop_help_text())
@@ -1420,6 +1427,12 @@ class MultiWechatCodexService:
         if action in {"chats", "archived"}:
             selector = parts[1] if len(parts) > 1 else "all"
             page_text = parts[2] if len(parts) > 2 else "1"
+            if selector.lower() == "page":
+                if len(parts) != 3:
+                    raise ValueError("用法：/d-sessions page <页码>。")
+                selector = "all"
+            if len(parts) > 3:
+                raise ValueError("用法：/d-sessions [all|项目编号] [页码]，或 /d-sessions page <页码>。")
             if not page_text.isdigit() or int(page_text) < 1:
                 raise ValueError("页码必须是正整数。")
             page = int(page_text)
@@ -1436,10 +1449,11 @@ class MultiWechatCodexService:
                 return
             page_size = 20
             start = (page - 1) * page_size
+            total_pages = (len(threads) + page_size - 1) // page_size
             if start >= len(threads):
-                raise ValueError(f"页码超出范围；共 {(len(threads) + page_size - 1) // page_size} 页。")
+                raise ValueError(f"页码超出范围；共 {total_pages} 页。")
             label = "归档会话" if action == "archived" else "会话"
-            lines = [f"{project_name or '所有项目'}{label}（账号 {codex_account['name']}，共 {len(threads)} 条，第 {page} 页）："]
+            lines = [f"{project_name or '所有项目'}{label}（账号 {codex_account['name']}，共 {len(threads)} 条，第 {page}/{total_pages} 页）："]
             for index in range(start, min(start + page_size, len(threads))):
                 item = threads[index]
                 try:
@@ -1453,7 +1467,12 @@ class MultiWechatCodexService:
                     project_label = f" [{matching['name'] if matching else '未归类'}]"
                 lines.append(f"{index + 1}. {item['title']}{project_label} [{status}]")
                 lines.append(f"   {item['id'][:12]}  {format_session_time(item['updatedAt'])}")
-            lines.append("编号可用于 /d-session view、status、use、archive、delete。")
+            list_command = "/d-sessions archived" if action == "archived" else "/d-sessions"
+            if page > 1:
+                lines.append(f"上一页：{list_command} {selector} {page - 1}")
+            if page < total_pages:
+                lines.append(f"下一页：{list_command} {selector} {page + 1}")
+            lines.append("切换会话：/d-session <编号>；也可用 /d-session use <编号>。")
             self._send_text(account, user_id, "\n".join(lines))
             return
         if action == "off":
@@ -1466,8 +1485,7 @@ class MultiWechatCodexService:
             self._send_text(account, user_id, "已退出桌面 App Server 路由；当前 Codex 会话 ID 保留。")
             return
         if action not in {"view", "status", "use", "guide", "interrupt", "archive", "unarchive", "delete"}:
-            self._send_text(account, user_id, self._desktop_help_text())
-            return
+            raise ValueError(f"未知桌面会话操作：{action}。切换请用 /d-session <编号>；查看帮助发送 /d-session。")
         if len(parts) < 2:
             raise ValueError(f"用法：/d-session {action} <会话编号>。先发送 /d-sessions all。")
         item = self._desktop_thread_selector(conversation_key, parts[1])
@@ -2670,7 +2688,7 @@ class MultiWechatCodexService:
                 "常用命令：",
                 "/status 状态；/active 运行中的任务",
                 "/sessions [codex|claude|all] CLI 会话；/session 管理 CLI 会话",
-                "/d-projects 桌面项目；/d-sessions [all|项目编号] 桌面会话",
+                "/d-projects 桌面项目；/d-sessions all 2 查看会话第 2 页",
                 "/d-session 管理桌面会话；/d-account 选择桌面账号",
                 "/new-project <目录> 新建 CLI 工作区；/d-p-n <目录> 新建桌面原生项目",
                 "/ws 工作区；/agent 切换 Agent；/account 切换账号",
@@ -2694,6 +2712,7 @@ class MultiWechatCodexService:
                 "/sessions archived [codex|claude|all] 查看 CLI 归档会话",
                 "/session use|new|archive|unarchive|delete 管理 CLI 会话（/session 看用法）",
                 "/d-projects 查看桌面项目；/d-sessions [all|项目编号] [页码] 查看会话",
+                "/d-sessions page <页码> 查看全部项目指定页；/d-session <编号> 快速切换",
                 "/d-project use <编号> 切换已有桌面项目并准备新会话",
                 "/d-sessions archived [all|项目编号] [页码] 查看桌面归档会话",
                 "/d-session new 在当前桌面项目新建会话；/d-session 查看其他操作；/d-account [账号] 选择桌面账号",
