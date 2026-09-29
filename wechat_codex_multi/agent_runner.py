@@ -6,11 +6,12 @@ from .codex_cli import CodexCliRunner
 
 
 class AgentRunnerManager:
-    def __init__(self, config, state_store, codex_factory=None, claude_factory=None):
+    def __init__(self, config, state_store, codex_factory=None, claude_factory=None, desktop_factory=None):
         self.config = config
         self.state = state_store
         self.codex_factory = codex_factory or self._default_codex_factory
         self.claude_factory = claude_factory or self._default_claude_factory
+        self.desktop_factory = desktop_factory or self._default_desktop_factory
         self.runners = {}
 
     @staticmethod
@@ -24,6 +25,13 @@ class AgentRunnerManager:
     def _default_claude_factory(config, state_store):
         return ClaudeCliRunner(config, state_store)
 
+    @staticmethod
+    def _default_desktop_factory(config, state_store):
+        desktop_config = dict(config)
+        desktop_config["codex"] = dict(config["codex"])
+        desktop_config["codex"].update(bypassApprovalsAndSandbox=False, preserveExistingInstructions=True)
+        return CodexAppServerRunner(desktop_config, state_store)
+
     def _default_cwd(self):
         return self.config["codex"]["workingDirectory"]
 
@@ -34,17 +42,22 @@ class AgentRunnerManager:
             default_codex_account(self.config),
             self.config.get("defaultAgent") or "codex",
         )
-        return resolve_session_agent(self.config, session)
+        agent = resolve_session_agent(self.config, session)
+        if agent == "codex" and session.get("codexClient") == "desktop":
+            return "desktop"
+        return agent
 
     def runner_for(self, agent):
         name = str(agent or "codex").strip().lower()
-        if name not in {"codex", "claude"}:
+        if name not in {"codex", "claude", "desktop"}:
             name = "codex"
         runner = self.runners.get(name)
         if runner:
             return runner
         if name == "claude":
             runner = self.claude_factory(self.config, self.state)
+        elif name == "desktop":
+            runner = self.desktop_factory(self.config, self.state)
         else:
             runner = self.codex_factory(self.config, self.state)
         self.runners[name] = runner

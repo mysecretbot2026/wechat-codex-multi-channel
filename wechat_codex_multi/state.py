@@ -22,6 +22,7 @@ class StateStore:
             "sessions": {},
             "contextTokens": {},
             "workspaces": {},
+            "archivedClaudeSessions": {},
         }
         self.load()
 
@@ -37,6 +38,7 @@ class StateStore:
             self.state["sessions"] = dict(loaded.get("sessions") or {})
             self.state["contextTokens"] = dict(loaded.get("contextTokens") or {})
             self.state["workspaces"] = dict(loaded.get("workspaces") or {})
+            self.state["archivedClaudeSessions"] = dict(loaded.get("archivedClaudeSessions") or {})
             if self._ensure_account_nicknames_locked():
                 self._write_locked()
             return self.state
@@ -253,7 +255,7 @@ class StateStore:
             self.save(debounce=True)
             return True
 
-    def upsert_workspace(self, base_conversation_key, workspace_name, cwd):
+    def upsert_workspace(self, base_conversation_key, workspace_name, cwd, project_client=None, project_account=""):
         name = str(workspace_name or "").strip()
         if not name or name == self.DEFAULT_WORKSPACE:
             return None
@@ -270,6 +272,10 @@ class StateStore:
                 "cwd": cwd,
                 "createdAt": existing.get("createdAt") or now,
                 "lastActive": now,
+                "projectClient": (project_client if project_client is not None
+                                  else existing.get("projectClient") if existing.get("cwd") == cwd else ""),
+                "projectAccount": (project_account if project_client is not None
+                                   else existing.get("projectAccount") if existing.get("cwd") == cwd else ""),
             }
             items[name] = item
             self.save(debounce=True)
@@ -371,6 +377,55 @@ class StateStore:
             session["lastActive"] = int(time.time() * 1000)
             self.save()
             return True
+
+    def clear_codex_thread(self, thread_id, account_name=""):
+        """Drop references to a thread removed from the shared Codex store."""
+        cleared = 0
+        with self.lock:
+            for session in self.state["sessions"].values():
+                if session.get("codexThreadId") != thread_id:
+                    continue
+                if account_name and session.get("codexAccount") not in {None, "", account_name}:
+                    continue
+                session["codexThreadId"] = ""
+                session["codexClient"] = ""
+                session["lastActive"] = int(time.time() * 1000)
+                cleared += 1
+            if cleared:
+                self.save()
+        return cleared
+
+    def archived_claude_ids(self, account_name):
+        with self.lock:
+            return set(self.state["archivedClaudeSessions"].get(account_name) or [])
+
+    def set_claude_archived(self, account_name, session_id, archived):
+        with self.lock:
+            ids = set(self.state["archivedClaudeSessions"].get(account_name) or [])
+            if archived:
+                ids.add(session_id)
+            else:
+                ids.discard(session_id)
+            if ids:
+                self.state["archivedClaudeSessions"][account_name] = sorted(ids)
+            else:
+                self.state["archivedClaudeSessions"].pop(account_name, None)
+            self.save()
+
+    def clear_claude_session(self, session_id, account_name=""):
+        cleared = 0
+        with self.lock:
+            for session in self.state["sessions"].values():
+                if session.get("claudeSessionId") != session_id:
+                    continue
+                if account_name and session.get("claudeAccount") not in {None, "", account_name}:
+                    continue
+                session["claudeSessionId"] = ""
+                session["lastActive"] = int(time.time() * 1000)
+                cleared += 1
+            if cleared:
+                self.save()
+        return cleared
 
     def set_context_token(self, account_id, user_id, context_token):
         with self.lock:

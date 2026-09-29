@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
     },
     "codex": {
         "bin": "codex",
+        "desktopBin": "",
         "workingDirectory": ".",
         "model": "",
         "reasoningEffort": "",

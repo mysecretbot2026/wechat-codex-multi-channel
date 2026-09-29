@@ -94,6 +94,7 @@ class AppServerProcess:
         self.next_id = 1
         self.pending = {}
         self.pending_lock = threading.Lock()
+        self.write_lock = threading.Lock()
         self.contexts_by_thread = {}
         self.contexts_lock = threading.RLock()
         self.closed = False
@@ -131,6 +132,14 @@ class AppServerProcess:
             },
             timeout_s=15,
         )
+        self.notify("initialized")
+
+    def notify(self, method, params=None):
+        payload = {"method": method, "params": params or {}}
+        assert self.process is not None and self.process.stdin is not None
+        with self.write_lock:
+            self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self.process.stdin.flush()
 
     def close(self):
         self.closed = True
@@ -142,6 +151,13 @@ class AppServerProcess:
             except Exception:
                 try:
                     process.kill()
+                except Exception:
+                    pass
+        if process:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                try:
+                    if stream:
+                        stream.close()
                 except Exception:
                     pass
 
@@ -161,8 +177,9 @@ class AppServerProcess:
         payload = {"id": request_id, "method": method, "params": params or {}}
         try:
             assert self.process is not None and self.process.stdin is not None
-            self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            self.process.stdin.flush()
+            with self.write_lock:
+                self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                self.process.stdin.flush()
         except Exception as err:
             with self.pending_lock:
                 self.pending.pop(request_id, None)
@@ -202,6 +219,20 @@ class AppServerProcess:
                 try:
                     message = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if "id" in message and "method" in message:
+                    # Approval and elicitation requests need an interactive client.
+                    # Fail promptly instead of leaving a WeChat turn waiting forever.
+                    try:
+                        assert self.process.stdin is not None
+                        with self.write_lock:
+                            self.process.stdin.write(json.dumps({
+                                "id": message["id"],
+                                "error": {"code": -32000, "message": "微信通道暂不支持交互式审批"},
+                            }, ensure_ascii=False) + "\n")
+                            self.process.stdin.flush()
+                    except Exception:
+                        pass
                     continue
                 if "id" in message:
                     with self.pending_lock:
@@ -269,6 +300,7 @@ class CodexAppServerRunner:
         self.reasoning_effort = str(config["codex"].get("reasoningEffort") or "").strip()
         self.bin = str(config["codex"].get("bin") or "codex")
         self.bypass = bool(config["codex"].get("bypassApprovalsAndSandbox", True))
+        self.preserve_existing_instructions = bool(config["codex"].get("preserveExistingInstructions", False))
         self.servers = {}
         self.contexts = {}
         self.lock = threading.RLock()
@@ -288,6 +320,9 @@ class CodexAppServerRunner:
                 self.servers[key] = server
             server.start()
             return server
+
+    def request_for_account(self, codex_account, method, params=None, timeout_s=30):
+        return self._server_for_account(codex_account).request(method, params, timeout_s=timeout_s)
 
     def _context(self, conversation_key, thread_id=""):
         with self.lock:
@@ -332,7 +367,8 @@ class CodexAppServerRunner:
     def _prompt_version(self, instructions=None):
         return prompt_version(instructions if instructions is not None else self._instructions())
 
-    def _thread_params(self, cwd, model="", reasoning_effort="", include_instructions=True, instructions=None):
+    def _thread_params(self, cwd, model="", reasoning_effort="", include_instructions=True, instructions=None,
+                       project_id=""):
         params = {
             "cwd": str(cwd),
         }
@@ -343,6 +379,8 @@ class CodexAppServerRunner:
             params["model"] = model
         if reasoning_effort:
             params["effort"] = reasoning_effort
+        if project_id:
+            params["projectId"] = project_id
         if self.bypass:
             params["approvalPolicy"] = "never"
             params["sandbox"] = "danger-full-access"
@@ -377,7 +415,10 @@ class CodexAppServerRunner:
         instructions,
     ):
         thread_id = session.get("codexThreadId") or ""
-        inject_prompt = (not thread_id) or session.get("codexAppServerPromptVersion") != current_prompt_version
+        inject_prompt = (not thread_id) or (
+            not self.preserve_existing_instructions
+            and session.get("codexAppServerPromptVersion") != current_prompt_version
+        )
         if not thread_id:
             context.thread_id = ""
             server.unregister_context(context)
@@ -403,12 +444,20 @@ class CodexAppServerRunner:
                 return thread_id
             except Exception as err:
                 log.warn(f"[app-server] resume failed conversation={conversation_key}: {err}")
+                missing_pending_thread = (
+                    session.get("desktopPendingThread")
+                    and ("no rollout found" in str(err).lower() or "not materialized yet" in str(err).lower())
+                )
+                if self.preserve_existing_instructions and not missing_pending_thread:
+                    server.unregister_context(context)
+                    raise RuntimeError(f"无法续聊所选桌面会话 {thread_id}: {err}") from err
                 self.state.reset_session(conversation_key)
                 context.thread_id = ""
                 server.unregister_context(context)
         result = server.request(
             "thread/start",
-            self._thread_params(cwd, model, reasoning_effort, include_instructions=True, instructions=instructions),
+            self._thread_params(cwd, model, reasoning_effort, include_instructions=True, instructions=instructions,
+                                project_id=session.get("desktopProjectId") or ""),
             timeout_s=30,
         )
         thread = (result or {}).get("thread") or {}
@@ -488,16 +537,23 @@ class CodexAppServerRunner:
             f"[app-server] start turn conversation={conversation_key} account={codex_account_name} "
             f"model={selected_model or 'default'} reasoning={selected_reasoning or 'default'} cwd={cwd}"
         )
-        result = server.request(
-            "turn/start",
-            self._turn_params(thread_id, cwd, user_message, selected_model, selected_reasoning),
-            timeout_s=30,
-        )
+        context.start_turn("")
+        try:
+            result = server.request(
+                "turn/start",
+                self._turn_params(thread_id, cwd, user_message, selected_model, selected_reasoning),
+                timeout_s=30,
+            )
+        except Exception:
+            context.finish("failed")
+            raise
         turn = (result or {}).get("turn") or {}
         turn_id = turn.get("id")
         if not turn_id:
             raise RuntimeError("app-server did not return turn id")
-        context.start_turn(turn_id)
+        with context.lock:
+            if context.running and not context.active_turn_id:
+                context.active_turn_id = turn_id
         if not context.completed.wait(self.timeout_ms / 1000):
             self.cancel(conversation_key)
             raise RuntimeError(f"Codex 在 {self.timeout_ms // 1000} 秒内没有返回结果")

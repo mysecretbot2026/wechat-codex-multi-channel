@@ -3,6 +3,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from . import logging as log
@@ -14,6 +15,7 @@ from .claude_accounts import (
     claude_account_names,
     default_claude_account,
     find_claude_account,
+    get_claude_account,
     list_claude_accounts,
     resolve_session_claude_account,
 )
@@ -38,11 +40,13 @@ from .codex_accounts import (
     codex_account_names,
     default_codex_account,
     find_codex_account,
+    get_codex_account,
     list_codex_accounts,
     resolve_session_codex_account,
 )
 from .codex_cli import CodexCancelled, CodexCliRunner
 from .codex_device_login import CodexDeviceLoginManager, cached_email, login_status
+from .desktop_codex import DesktopCodexCatalog, project_for_thread
 from .codex_models import find_model_option, format_model_option, model_options, resolve_session_model
 from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
 from .config import PROJECT_DIR
@@ -62,7 +66,8 @@ from .wechat import MESSAGE_TYPE_USER, TYPING_STATUS_CANCEL, TYPING_STATUS_TYPIN
 
 
 class MultiWechatCodexService:
-    WORKSPACE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+    WORKSPACE_NAME_RE = re.compile(r"^[^\W_][\w.-]{0,63}$")
+    DESKTOP_RUN_MARKER = ":desktop-thread:"
 
     def __init__(self, config):
         self.config = config
@@ -75,7 +80,9 @@ class MultiWechatCodexService:
             self.state,
             codex_factory=lambda cfg, state: self._create_codex_runner(cfg),
             claude_factory=lambda cfg, state: self._create_claude_runner(cfg),
+            desktop_factory=lambda cfg, state: self._create_desktop_runner(cfg),
         )
+        self.desktop = DesktopCodexCatalog(self.codex.runner_for("desktop"))
         self.codex_device_login = CodexDeviceLoginManager(config["codex"].get("bin") or "codex")
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(config.get("concurrency", {}).get("maxWorkers") or 4)
@@ -92,6 +99,11 @@ class MultiWechatCodexService:
         self.pending_guidance = {}
         self.pending_guidance_guard = threading.Lock()
         self.session_selection_cache = {}
+        self.desktop_project_cache = {}
+        self.desktop_thread_cache = {}
+        self.desktop_account_selection = {}
+        self.desktop_delete_pending = {}
+        self.session_delete_pending = {}
         self.monitor_accounts = set()
         self.monitor_disabled_accounts = set()
         self._model_options = None
@@ -105,6 +117,24 @@ class MultiWechatCodexService:
 
     def _create_claude_runner(self, config):
         return ClaudeCliRunner(config, self.state)
+
+    def _create_desktop_runner(self, config):
+        desktop_config = dict(config)
+        desktop_config["codex"] = dict(config["codex"])
+        bundled_bin = Path(
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/"
+            "CodexCLI.app/Contents/MacOS/codex"
+        )
+        desktop_config["codex"].update(
+            bin=config["codex"].get("desktopBin") or (
+                str(bundled_bin) if bundled_bin.is_file() else config["codex"].get("bin") or "codex"
+            ),
+            bypassApprovalsAndSandbox=False,
+            preserveExistingInstructions=True,
+            model="",
+            reasoningEffort="",
+        )
+        return CodexAppServerRunner(desktop_config, self.state)
 
     def _api_for_account(self, account):
         return WechatClient(
@@ -202,6 +232,7 @@ class MultiWechatCodexService:
             return self.conversation_locks[key]
 
     def _handle_message_safe(self, account, user_id, base_conversation_key, text, msg=None):
+        conversation_key = base_conversation_key
         try:
             conversation_key = self._conversation_key_for_text(base_conversation_key, text)
             if self._can_run_without_conversation_lock(text):
@@ -215,6 +246,9 @@ class MultiWechatCodexService:
                     agent_label = self._agent_label(agent)
                     if text.strip() == "/reset":
                         killed = self._cancel_runner(conversation_key, reset_session=True)
+                        if self.DESKTOP_RUN_MARKER in conversation_key:
+                            self.state.reset_session(self._desktop_parent_key(conversation_key), agent="codex")
+                            self.state.update_session(self._desktop_parent_key(conversation_key), desktopPendingId="")
                         self._clear_pending_guidance(conversation_key)
                         message = f"已取消正在运行的 {agent_label} 并重置当前工作区。" if killed else "已重置当前工作区。"
                         self._send_text(account, user_id, message)
@@ -270,6 +304,21 @@ class MultiWechatCodexService:
             log.info(f"handler cancelled conversation={base_conversation_key}")
         except Exception as err:
             log.error(f"handler error conversation={base_conversation_key}: {err}")
+            if self.DESKTOP_RUN_MARKER in conversation_key:
+                run_session = self._get_session(conversation_key)
+                turn_id = ""
+                try:
+                    codex_account = resolve_session_codex_account(self.config, run_session)
+                    turn_id = self.desktop.latest_result(codex_account, run_session.get("codexThreadId") or "")["turnId"]
+                except Exception:
+                    pass
+                self.state.update_session(
+                    conversation_key, desktopLastError=str(err), desktopLastErrorTurnId=turn_id,
+                )
+                with self._desktop_selection_lock(conversation_key):
+                    if self._desktop_is_selected(conversation_key):
+                        self._send_text(account, user_id, f"执行失败：{err}")
+                return
             self._send_text(account, user_id, f"执行失败：{err}")
 
     def _extract_message_text(self, account, user_id, msg):
@@ -296,9 +345,74 @@ class MultiWechatCodexService:
     def _conversation_key_for_text(self, base_conversation_key, text):
         parts = self._workspace_run_parts(text)
         if len(parts) >= 3:
-            return self.state.workspace_conversation_key(base_conversation_key, parts[2])
+            workspace_key = self.state.workspace_conversation_key(base_conversation_key, parts[2])
+            return self._desktop_execution_key(workspace_key)
         active = self.state.get_active_workspace(base_conversation_key)
-        return self.state.workspace_conversation_key(base_conversation_key, active)
+        workspace_key = self.state.workspace_conversation_key(base_conversation_key, active)
+        first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+        if not first.startswith("/") or first in {"/status", "/guide", "/interrupt", "/cancel", "/reset"}:
+            return self._desktop_execution_key(workspace_key)
+        return workspace_key
+
+    @classmethod
+    def _desktop_parent_key(cls, conversation_key):
+        return conversation_key.split(cls.DESKTOP_RUN_MARKER, 1)[0]
+
+    def _desktop_selection_lock(self, conversation_key):
+        parent = self._desktop_parent_key(conversation_key)
+        base_key = ":".join(parent.split(":", 2)[:2])
+        return self._conversation_lock(f"{base_key}:desktop-selection")
+
+    def _desktop_is_selected(self, run_key):
+        parent = self._desktop_parent_key(run_key)
+        run_session = self._get_session(run_key)
+        selected = self._get_session(parent)
+        if (selected.get("codexClient") != "desktop"
+                or selected.get("codexThreadId") != run_session.get("codexThreadId")
+                or selected.get("codexAccount") != run_session.get("codexAccount")):
+            return False
+        parts = parent.split(":", 2)
+        if len(parts) < 2:
+            return True
+        base_key = ":".join(parts[:2])
+        active = self.state.get_active_workspace(base_key)
+        return self.state.workspace_conversation_key(base_key, active) == parent
+
+    def _desktop_execution_key(self, workspace_key):
+        session = self._get_session(workspace_key)
+        thread_id = session.get("codexThreadId") or ""
+        if session.get("codexClient") != "desktop":
+            return workspace_key
+        account_name = session.get("codexAccount") or default_codex_account(self.config)
+        if thread_id:
+            run_key = f"{workspace_key}{self.DESKTOP_RUN_MARKER}{account_name}:{thread_id}"
+        else:
+            pending_id = session.get("desktopPendingId") or uuid.uuid4().hex
+            if not session.get("desktopPendingId"):
+                self.state.update_session(workspace_key, desktopPendingId=pending_id)
+            run_key = f"{workspace_key}{self.DESKTOP_RUN_MARKER}{account_name}:pending-{pending_id}"
+            thread_id = self._get_session(run_key).get("codexThreadId") or ""
+        self.state.update_session(
+            run_key, agent="codex", codexClient="desktop", codexThreadId=thread_id,
+            codexAccount=account_name, cwd=session.get("cwd") or self.config["codex"]["workingDirectory"],
+            desktopProjectId=session.get("desktopProjectId") or "",
+            codexModel="", codexReasoningEffort="",
+            desktopPendingThread=bool(session.get("desktopPendingId")),
+        )
+        return run_key
+
+    def _promote_pending_desktop_thread(self, run_key):
+        if ":pending-" not in run_key:
+            return
+        parent = self._desktop_parent_key(run_key)
+        selected = self._get_session(parent)
+        pending_id = selected.get("desktopPendingId") or ""
+        run_session = self._get_session(run_key)
+        if (pending_id and run_key.endswith(f":pending-{pending_id}")
+                and selected.get("codexClient") == "desktop"
+                and not selected.get("codexThreadId")
+                and run_session.get("codexThreadId")):
+            self.state.update_session(parent, codexThreadId=run_session["codexThreadId"], desktopPendingId="")
 
     @staticmethod
     def _can_run_without_conversation_lock(text):
@@ -327,6 +441,17 @@ class MultiWechatCodexService:
             "/models",
             "/sessions",
             "/session",
+            "/desktop",
+            "/d-projects",
+            "/d-sessions",
+            "/d-session",
+            "/d-account",
+            "/new-project",
+            "/n-p",
+            "/d-new-project",
+            "/d-n-p",
+            "/d-p-n",
+            "/d-project",
             "/cwd",
             "/runner",
             "/restart",
@@ -487,8 +612,8 @@ class MultiWechatCodexService:
     def _handle_message(self, account, user_id, base_conversation_key, text, conversation_key=None):
         conversation_key = conversation_key or base_conversation_key
         command = text.strip()
-        if command == "/help":
-            self._send_text(account, user_id, self._help_text(account["accountId"]))
+        if command == "/help" or command == "/help all":
+            self._send_text(account, user_id, self._help_text(account["accountId"], full=command.endswith(" all")))
             return
         if command == "/codex-login" or command.startswith("/codex-login "):
             self._handle_codex_login(account, user_id, conversation_key, command)
@@ -559,7 +684,7 @@ class MultiWechatCodexService:
                     [
                         f"codexAccount: {codex_account.get('name')}",
                         f"codexHome: {codex_account.get('codexHome')}",
-                        f"codexRunner: {self.config.get('codex', {}).get('runner') or 'exec'}",
+                        f"codexRunner: {'desktop-app-server' if session.get('codexClient') == 'desktop' else self.config.get('codex', {}).get('runner') or 'exec'}",
                         f"codexModel: {model_selection.get('model') or 'default'}",
                         f"reasoning: {model_selection.get('reasoningEffort') or 'default'}",
                         f"codexThreadId: {(session.get('codexThreadId') or '')[:12]}",
@@ -576,6 +701,36 @@ class MultiWechatCodexService:
             return
         if command == "/sessions" or command.startswith("/sessions "):
             self._handle_sessions_command(account, user_id, conversation_key, command[len("/sessions"):].strip())
+            return
+        for prefix in ("/new-project", "/n-p", "/d-new-project", "/d-n-p", "/d-p-n"):
+            if command == prefix or command.startswith(prefix + " "):
+                self._handle_new_project_command(
+                    account, user_id, base_conversation_key, conversation_key,
+                    command[len(prefix):].strip(), desktop=prefix.startswith("/d-"),
+                )
+                return
+        if command == "/d-projects":
+            self._handle_desktop_command(account, user_id, conversation_key, "projects")
+            return
+        if command == "/d-project" or command.startswith("/d-project "):
+            self._handle_desktop_command(account, user_id, conversation_key,
+                                         "project " + command[len("/d-project"):].strip())
+            return
+        if command == "/d-sessions" or command.startswith("/d-sessions "):
+            arg = command[len("/d-sessions"):].strip()
+            parts = arg.split(maxsplit=1)
+            action = "archived" if parts and parts[0].lower() == "archived" else "chats"
+            remainder = parts[1] if action == "archived" and len(parts) > 1 else ("" if action == "archived" else arg)
+            self._handle_desktop_command(account, user_id, conversation_key, f"{action} {remainder}".strip())
+            return
+        if command == "/d-session" or command.startswith("/d-session "):
+            self._handle_desktop_command(account, user_id, conversation_key, command[len("/d-session"):].strip())
+            return
+        if command == "/d-account" or command.startswith("/d-account "):
+            self._handle_desktop_command(account, user_id, conversation_key, "account " + command[len("/d-account"):].strip())
+            return
+        if command == "/desktop" or command.startswith("/desktop "):
+            self._handle_desktop_command(account, user_id, conversation_key, command[len("/desktop"):].strip())
             return
         if command == "/session" or command.startswith("/session "):
             self._handle_session_command(account, user_id, conversation_key, command[len("/session"):].strip())
@@ -715,6 +870,10 @@ class MultiWechatCodexService:
             self._clear_pending_guidance(conversation_key)
             agent = resolve_session_agent(self.config, self._get_session(conversation_key))
             self.state.reset_session(conversation_key, agent=agent)
+            self.state.update_session(conversation_key, desktopPendingId="")
+            if self.DESKTOP_RUN_MARKER in conversation_key:
+                self.state.reset_session(self._desktop_parent_key(conversation_key), agent="codex")
+                self.state.update_session(self._desktop_parent_key(conversation_key), desktopPendingId="")
             self._send_text(account, user_id, f"已重置当前工作区 {self._agent_label(agent)} 会话。")
             return
         if command.startswith("/cwd"):
@@ -730,7 +889,15 @@ class MultiWechatCodexService:
                 workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
                 if workspace_name != self.state.DEFAULT_WORKSPACE:
                     self.state.upsert_workspace(base_conversation_key, workspace_name, cwd)
-                self.state.update_session(conversation_key, cwd=cwd, codexThreadId="", claudeSessionId="")
+                updates = {"cwd": cwd, "codexThreadId": "", "claudeSessionId": "", "desktopPendingId": ""}
+                if session.get("codexClient") == "desktop":
+                    codex_account = resolve_session_codex_account(self.config, session)
+                    project_id = project_for_thread({"cwd": cwd}, self.desktop.projects(codex_account))
+                    updates["desktopProjectId"] = "" if project_id == "_ungrouped" else project_id
+                    updates["desktopPendingId"] = uuid.uuid4().hex
+                else:
+                    updates["desktopProjectId"] = ""
+                self.state.update_session(conversation_key, **updates)
                 self._send_text(account, user_id, f"已切换 CWD: {cwd}\n已重置当前工作区 Codex thread 和 Claude session。")
             return
 
@@ -740,13 +907,51 @@ class MultiWechatCodexService:
         self._run_pending_guidance(account, user_id, conversation_key)
 
     def _run_codex_and_reply(self, account, user_id, conversation_key, text):
+        if self.DESKTOP_RUN_MARKER in conversation_key:
+            thread_id = self._get_session(conversation_key).get("codexThreadId") or ""
+            running = self._desktop_running_context(thread_id) if thread_id else None
+            if running and running.conversation_key != conversation_key:
+                raise ValueError("该桌面会话已有运行中任务，请等待完成后再发新任务。")
+            if thread_id and not running:
+                run_session = self._get_session(conversation_key)
+                codex_account = resolve_session_codex_account(self.config, run_session)
+                if self.desktop.last_turn_status(codex_account, thread_id) == "inProgress":
+                    raise ValueError("该桌面会话正在执行中，请等待完成后再发新任务。")
+            self.state.update_session(conversation_key, desktopLastError="", desktopLastErrorTurnId="")
         stop_typing = self._start_typing_loop(account, user_id)
         try:
             result = self.codex.run(conversation_key, text)
         finally:
             stop_typing()
+        turn_id = ""
+        if self.DESKTOP_RUN_MARKER in conversation_key:
+            with self._desktop_selection_lock(conversation_key):
+                self._promote_pending_desktop_thread(conversation_key)
+                if not self._desktop_is_selected(conversation_key):
+                    return
+                run_session = self._get_session(conversation_key)
+                try:
+                    codex_account = resolve_session_codex_account(self.config, run_session)
+                    latest = self.desktop.latest_result(codex_account, run_session["codexThreadId"])
+                    if latest["status"] == "completed" and latest["text"]:
+                        result = latest["text"]
+                        turn_id = latest["turnId"]
+                except Exception as err:
+                    log.warn(f"desktop latest result unavailable conversation={conversation_key}: {err}")
+                if turn_id and self._get_session(conversation_key).get("desktopDeliveredTurnId") == turn_id:
+                    return
+                self._deliver_agent_output(account, user_id, conversation_key, result, turn_id=turn_id)
+            return
+        self._deliver_agent_output(account, user_id, conversation_key, result)
+
+    def _deliver_agent_output(self, account, user_id, conversation_key, result, turn_id=""):
         cleaned, actions = extract_actions(result)
-        actions.extend(read_and_clear_media_outbox(media_outbox_path(self.state.state_dir, conversation_key)))
+        session = self._get_session(conversation_key)
+        already_delivered = bool(turn_id and session.get("desktopDeliveredTurnId") == turn_id)
+        if already_delivered:
+            actions = []
+        else:
+            actions.extend(read_and_clear_media_outbox(media_outbox_path(self.state.state_dir, conversation_key)))
         cleaned = markdown_to_plain_text(cleaned)
         if cleaned:
             self._send_text(account, user_id, cleaned)
@@ -764,6 +969,8 @@ class MultiWechatCodexService:
                 transfer_semaphore=self.media_semaphore,
             )
             log.info(f"sent media conversation={conversation_key} count={len(sent)}")
+        if turn_id and not already_delivered:
+            self.state.update_session(conversation_key, desktopDeliveredTurnId=turn_id)
 
     def _cancel_runner(self, conversation_key, reset_session=True):
         try:
@@ -771,7 +978,7 @@ class MultiWechatCodexService:
         except TypeError:
             return self.codex.cancel(conversation_key)
 
-    def _discover_sessions(self, conversation_key, scope="", limit=20):
+    def _discover_sessions(self, conversation_key, scope="", limit=20, archived=False):
         current = self._get_session(conversation_key)
         current_agent = resolve_session_agent(self.config, current)
         value = str(scope or "").strip().lower()
@@ -787,22 +994,30 @@ class MultiWechatCodexService:
         sessions = []
         if "codex" in agents:
             codex_account = resolve_session_codex_account(self.config, current)
-            sessions.extend(list_codex_sessions(codex_account, limit=limit))
+            sessions.extend(list_codex_sessions(codex_account, limit=limit, archived_only=archived))
         if "claude" in agents:
             claude_account = resolve_session_claude_account(self.config, current)
-            sessions.extend(list_claude_sessions(claude_account, limit=limit))
+            sessions.extend(list_claude_sessions(
+                claude_account, limit=limit,
+                archived_ids=self.state.archived_claude_ids(claude_account["name"]),
+                archived_only=archived,
+            ))
         return sort_sessions(sessions)[:limit], ""
 
     def _handle_sessions_command(self, account, user_id, conversation_key, scope):
-        sessions, error = self._discover_sessions(conversation_key, scope, limit=20)
+        parts = str(scope or "").split()
+        archived = "archived" in [part.lower() for part in parts]
+        scope = " ".join(part for part in parts if part.lower() != "archived")
+        sessions, error = self._discover_sessions(conversation_key, scope, limit=20, archived=archived)
         if error:
             self._send_text(account, user_id, error)
             return
         self.session_selection_cache[conversation_key] = sessions
         if not sessions:
-            self._send_text(account, user_id, "没有找到可恢复的 session。")
+            self._send_text(account, user_id, "没有找到归档会话。" if archived else "没有找到可恢复的 session。")
             return
-        lines = ["可恢复 sessions（发送 /session use 编号 切换）："]
+        lines = ["归档 sessions（发送 /session unarchive 编号 恢复）：" if archived
+                 else "可恢复 sessions（发送 /session use 编号 切换）："]
         for index, item in enumerate(sessions, 1):
             lines.append(
                 f"{index}. {item['agent']}:{item.get('account') or '-'} {short_session_id(item.get('sessionId'))}"
@@ -821,6 +1036,9 @@ class MultiWechatCodexService:
                 "/sessions [codex|claude|all] 查看可恢复 sessions",
                 "/session use <编号|sessionId前缀> 切换当前工作区到指定 session",
                 "/session new [codex|claude] 新建当前工作区会话",
+                "/sessions archived [codex|claude|all] 查看归档会话",
+                "/session archive|unarchive <编号> 归档或恢复（管理员）",
+                "/session delete <编号> 预览删除，再加 confirm 确认（管理员）",
             ]
         )
 
@@ -869,7 +1087,10 @@ class MultiWechatCodexService:
             if error:
                 self._send_text(account, user_id, error)
                 return
-            updates = {"agent": item["agent"]}
+            if item.get("archived"):
+                self._send_text(account, user_id, "该会话已归档，请先 /session unarchive。")
+                return
+            updates = {"agent": item["agent"], "codexClient": "", "desktopPendingId": ""}
             if item.get("cwd"):
                 updates["cwd"] = item["cwd"]
             if item["agent"] == "claude":
@@ -894,11 +1115,454 @@ class MultiWechatCodexService:
                 self._send_text(account, user_id, "未知 Agent。可用：codex、claude")
                 return
             self.state.reset_session(conversation_key, agent=target)
-            self.state.update_session(conversation_key, agent=target)
+            self.state.update_session(conversation_key, agent=target, codexClient="", desktopPendingId="")
             self.session_selection_cache.pop(conversation_key, None)
             self._send_text(account, user_id, f"已新建当前工作区 {self._agent_label(target)} 会话。")
             return
+        if action in {"archive", "unarchive", "delete"}:
+            self._manage_cli_session(account, user_id, conversation_key, action, rest)
+            return
         self._send_text(account, user_id, self._session_help_text())
+
+    @staticmethod
+    def _delete_claude_session_files(claude_account, session_id):
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id or ""):
+            raise ValueError("无效的 Claude 会话 ID。")
+        base = Path(claude_account.get("claudeConfigDir") or "~/.claude").expanduser().resolve()
+        paths = list((base / "projects").glob(f"*/{session_id}.jsonl"))
+        paths.append(base / "usage-data" / "session-meta" / f"{session_id}.json")
+        existing = [path for path in paths if path.exists()]
+        for path in existing:
+            if base not in path.resolve().parents or not path.is_file():
+                raise ValueError("Claude 会话文件路径异常，已停止删除。")
+        for path in existing:
+            path.unlink()
+        return len(existing)
+
+    def _manage_cli_session(self, account, user_id, conversation_key, action, rest):
+        if not self._is_admin(user_id):
+            raise ValueError("归档、恢复和删除仅限 adminUsers。")
+        parts = rest.split()
+        if (not parts or len(parts) > 2
+                or (len(parts) == 2 and (action != "delete" or parts[1].lower() != "confirm"))):
+            raise ValueError(f"用法：/session {action} <编号|sessionId前缀>" + (" [confirm]" if action == "delete" else ""))
+        item, error = self._find_cached_session(conversation_key, parts[0])
+        if error:
+            raise ValueError(error)
+        session_id = item["sessionId"]
+        account_name = item["account"]
+        archived = bool(item.get("archived"))
+        if action == "archive" and archived:
+            raise ValueError("该会话已经归档。")
+        if action == "unarchive" and not archived:
+            raise ValueError("该会话未归档。")
+        if action != "unarchive":
+            with self.state.lock:
+                refs = [(key, value) for key, value in self.state.state["sessions"].items()
+                        if value.get("codexThreadId" if item["agent"] == "codex" else "claudeSessionId") == session_id
+                        and value.get("codexAccount" if item["agent"] == "codex" else "claudeAccount") in {None, "", account_name}]
+            if any(self.codex.is_running(key) for key, _ in refs):
+                raise ValueError("该会话正在运行，请先结束任务。")
+        if item["agent"] == "codex":
+            target_account = get_codex_account(self.config, account_name)
+            if self._desktop_running_context(session_id):
+                raise ValueError("该会话正在运行，请先结束任务。")
+            if action != "unarchive" and self.desktop.last_turn_status(target_account, session_id) == "inProgress":
+                raise ValueError("该会话可能正在运行，请先结束任务。")
+        else:
+            target_account = get_claude_account(self.config, account_name)
+        if action == "delete" and len(parts) == 1:
+            self.session_delete_pending[conversation_key] = {
+                "agent": item["agent"], "account": account_name, "sessionId": session_id,
+                "expires": time.monotonic() + 60,
+            }
+            self._send_text(account, user_id,
+                f"即将永久删除：{item['title']}\n{session_id}\n60 秒内发送 /session delete {parts[0]} confirm 确认。")
+            return
+        if action == "delete":
+            pending = self.session_delete_pending.get(conversation_key) or {}
+            if (pending.get("agent") != item["agent"] or pending.get("account") != account_name
+                    or pending.get("sessionId") != session_id or time.monotonic() > pending.get("expires", 0)):
+                raise ValueError("删除确认已失效；请重新发送 /session delete <会话编号>。")
+        if item["agent"] == "codex":
+            if action == "archive":
+                self.desktop.archive(target_account, session_id)
+                self.state.clear_codex_thread(session_id, account_name)
+            elif action == "unarchive":
+                self.desktop.unarchive(target_account, session_id)
+            else:
+                self.desktop.delete(target_account, session_id)
+                self.state.clear_codex_thread(session_id, account_name)
+        else:
+            if action == "archive":
+                self.state.set_claude_archived(account_name, session_id, True)
+                self.state.clear_claude_session(session_id, account_name)
+            elif action == "unarchive":
+                self.state.set_claude_archived(account_name, session_id, False)
+            else:
+                removed = self._delete_claude_session_files(target_account, session_id)
+                if not removed:
+                    raise ValueError("没有找到可删除的 Claude 会话文件。")
+                self.state.set_claude_archived(account_name, session_id, False)
+                self.state.clear_claude_session(session_id, account_name)
+        self.session_selection_cache.pop(conversation_key, None)
+        self.session_delete_pending.pop(conversation_key, None)
+        self._send_text(account, user_id, f"已{'归档' if action == 'archive' else '恢复' if action == 'unarchive' else '永久删除'}：{item['title']}")
+
+    def _desktop_account(self, conversation_key):
+        session = self._get_session(conversation_key)
+        name = (self.desktop_account_selection.get(conversation_key)
+                or (session.get("codexAccount") if session.get("codexClient") == "desktop" else "")
+                or default_codex_account(self.config))
+        return get_codex_account(self.config, name)
+
+    @staticmethod
+    def _desktop_help_text():
+        return "\n".join([
+            "桌面 Codex 项目与会话：",
+            "/d-p-n <目录> 创建桌面原生项目并切换；/d-new-project、/d-n-p 等价",
+            "/d-account [账号] 选择本地 Codex 账号",
+            "/d-projects 列桌面原生项目并编号",
+            "/d-project use <编号> 切换桌面项目并准备新会话",
+            "/d-sessions [all|项目编号] [页码] 列会话",
+            "/d-sessions archived [all|项目编号] [页码] 列归档会话",
+            "/d-session view|status|use <编号> 查看结果、状态或选中续聊",
+            "/d-session new 在当前桌面项目准备新会话",
+            "/d-session guide <编号> <内容> 引导本 Bot 发起的运行",
+            "/d-session interrupt <编号> 打断本 Bot 发起的运行",
+            "/d-session archive|unarchive <编号> 归档或恢复（管理员）",
+            "/d-session delete <编号> 删除预览；再加 confirm 确认（管理员）",
+            "/d-session off 退出桌面 App Server 路由",
+            "旧版 /desktop 命令仍可使用。",
+            "项目和会话存入桌面 Codex 的本地数据；任务结果同时回传微信。",
+            "列表状态是最后保存的回合状态；桌面窗口实时运行状态无法由独立 App Server 确认。",
+        ])
+
+    def _desktop_projects(self, conversation_key, codex_account):
+        projects = self.desktop.projects(codex_account)
+        threads = self.desktop.threads(codex_account)
+        counts = {project["id"]: 0 for project in projects}
+        for item in threads:
+            project_id = project_for_thread(item, projects)
+            counts[project_id] = counts.get(project_id, 0) + 1
+        if counts.get("_ungrouped"):
+            projects.append({"id": "_ungrouped", "name": "未归类", "roots": []})
+        for project in projects:
+            project["count"] = counts.get(project["id"], 0)
+        self.desktop_project_cache[conversation_key] = projects
+        return projects
+
+    def _desktop_project_selector(self, conversation_key, codex_account, selector):
+        if not selector or selector.lower() in {"all", "*"}:
+            return "all", ""
+        projects = self.desktop_project_cache.get(conversation_key)
+        if projects is None:
+            projects = self._desktop_projects(conversation_key, codex_account)
+        if selector.isdigit():
+            index = int(selector) - 1
+            if 0 <= index < len(projects):
+                return projects[index]["id"], projects[index]["name"]
+            raise ValueError(f"项目编号超出范围：{selector}。先发送 /d-projects。")
+        matches = [p for p in projects if selector == p["id"] or selector == p["name"]]
+        if not matches:
+            matches = [p for p in projects if selector.lower() in p["name"].lower()]
+        if len(matches) != 1:
+            raise ValueError("项目名称未找到或不唯一。先发送 /d-projects，使用编号。")
+        return matches[0]["id"], matches[0]["name"]
+
+    def _desktop_thread_selector(self, conversation_key, selector):
+        value = str(selector or "").strip()
+        if not value:
+            raise ValueError("请提供会话编号；先发送 /d-sessions all。")
+        cached = self.desktop_thread_cache.get(conversation_key) or []
+        if value.isdigit():
+            index = int(value) - 1
+            if 0 <= index < len(cached):
+                return cached[index]
+            raise ValueError("会话编号无效；先发送 /d-sessions all 或 /d-sessions archived all。")
+        matches = [item for item in cached if item["id"].startswith(value)]
+        if len(matches) != 1:
+            raise ValueError("会话 ID 前缀未找到或不唯一；先列会话并使用编号。")
+        return matches[0]
+
+    def _desktop_running_context(self, thread_id):
+        if not thread_id:
+            return None
+        runner = self.desktop.runner
+        with runner.lock:
+            contexts = list(runner.contexts.values())
+        for context in contexts:
+            with context.lock:
+                if context.thread_id == thread_id and context.running:
+                    return context
+        return None
+
+    def _desktop_latest_error(self, run_key, latest):
+        session = self._get_session(run_key)
+        error = session.get("desktopLastError") or ""
+        failed_turn_id = session.get("desktopLastErrorTurnId") or ""
+        if error and (not failed_turn_id or not latest.get("turnId") or latest.get("turnId") == failed_turn_id):
+            return error
+        return ""
+
+    def _send_desktop_selected_result(self, account, user_id, run_key, title, latest, running=False):
+        if running or latest["status"] == "inProgress":
+            self._send_text(account, user_id, f"已切换：{title}\n正在执行中")
+            return
+        last_error = self._desktop_latest_error(run_key, latest)
+        if last_error:
+            self._send_text(account, user_id, f"已切换：{title}\n最新任务失败：{last_error}")
+            return
+        if latest["status"] == "completed" and latest["text"]:
+            self._deliver_agent_output(
+                account, user_id, run_key,
+                f"已切换：{title}\n最新结果：\n{latest['text']}",
+                turn_id=latest["turnId"],
+            )
+            return
+        self._send_text(account, user_id,
+            f"已切换：{title}\n{self._desktop_status_text({'lastTurnStatus': latest['status']})}")
+
+    @staticmethod
+    def _desktop_status_text(item, bot_running=False):
+        if bot_running:
+            return "本 Bot 运行中"
+        labels = {
+            "completed": "最近回合已完成",
+            "failed": "最近回合失败",
+            "interrupted": "最近回合已中断",
+            "inProgress": "最近回合记录为进行中",
+        }
+        return labels.get(item.get("lastTurnStatus"), "最近回合状态未知")
+
+    def _handle_desktop_command(self, account, user_id, conversation_key, arg):
+        parts = str(arg or "").strip().split()
+        action = parts[0].lower() if parts else "help"
+        codex_account = self._desktop_account(conversation_key)
+        if action in {"help", "?"}:
+            self._send_text(account, user_id, self._desktop_help_text())
+            return
+        if action == "account":
+            if len(parts) == 1:
+                names = ", ".join(a["name"] for a in list_codex_accounts(self.config))
+                self._send_text(account, user_id, f"当前桌面会话账号：{codex_account['name']}\n可选：{names}")
+                return
+            selected = find_codex_account(self.config, parts[1])
+            if not selected:
+                raise ValueError("未找到该 Codex 账号。")
+            self.desktop_account_selection[conversation_key] = selected["name"]
+            self.desktop_project_cache.pop(conversation_key, None)
+            self.desktop_thread_cache.pop(conversation_key, None)
+            self._send_text(account, user_id, f"桌面会话账号：{selected['name']}")
+            return
+        if action == "projects":
+            projects = self._desktop_projects(conversation_key, codex_account)
+            if not projects:
+                self._send_text(account, user_id, "该账号没有本地 Codex 项目。")
+                return
+            lines = [f"桌面 Codex 项目（账号 {codex_account['name']}，共 {len(projects)} 个）："]
+            for index, project in enumerate(projects, 1):
+                lines.append(f"{index}. {project['name']}（{project['count']} 条会话）")
+                if project.get("roots"):
+                    lines.append("   " + ", ".join(project["roots"]))
+            lines.append("发送 /d-sessions <项目编号> 查看会话。")
+            self._send_text(account, user_id, "\n".join(lines))
+            return
+        if action == "project":
+            if len(parts) != 3 or parts[1].lower() != "use":
+                raise ValueError("用法：/d-project use <项目编号>。先发送 /d-projects。")
+            project_id, _ = self._desktop_project_selector(conversation_key, codex_account, parts[2])
+            project = next((p for p in self.desktop_project_cache[conversation_key]
+                            if p["id"] == project_id), None)
+            if not project or not project.get("roots"):
+                raise ValueError("该项目没有本地目录，无法创建本地会话。")
+            base_key = ":".join(self._desktop_parent_key(conversation_key).split(":", 2)[:2])
+            with self._desktop_selection_lock(base_key):
+                self.desktop_account_selection[base_key] = codex_account["name"]
+                self.state.set_active_workspace(base_key, self.state.DEFAULT_WORKSPACE)
+                self.state.update_session(
+                    base_key, agent="codex", codexClient="desktop", codexThreadId="",
+                    codexAccount=codex_account["name"], cwd=project["roots"][0],
+                    desktopProjectId=project_id, desktopPendingId=uuid.uuid4().hex,
+                    codexModel="", codexReasoningEffort="",
+                )
+            self._send_text(account, user_id,
+                            f"已切换桌面项目：{project['name']}\n目录：{project['roots'][0]}\n发送第一条任务时创建会话。")
+            return
+        if action == "new":
+            if len(parts) != 1:
+                raise ValueError("用法：/d-session new；指定新目录请使用 /d-new-project <目录>。")
+            if self.codex.is_running(conversation_key):
+                raise ValueError("当前工作区有任务运行中，请先中断或等待完成。")
+            with self._desktop_selection_lock(conversation_key):
+                cwd = self._get_session(conversation_key).get("cwd") or self.config["codex"]["workingDirectory"]
+                current = self._get_session(conversation_key)
+                projects = self.desktop.projects(codex_account)
+                project_id = current.get("desktopProjectId") or ""
+                selected_project = next((p for p in projects if p["id"] == project_id), None)
+                if not selected_project or not any(
+                    cwd == root or cwd.startswith(root.rstrip("/") + "/")
+                    for root in selected_project.get("roots") or []
+                ):
+                    project_id = project_for_thread({"cwd": cwd}, projects)
+                    if project_id == "_ungrouped":
+                        project_id = ""
+                self.state.update_session(
+                    conversation_key, agent="codex", codexClient="desktop",
+                    codexThreadId="", codexAccount=codex_account["name"],
+                    desktopProjectId=project_id,
+                    codexModel="", codexReasoningEffort="", desktopPendingId=uuid.uuid4().hex,
+                )
+                self.desktop_thread_cache.pop(conversation_key, None)
+            self._send_text(account, user_id,
+                f"已准备新的桌面 Codex 会话。\n目录：{cwd}\n发送第一条任务时创建。")
+            return
+        if action in {"chats", "archived"}:
+            selector = parts[1] if len(parts) > 1 else "all"
+            page_text = parts[2] if len(parts) > 2 else "1"
+            if not page_text.isdigit() or int(page_text) < 1:
+                raise ValueError("页码必须是正整数。")
+            page = int(page_text)
+            project_id, project_name = self._desktop_project_selector(conversation_key, codex_account, selector)
+            projects = self.desktop_project_cache.get(conversation_key) or self._desktop_projects(conversation_key, codex_account)
+            threads = self.desktop.threads(codex_account, archived=action == "archived")
+            if project_id != "all":
+                threads = [item for item in threads if project_for_thread(item, projects) == project_id]
+            for item in threads:
+                item["account"] = codex_account["name"]
+            self.desktop_thread_cache[conversation_key] = threads
+            if not threads:
+                self._send_text(account, user_id, "没有找到会话。")
+                return
+            page_size = 20
+            start = (page - 1) * page_size
+            if start >= len(threads):
+                raise ValueError(f"页码超出范围；共 {(len(threads) + page_size - 1) // page_size} 页。")
+            label = "归档会话" if action == "archived" else "会话"
+            lines = [f"{project_name or '所有项目'}{label}（账号 {codex_account['name']}，共 {len(threads)} 条，第 {page} 页）："]
+            for index in range(start, min(start + page_size, len(threads))):
+                item = threads[index]
+                try:
+                    item["lastTurnStatus"] = self.desktop.last_turn_status(codex_account, item["id"])
+                except Exception:
+                    item["lastTurnStatus"] = "unknown"
+                status = self._desktop_status_text(item, bool(self._desktop_running_context(item["id"])))
+                project_label = ""
+                if project_id == "all":
+                    matching = next((p for p in projects if p["id"] == project_for_thread(item, projects)), None)
+                    project_label = f" [{matching['name'] if matching else '未归类'}]"
+                lines.append(f"{index + 1}. {item['title']}{project_label} [{status}]")
+                lines.append(f"   {item['id'][:12]}  {format_session_time(item['updatedAt'])}")
+            lines.append("编号可用于 /d-session view、status、use、archive、delete。")
+            self._send_text(account, user_id, "\n".join(lines))
+            return
+        if action == "off":
+            selected = self._get_session(conversation_key)
+            if (self.codex.is_running(conversation_key)
+                    or (selected.get("codexClient") == "desktop"
+                        and self._desktop_running_context(selected.get("codexThreadId") or ""))):
+                raise ValueError("当前工作区有任务运行中，请先中断或等待完成。")
+            self.state.update_session(conversation_key, codexClient="", desktopPendingId="")
+            self._send_text(account, user_id, "已退出桌面 App Server 路由；当前 Codex 会话 ID 保留。")
+            return
+        if action not in {"view", "status", "use", "guide", "interrupt", "archive", "unarchive", "delete"}:
+            self._send_text(account, user_id, self._desktop_help_text())
+            return
+        if len(parts) < 2:
+            raise ValueError(f"用法：/d-session {action} <会话编号>。先发送 /d-sessions all。")
+        item = self._desktop_thread_selector(conversation_key, parts[1])
+        target_account = get_codex_account(self.config, item["account"])
+        thread_id = item["id"]
+        running = self._desktop_running_context(thread_id)
+        if action == "status":
+            item["lastTurnStatus"] = self.desktop.last_turn_status(target_account, thread_id)
+            lines = [f"{item['title']}", f"threadId: {thread_id}",
+                     f"状态: {self._desktop_status_text(item, bool(running))}",
+                     f"最近更新: {format_session_time(item['updatedAt'])}",
+                     "桌面窗口是否正在运行，当前连接无法确认。"]
+            self._send_text(account, user_id, "\n".join(lines))
+            return
+        if action == "view":
+            latest = self.desktop.latest_result(target_account, thread_id)
+            if running or latest["status"] == "inProgress":
+                message = "正在执行中"
+            elif latest["status"] == "completed" and latest["text"]:
+                message = markdown_to_plain_text(extract_actions(latest["text"])[0])
+            else:
+                message = self._desktop_status_text({"lastTurnStatus": latest["status"]})
+            self._send_text(account, user_id, f"{item['title']}\n最新结果：\n{message}")
+            return
+        if action == "use":
+            if self.codex.is_running(conversation_key):
+                raise ValueError("当前工作区有任务运行中，请先中断或等待完成。")
+            if item["archived"]:
+                raise ValueError("该会话已归档，请先 /d-session unarchive。")
+            with self._desktop_selection_lock(conversation_key):
+                project_id = project_for_thread(item, self.desktop.projects(target_account))
+                self.state.update_session(
+                    conversation_key, agent="codex", codexClient="desktop", codexThreadId=thread_id,
+                    codexAccount=target_account["name"], cwd=item["cwd"] or self._get_session(conversation_key).get("cwd"),
+                    desktopProjectId="" if project_id == "_ungrouped" else project_id,
+                    codexModel="", codexReasoningEffort="", desktopPendingId="",
+                )
+                run_key = self._desktop_execution_key(conversation_key)
+                latest = self.desktop.latest_result(target_account, thread_id)
+                running = self._desktop_running_context(thread_id)
+                self._send_desktop_selected_result(account, user_id, run_key, item["title"], latest, bool(running))
+            return
+        if action in {"guide", "interrupt"}:
+            if not running:
+                raise ValueError("该会话当前没有本 Bot 发起的运行；无法控制桌面窗口内独立运行的回合。")
+            if action == "guide":
+                value = arg.split(maxsplit=2)[2].strip() if len(arg.split(maxsplit=2)) > 2 else ""
+                if not value:
+                    raise ValueError("用法：/d-session guide <会话编号> <引导内容>")
+                if not self.desktop.runner.steer(running.conversation_key, value):
+                    raise RuntimeError("引导未被当前回合接受。")
+                self._send_text(account, user_id, "已发送引导。")
+            else:
+                self.desktop.runner.cancel(running.conversation_key, reset_session=False)
+                self._send_text(account, user_id, "已请求中断；会话保留。")
+            return
+        if not self._is_admin(user_id):
+            raise ValueError("归档、恢复和删除仅限 adminUsers。")
+        item["lastTurnStatus"] = self.desktop.last_turn_status(target_account, thread_id)
+        if running or item.get("lastTurnStatus") == "inProgress":
+            raise ValueError("该会话可能正在运行；请先结束任务，再操作。")
+        if action == "archive":
+            if item["archived"]:
+                raise ValueError("该会话已经归档。")
+            self.desktop.archive(target_account, thread_id)
+            self.state.clear_codex_thread(thread_id, target_account["name"])
+            self.desktop_thread_cache.pop(conversation_key, None)
+            self._send_text(account, user_id, f"已归档：{item['title']}")
+            return
+        if action == "unarchive":
+            if not item["archived"]:
+                raise ValueError("该会话未归档。")
+            self.desktop.unarchive(target_account, thread_id)
+            self.desktop_thread_cache.pop(conversation_key, None)
+            self._send_text(account, user_id, f"已恢复：{item['title']}")
+            return
+        if action == "delete":
+            pending = self.desktop_delete_pending.get(conversation_key) or {}
+            confirmed = len(parts) >= 3 and parts[2].lower() == "confirm"
+            if not confirmed:
+                self.desktop_delete_pending[conversation_key] = {
+                    "threadId": thread_id, "account": target_account["name"], "expires": time.monotonic() + 60,
+                }
+                self._send_text(account, user_id,
+                    f"即将永久删除：{item['title']}\n{thread_id}\n派生子会话也会被删除。60 秒内发送 /d-session delete {parts[1]} confirm 确认。")
+                return
+            if (pending.get("threadId") != thread_id or pending.get("account") != target_account["name"]
+                    or time.monotonic() > pending.get("expires", 0)):
+                raise ValueError("删除确认已失效；请重新发送 /d-session delete <会话编号>。")
+            self.desktop.delete(target_account, thread_id)
+            self.desktop_delete_pending.pop(conversation_key, None)
+            self.state.clear_codex_thread(thread_id, target_account["name"])
+            self.desktop_thread_cache.pop(conversation_key, None)
+            self._send_text(account, user_id, f"已永久删除：{item['title']}")
+            return
 
     @staticmethod
     def _parse_interrupt_command(text):
@@ -1092,6 +1756,7 @@ class MultiWechatCodexService:
         return self._read_claude_usage_for_account(claude_account, cwd=session.get("cwd") or "")
 
     def _workspace_name_from_key(self, base_conversation_key, conversation_key):
+        conversation_key = self._desktop_parent_key(conversation_key)
         if conversation_key == base_conversation_key:
             return self.state.DEFAULT_WORKSPACE
         prefix = f"{base_conversation_key}:"
@@ -1106,7 +1771,7 @@ class MultiWechatCodexService:
         if value == self.state.DEFAULT_WORKSPACE:
             return "default 是保留工作区名，不能用 /ws add 创建。"
         if not self.WORKSPACE_NAME_RE.match(value):
-            return "工作区名称只能包含字母、数字、点、下划线和中划线，长度 1-64，且必须以字母或数字开头。"
+            return "工作区名称只能包含中英文字母、数字、点、下划线和中划线，长度 1-64，且必须以字母或数字开头。"
         return ""
 
     def _resolve_cwd(self, value, base_cwd=None):
@@ -1122,6 +1787,106 @@ class MultiWechatCodexService:
         if not resolved.is_dir():
             return "", f"不是目录: {resolved}"
         return str(resolved), ""
+
+    def _new_project_path(self, value, base_cwd):
+        raw = str(value or "").strip()
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in {'"', "'"}:
+            raw = raw[1:-1]
+        if not raw:
+            raise ValueError("用法：/new-project <目录> 或 /d-new-project <目录>")
+        path = Path(os.path.expandvars(os.path.expanduser(raw)))
+        if not path.is_absolute():
+            path = Path(base_cwd or self.config["codex"]["workingDirectory"]) / path
+        path = path.resolve()
+        if path.exists() and not path.is_dir():
+            raise ValueError(f"不是目录：{path}")
+        if not path.exists():
+            path.mkdir(parents=True)
+        return str(path)
+
+    def _project_workspace_name(self, base_conversation_key, cwd):
+        workspaces = self.state.list_workspaces(base_conversation_key)
+        existing = next((item["name"] for item in workspaces if item.get("cwd") == cwd), "")
+        if existing:
+            return existing
+        used = {item["name"] for item in workspaces}
+        stem = re.sub(r"[^\w.-]+", "-", Path(cwd).name, flags=re.UNICODE).strip("._-")[:64]
+        if not stem or self._validate_workspace_name(stem) or stem == self.state.DEFAULT_WORKSPACE:
+            stem = "project"
+        candidate = stem
+        index = 2
+        while candidate in used:
+            suffix = f"-{index}"
+            candidate = stem[:64 - len(suffix)] + suffix
+            index += 1
+        return candidate
+
+    def _handle_new_project_command(self, account, user_id, base_conversation_key, conversation_key, arg, desktop=False):
+        if not arg:
+            prefix = "/d-new-project" if desktop else "/new-project"
+            self._send_text(account, user_id, f"用法：{prefix} <目录>")
+            return
+        if desktop:
+            self._handle_new_desktop_project_command(
+                account, user_id, base_conversation_key, conversation_key, arg
+            )
+            return
+        with self._desktop_selection_lock(base_conversation_key):
+            current = self._get_session(conversation_key)
+            cwd = self._new_project_path(arg, current.get("cwd"))
+            name = self._project_workspace_name(base_conversation_key, cwd)
+            workspace_key = self._workspace_key(base_conversation_key, name)
+            if self.codex.is_running(workspace_key):
+                raise ValueError("该项目工作区有任务运行中，请稍后再新建会话。")
+            updates = {
+                "cwd": cwd,
+                "agent": resolve_session_agent(self.config, current),
+                "codexClient": "",
+                "desktopProjectId": "",
+                "codexThreadId": "",
+                "claudeSessionId": "",
+                "desktopPendingId": "",
+            }
+            for field in ("codexAccount", "claudeAccount", "codexModel", "codexReasoningEffort", "claudeModel", "claudeEffort"):
+                if field in current:
+                    updates[field] = current[field]
+            self.state.upsert_workspace(
+                base_conversation_key, name, cwd, project_client="cli",
+            )
+            self.state.update_session(workspace_key, **updates)
+            self.state.set_active_workspace(base_conversation_key, name)
+            self.desktop_thread_cache.pop(workspace_key, None)
+            self.desktop_project_cache.pop(workspace_key, None)
+            self.desktop_project_cache.pop(conversation_key, None)
+            self.session_selection_cache.pop(workspace_key, None)
+        self._send_text(account, user_id,
+            f"已切换到项目工作区：{name}\n目录：{cwd}\n已准备新的 {self._agent_label(updates['agent'])} 会话；直接发送任务即可开始。")
+
+    def _handle_new_desktop_project_command(self, account, user_id, base_conversation_key,
+                                            conversation_key, arg):
+        current = self._get_session(conversation_key)
+        cwd = self._new_project_path(arg, current.get("cwd"))
+        codex_account = self._desktop_account(conversation_key)
+        projects = self.desktop.projects(codex_account)
+        project = next((p for p in projects if cwd in (p.get("roots") or [])), None)
+        existed = project is not None
+        if not project:
+            project = self.desktop.create_project(
+                codex_account, Path(cwd).name or "新项目", cwd, uuid.uuid4().hex
+            )
+        with self._desktop_selection_lock(base_conversation_key):
+            self.desktop_account_selection[base_conversation_key] = codex_account["name"]
+            self.state.set_active_workspace(base_conversation_key, self.state.DEFAULT_WORKSPACE)
+            self.state.update_session(
+                base_conversation_key, agent="codex", codexClient="desktop", codexThreadId="",
+                codexAccount=codex_account["name"], cwd=cwd, desktopProjectId=project["id"],
+                desktopPendingId=uuid.uuid4().hex, codexModel="", codexReasoningEffort="",
+            )
+            self.desktop_thread_cache.pop(base_conversation_key, None)
+            self.desktop_project_cache.pop(base_conversation_key, None)
+        prefix = "已切换到已有桌面项目" if existed else "已创建桌面 Codex 项目"
+        self._send_text(account, user_id,
+            f"{prefix}：{project['name']}\n目录：{cwd}\n已准备新的桌面 Codex 会话；发送第一条任务时创建。")
 
     def _workspace_key(self, base_conversation_key, workspace_name):
         return self.state.workspace_conversation_key(base_conversation_key, workspace_name)
@@ -1160,6 +1925,8 @@ class MultiWechatCodexService:
                 "",
                 "用法：",
                 "/ws add <名称> <路径>",
+                "/new-project <目录>（缩写 /n-p）",
+                "/d-p-n <目录> 在桌面 Codex 创建原生项目（/d-new-project、/d-n-p）",
                 "/ws use <名称>",
                 "/ws agent <名称> <codex|claude>",
                 "/ws run <名称> <任务>",
@@ -1174,6 +1941,8 @@ class MultiWechatCodexService:
                 "工作区命令：",
                 "/ws 或 /ws list 查看当前微信用户的项目工作区",
                 "/ws add <名称> <路径> 添加项目工作区",
+                "/new-project <目录> 新建并切换 CLI 项目工作区（缩写 /n-p）",
+                "/d-p-n <目录> 新建并切换桌面 Codex 原生项目（/d-new-project、/d-n-p）",
                 "/ws use <名称> 切换当前工作区",
                 "/ws agent <名称> <codex|claude> 设置指定工作区使用的 Agent",
                 "/ws run <名称> <任务> 在指定工作区派发任务",
@@ -1206,7 +1975,7 @@ class MultiWechatCodexService:
                 return
             self.state.upsert_workspace(base_conversation_key, name, cwd)
             workspace_key = self._workspace_key(base_conversation_key, name)
-            self.state.update_session(workspace_key, cwd=cwd, codexThreadId="", claudeSessionId="")
+            self.state.update_session(workspace_key, cwd=cwd, codexThreadId="", claudeSessionId="", desktopPendingId="")
             self._send_text(
                 account,
                 user_id,
@@ -1226,11 +1995,23 @@ class MultiWechatCodexService:
             if name != self.state.DEFAULT_WORKSPACE and not item:
                 self._send_text(account, user_id, f"未知工作区: {name}\n发送 /ws 查看已添加工作区。")
                 return
-            self.state.set_active_workspace(base_conversation_key, name)
-            if item and item.get("cwd"):
-                self.state.update_session(self._workspace_key(base_conversation_key, name), cwd=item["cwd"])
-            cwd = self._get_session(self._workspace_key(base_conversation_key, name)).get("cwd")
-            self._send_text(account, user_id, f"已切换当前工作区: {name}\nCWD: {cwd}")
+            with self._desktop_selection_lock(base_conversation_key):
+                self.state.set_active_workspace(base_conversation_key, name)
+                if item and item.get("cwd"):
+                    self.state.update_session(self._workspace_key(base_conversation_key, name), cwd=item["cwd"])
+                workspace_key = self._workspace_key(base_conversation_key, name)
+                session = self._get_session(workspace_key)
+                cwd = session.get("cwd")
+                self._send_text(account, user_id, f"已切换当前工作区: {name}\nCWD: {cwd}")
+                if session.get("codexClient") == "desktop" and session.get("codexThreadId"):
+                    run_key = self._desktop_execution_key(workspace_key)
+                    codex_account = resolve_session_codex_account(self.config, session)
+                    thread_id = session["codexThreadId"]
+                    latest = self.desktop.latest_result(codex_account, thread_id)
+                    self._send_desktop_selected_result(
+                        account, user_id, run_key, thread_id[:12], latest,
+                        bool(self._desktop_running_context(thread_id)),
+                    )
             return
         if action == "agent":
             if len(parts) < 4:
@@ -1277,7 +2058,7 @@ class MultiWechatCodexService:
             if item and item.get("cwd"):
                 self.state.update_session(workspace_key, cwd=item["cwd"])
             self.state.touch_workspace(base_conversation_key, name)
-            self._run_codex_and_reply(account, user_id, workspace_key, prompt)
+            self._run_codex_and_reply(account, user_id, self._desktop_execution_key(workspace_key), prompt)
             return
         if action in {"reset", "cancel"}:
             if len(parts) < 3:
@@ -1293,8 +2074,12 @@ class MultiWechatCodexService:
                 self._send_text(account, user_id, f"未知工作区: {name}")
                 return
             workspace_key = self._workspace_key(base_conversation_key, name)
-            killed = self._cancel_runner(workspace_key, reset_session=True)
-            self._clear_pending_guidance(workspace_key)
+            run_key = self._desktop_execution_key(workspace_key)
+            killed = self._cancel_runner(run_key, reset_session=True)
+            if run_key != workspace_key:
+                self.state.reset_session(workspace_key, agent="codex")
+            self.state.update_session(workspace_key, desktopPendingId="")
+            self._clear_pending_guidance(run_key)
             agent = resolve_session_agent(self.config, self._get_session(workspace_key))
             message = f"已取消正在运行的 {self._agent_label(agent)} 并重置该工作区。" if killed else "已重置该工作区。"
             self._send_text(account, user_id, message)
@@ -1879,7 +2664,20 @@ class MultiWechatCodexService:
         return bool(admins) and user_id in admins
 
     @staticmethod
-    def _help_text(account_id):
+    def _help_text(account_id, full=False):
+        if not full:
+            return "\n".join([
+                "常用命令：",
+                "/status 状态；/active 运行中的任务",
+                "/sessions [codex|claude|all] CLI 会话；/session 管理 CLI 会话",
+                "/d-projects 桌面项目；/d-sessions [all|项目编号] 桌面会话",
+                "/d-session 管理桌面会话；/d-account 选择桌面账号",
+                "/new-project <目录> 新建 CLI 工作区；/d-p-n <目录> 新建桌面原生项目",
+                "/ws 工作区；/agent 切换 Agent；/account 切换账号",
+                "/guide <内容> 引导；/interrupt 中断；/reset 重置",
+                "/help all 查看全部命令及归档、删除用法",
+                f"当前 bot accountId: {account_id}",
+            ])
         return "\n".join(
             [
                 "命令：",
@@ -1890,9 +2688,16 @@ class MultiWechatCodexService:
                 "/guide <补充要求> 在任务运行中追加引导；直接发普通消息也会追加",
                 "/usage 查看当前 Agent 用量",
                 "/usage all 查看配置里所有 Codex 和 Claude 账号的用量",
-                "/sessions [codex|claude|all] 查看可恢复 sessions",
-                "/session use <编号|sessionId前缀> 恢复指定 session",
-                "/session new [codex|claude] 新建会话",
+                "/sessions [codex|claude|all] 查看 CLI 会话",
+                "/new-project <目录> 新建并切换 CLI 项目工作区（/n-p）",
+                "/d-p-n <目录> 新建并切换桌面原生项目（/d-new-project、/d-n-p）",
+                "/sessions archived [codex|claude|all] 查看 CLI 归档会话",
+                "/session use|new|archive|unarchive|delete 管理 CLI 会话（/session 看用法）",
+                "/d-projects 查看桌面项目；/d-sessions [all|项目编号] [页码] 查看会话",
+                "/d-project use <编号> 切换已有桌面项目并准备新会话",
+                "/d-sessions archived [all|项目编号] [页码] 查看桌面归档会话",
+                "/d-session new 在当前桌面项目新建会话；/d-session 查看其他操作；/d-account [账号] 选择桌面账号",
+                "桌面项目和会话使用 Codex 原生数据；任务结果回传微信。",
                 "/agents 查看可用 Agent",
                 "/agent <codex|claude> 切换当前工作区使用的 CLI",
                 "/account 查看或切换当前 Agent 账号",

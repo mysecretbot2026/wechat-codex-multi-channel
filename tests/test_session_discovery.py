@@ -49,6 +49,14 @@ class SessionDiscoveryTests(unittest.TestCase):
             self.assertEqual(sessions[0]["title"], "检查 xx_gg 目录")
             self.assertEqual(sessions[0]["cwd"], "/tmp/project")
 
+            con = sqlite3.connect(str(home / "state_5.sqlite"))
+            con.execute("update threads set archived = 1 where id = 'thread-1'")
+            con.commit()
+            con.close()
+            self.assertEqual(list_codex_sessions({"name": "main", "codexHome": str(home)}), [])
+            archived = list_codex_sessions({"name": "main", "codexHome": str(home)}, archived_only=True)
+            self.assertEqual([item["sessionId"] for item in archived], ["thread-1"])
+
     def test_list_claude_sessions_reads_meta_and_project_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
@@ -90,6 +98,15 @@ class SessionDiscoveryTests(unittest.TestCase):
             self.assertEqual(sessions[0]["sessionId"], "session-1")
             self.assertEqual(sessions[0]["title"], "修复登录问题")
             self.assertEqual(sessions[0]["cwd"], "/tmp/project")
+
+            archived = list_claude_sessions(
+                {"name": "main", "claudeConfigDir": str(base)},
+                archived_ids={"session-1"}, archived_only=True,
+            )
+            self.assertEqual([item["sessionId"] for item in archived], ["session-1"])
+            self.assertEqual(list_claude_sessions(
+                {"name": "main", "claudeConfigDir": str(base)}, archived_ids={"session-1"},
+            ), [])
 
 
 if __name__ == "__main__":

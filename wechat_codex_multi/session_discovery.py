@@ -48,14 +48,14 @@ def format_session_time(epoch):
     return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
 
 
-def _codex_rows_from_sqlite(db_path, limit, include_archived=False):
+def _codex_rows_from_sqlite(db_path, limit, include_archived=False, archived_only=False):
     if not db_path.exists():
         return []
     uri = f"file:{db_path}?mode=ro"
     con = sqlite3.connect(uri, uri=True, timeout=1)
     con.row_factory = sqlite3.Row
     try:
-        archived_clause = "" if include_archived else "where archived = 0"
+        archived_clause = "where archived = 1" if archived_only else ("" if include_archived else "where archived = 0")
         rows = con.execute(
             f"""
             select id, title, cwd, source, created_at, updated_at, archived
@@ -96,14 +96,17 @@ def _codex_rows_from_index(codex_home, limit):
     return rows[: int(limit or 50)]
 
 
-def list_codex_sessions(codex_account, limit=20, include_archived=False):
+def list_codex_sessions(codex_account, limit=20, include_archived=False, archived_only=False):
     codex_home = expand_home((codex_account or {}).get("codexHome") or "~/.codex")
     rows = []
+    db_path = codex_home / "state_5.sqlite"
+    db_read_ok = False
     try:
-        rows = _codex_rows_from_sqlite(codex_home / "state_5.sqlite", limit, include_archived=include_archived)
+        rows = _codex_rows_from_sqlite(db_path, limit, include_archived=include_archived, archived_only=archived_only)
+        db_read_ok = db_path.exists()
     except Exception:
         rows = []
-    if not rows:
+    if not rows and not archived_only and not db_read_ok:
         rows = _codex_rows_from_index(codex_home, limit)
     account_name = (codex_account or {}).get("name") or "main"
     sessions = []
@@ -121,6 +124,7 @@ def list_codex_sessions(codex_account, limit=20, include_archived=False):
                 "source": row.get("source") or "",
                 "createdAt": int(row.get("created_at") or 0),
                 "updatedAt": int(row.get("updated_at") or 0),
+                "archived": bool(row.get("archived")),
             }
         )
     return sessions
@@ -168,7 +172,7 @@ def _merge_claude_project_logs(base_dir, sessions):
     projects_dir = base_dir / "projects"
     if not projects_dir.exists():
         return
-    for path in projects_dir.rglob("*.jsonl"):
+    for path in projects_dir.glob("*/*.jsonl"):
         session_id = path.stem
         entry = sessions.setdefault(
             session_id,
@@ -211,16 +215,20 @@ def _merge_claude_project_logs(base_dir, sessions):
             entry["updatedAt"] = max(int(entry.get("updatedAt") or 0), last_epoch)
 
 
-def list_claude_sessions(claude_account, limit=20):
+def list_claude_sessions(claude_account, limit=20, archived_ids=None, archived_only=False):
     config_dir = (claude_account or {}).get("claudeConfigDir") or "~/.claude"
     base_dir = expand_home(config_dir)
     sessions = _claude_sessions_from_meta(base_dir)
     _merge_claude_project_logs(base_dir, sessions)
     account_name = (claude_account or {}).get("name") or "main"
+    archived_ids = set(archived_ids or ())
     result = []
     for item in sessions.values():
         session_id = item.get("sessionId") or ""
         if not session_id:
+            continue
+        archived = session_id in archived_ids
+        if archived != archived_only:
             continue
         result.append(
             {
@@ -232,6 +240,7 @@ def list_claude_sessions(claude_account, limit=20):
                 "source": "local",
                 "createdAt": int(item.get("createdAt") or 0),
                 "updatedAt": int(item.get("updatedAt") or 0),
+                "archived": archived,
             }
         )
     result.sort(key=lambda item: item.get("updatedAt") or 0, reverse=True)

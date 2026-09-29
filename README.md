@@ -1,6 +1,6 @@
 # wechat-codex-multi-channel
 
-把多个微信 Bot 账号接到同一台机器上的 Codex CLI 或 Claude Code CLI。下列微信命令由本地服务按固定规则处理；其他消息交给所选 Agent。每个微信用户可以维护多个项目工作区，工作区分别保存目录、Agent、登录账号、模型和 CLI 会话。
+把多个微信 Bot 账号接到同一台机器上的 Codex CLI、桌面 Codex 或 Claude Code CLI。下列微信命令由本地服务按固定规则处理；其他消息交给所选 Agent。CLI 工作区由微信服务管理；桌面项目和会话使用 Codex 自己的本地数据，微信只保存当前选择。
 
 ## 快速开始
 
@@ -57,6 +57,7 @@ python3 -m wechat_codex_multi start
 | `defaultAgent` | 新工作区默认使用 `codex` 或 `claude` |
 | `wechat.baseUrl`、`botType`、`routeTag` | 微信 Bot 接口设置；`routeTag` 非空时作为请求头发送 |
 | `codex.bin`、`claude.bin` | CLI 命令名或绝对路径 |
+| `codex.desktopBin` | 桌面会话 App Server 的可执行文件；macOS 默认优先使用 ChatGPT.app 内置的 Codex，与桌面版本保持一致 |
 | `codex.workingDirectory` | 默认项目目录；`claude.workingDirectory` 为空时沿用此目录 |
 | `codex.runner` | `exec` 或 `app-server`；默认 `exec` |
 | `codex.defaultAccount`、`codex.accounts` | 默认 Codex 账号和各账号的 `codexHome` |
@@ -104,7 +105,7 @@ python3 -m wechat_codex_multi start
 
 | 命令 | 作用 |
 | --- | --- |
-| `/help` | 查看命令帮助 |
+| `/help`、`/help all` | 查看常用命令或完整命令清单 |
 | `/status` | 查看当前工作区、目录、Agent、账号、模型、会话与运行状态 |
 | `/active` | 查看正在运行的任务 |
 | `/accounts`、`/users` | 列出已连接的微信 Bot 账号和用户信息 |
@@ -142,18 +143,41 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 | `/cwd [路径]` | 查看或修改当前工作区目录；修改后重置两种 Agent 的会话 |
 | `/ws`、`/ws list` | 列出当前微信用户的项目工作区 |
 | `/ws add <名称> <路径>` | 添加工作区；`default` 为保留名称 |
+| `/new-project <目录>`、`/n-p <目录>` | 建立并切换 CLI 项目工作区，准备新会话；名称取目录名 |
+| `/d-new-project <目录>`、`/d-p-n <目录>`、`/d-n-p <目录>` | 在桌面 Codex 创建原生项目，指定目录为项目根目录，并准备新会话 |
 | `/ws use <名称>` | 切换当前工作区 |
 | `/ws agent <名称> <codex|claude>` | 设置指定工作区使用的 Agent |
 | `/ws run <名称> <任务>` | 不切换当前工作区，直接向指定工作区派发任务 |
 | `/ws reset <名称>` | 取消任务并重置指定工作区的当前 Agent 会话 |
 | `/sessions [codex|claude|all]` | 按更新时间列出本机可恢复的 CLI 会话 |
+| `/sessions archived [codex|claude|all]` | 列出 CLI 归档会话 |
 | `/session use <编号|sessionId前缀>` | 将当前工作区切换到指定会话 |
 | `/session new [codex|claude]` | 新建当前工作区的 CLI 会话 |
+| `/session archive|unarchive <编号|sessionId前缀>` | 归档或恢复 CLI 会话，仅管理员可用 |
+| `/session delete <编号|sessionId前缀>` | 预览永久删除；60 秒内再加 `confirm` 确认，仅管理员可用 |
+| `/d-projects` | 列出当前 Codex 账号的桌面原生项目 |
+| `/d-project use <项目编号>` | 切换已有桌面项目，并准备新会话 |
+| `/d-sessions [all|项目编号] [页码]` | 列出全部项目或指定项目的 Codex 会话，20 条一页 |
+| `/d-sessions archived [all|项目编号] [页码]` | 列出桌面归档会话 |
+| `/d-session view|status|use <会话编号>` | 查看最新结果、状态或选中会话；选中后直接发送消息续聊 |
+| `/d-session new` | 在当前桌面项目准备一个全新的会话 |
+| `/d-session guide <会话编号> <内容>`、`/d-session interrupt <会话编号>` | 引导或打断本 Bot 发起的回合 |
+| `/d-session archive|unarchive <会话编号>` | 归档或恢复会话，仅管理员可用 |
+| `/d-session delete <会话编号>` | 预览永久删除；60 秒内再加 `confirm` 确认，仅管理员可用 |
+| `/d-account [账号]`、`/d-session off` | 选择会话账号、退出桌面 App Server 路由 |
 | `/reset` | 取消当前任务并重置当前 Agent 会话 |
 
 每个 `accountId:userId` 有自己的默认工作区；额外工作区的会话 key 为 `accountId:userId:workspaceName`。同一用户可以让不同工作区并行执行。工作区分别保存目录、Agent、Codex 与 Claude 会话、账号和模型选择。
 
-`/sessions` 读取本机 CLI 会话数据，不请求模型。列表中的编号只对当前工作区最近一次查询有效；`/session use` 在当前任务运行时会拒绝切换。
+`/new-project /Users/bot/Documents/demo` 会在目录不存在时创建目录，以目录名 `demo` 登记 CLI 工作区并切换进去。缩写为 `/n-p`。
+
+`/d-p-n /Users/bot/Documents/demo` 通过 Codex App Server 的 `project/create` 创建桌面原生项目，以该目录作为项目根目录；目录不存在时先创建。同一路径已有桌面项目则直接选中。微信只保存当前选中的原生项目 ID、目录和会话 ID，不额外创建微信工作区。发送第一条任务时通过 `thread/start` 指定该项目 ID；任务结果发回微信，用户消息和 Codex 回复也写入桌面端同一会话。任务完成后，可在 `/d-sessions <项目编号>` 或桌面应用的该项目中查看、续聊。已有项目可用 `/d-project use <项目编号>` 切换，再发送任务创建新会话。`/d-new-project`、`/d-n-p` 与 `/d-p-n` 等价。
+
+`/sessions` 读取本机 CLI 会话数据，不请求模型。列表中的编号只对当前工作区最近一次查询有效；列出归档会话后，编号用于 `/session unarchive` 或 `/session delete`。`/session use` 在当前任务运行时会拒绝切换。Codex CLI 与桌面 Codex 共用本地会话库，因此归档和删除 Codex CLI 会话也会影响桌面端。Claude Code 没有原生归档命令；`/session archive` 对 Claude 只在本 Bot 的列表中隐藏会话，`/session unarchive` 可恢复显示，本机 Claude CLI 仍可找到它。删除 Claude 会话会移除该账号 `projects` 中对应的会话 JSONL 和 `usage-data/session-meta` 元数据；这不代表清除 Claude Code 的所有缓存或其他副本。
+
+`/d-` 前缀表示桌面 Codex；旧版 `/desktop` 命令继续兼容。桌面命令通过同一 `CODEX_HOME` 的 Codex App Server 协议读写原生项目和会话。桌面应用与微信使用同一份本地项目、会话数据；桌面窗口可能需要刷新才能看到外部进程新建的项目或会话。`status` 显示最后保存的回合状态，只有本 Bot 发起的回合能显示实时运行状态并接受 `guide` 或 `interrupt`。普通 ChatGPT Chat/Work 对话不在此命令范围内。会话编号以最近一次 `/d-sessions` 列表为准；切换账号后需重新列出。归档和删除可能影响派生子会话；删除不可恢复。
+
+同一微信用户可以在桌面会话 A 执行期间用 `/d-session use` 切到 B，并向 B 发起另一个任务。各会话独立运行；后台会话完成时暂不主动发送结果。切回 A 时，若仍在运行则回复“正在执行中”，若已完成则发送 A 最新回合的完整最终回答。当前选中的会话完成时会直接回复微信；`/d-session view` 只读取指定会话的最新结果，不回放历史回合。
 
 ### 运行中的任务
 

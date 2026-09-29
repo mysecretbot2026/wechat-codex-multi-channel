@@ -9,6 +9,7 @@
   "codex": {
     "runner": "exec",
     "bin": "codex",
+    "desktopBin": "",
     "workingDirectory": ".",
     "model": "",
     "reasoningEffort": "",
