@@ -140,6 +140,13 @@ def find_model_option(options, selector):
         if 0 <= index < len(options):
             return dict(options[index])
     lowered = value.lower()
+    # A bare model name means its advertised default effort, not the first
+    # (often lowest) entry in a flattened App Server model menu.
+    for option in options:
+        if (str(option.get("model") or "").lower() == lowered
+                and option.get("defaultReasoningEffort")
+                and option.get("reasoningEffort") == option["defaultReasoningEffort"]):
+            return dict(option)
     for option in options:
         keys = [
             _option_key(option),
@@ -166,6 +173,11 @@ def format_model_option(option):
 
 
 def resolve_session_model(config, session):
+    if (session or {}).get("codexClient") == "desktop":
+        # Cached observed settings are for display only. Without an explicit
+        # pending override, resume the native thread's latest model and effort.
+        override = (session or {}).get("desktopModelOverride") or {}
+        return {"model": override.get("model") or "", "reasoningEffort": override.get("reasoningEffort") or ""}
     codex = config.get("codex") or {}
     return {
         "model": (session or {}).get("codexModel") or codex.get("model") or "",

@@ -51,6 +51,32 @@ class DesktopCodexCatalog:
     def __init__(self, runner):
         self.runner = runner
 
+    def model_options(self, account):
+        options, seen = [], set()
+        cursor = None
+        for _ in range(100):
+            params = {"limit": 100, "includeHidden": False}
+            if cursor:
+                params["cursor"] = cursor
+            result = self.runner.request_for_account(account, "model/list", params, timeout_s=30) or {}
+            for item in result.get("data") or []:
+                model = item.get("model") or ""
+                if not model or item.get("hidden"):
+                    continue
+                default = item.get("defaultReasoningEffort") or ""
+                efforts = [level.get("reasoningEffort") or "" for level in item.get("supportedReasoningEfforts") or []]
+                for effort in efforts or [default]:
+                    if (model, effort) in seen:
+                        continue
+                    seen.add((model, effort))
+                    options.append({"model": model, "reasoningEffort": effort,
+                                    "label": item.get("displayName") or model,
+                                    "defaultReasoningEffort": default})
+            cursor = result.get("nextCursor")
+            if not cursor:
+                return options
+        raise RuntimeError("Codex 模型列表分页过多")
+
     def projects(self, account):
         server = self.runner._server_for_account(account)
         cursor = None
@@ -165,6 +191,8 @@ class DesktopCodexCatalog:
                 "archived": bool(archived),
                 "runtimeStatus": (item.get("status") or {}).get("type") or "unknown",
                 "lastTurnStatus": statuses.get(thread_id) or "unknown",
+                "model": item.get("model") or "",
+                "reasoningEffort": item.get("reasoningEffort") or "",
             })
         return result
 

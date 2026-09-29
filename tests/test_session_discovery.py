@@ -37,6 +37,13 @@ class SessionDiscoveryTests(unittest.TestCase):
                     0,
                 ),
             )
+            con.executemany(
+                "insert into threads values (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    ("desktop-1", "桌面会话", "/tmp/project", "vscode", 110, 300, 0),
+                    ("app-server-1", "App Server 会话", "/tmp/project", "appServer", 120, 400, 0),
+                ],
+            )
             con.commit()
             con.close()
 
@@ -48,6 +55,8 @@ class SessionDiscoveryTests(unittest.TestCase):
             self.assertEqual(sessions[0]["sessionId"], "thread-1")
             self.assertEqual(sessions[0]["title"], "检查 xx_gg 目录")
             self.assertEqual(sessions[0]["cwd"], "/tmp/project")
+            self.assertNotIn("desktop-1", [item["sessionId"] for item in sessions])
+            self.assertNotIn("app-server-1", [item["sessionId"] for item in sessions])
 
             con = sqlite3.connect(str(home / "state_5.sqlite"))
             con.execute("update threads set archived = 1 where id = 'thread-1'")
@@ -56,6 +65,36 @@ class SessionDiscoveryTests(unittest.TestCase):
             self.assertEqual(list_codex_sessions({"name": "main", "codexHome": str(home)}), [])
             archived = list_codex_sessions({"name": "main", "codexHome": str(home)}, archived_only=True)
             self.assertEqual([item["sessionId"] for item in archived], ["thread-1"])
+
+    def test_codex_index_fallback_keeps_only_cli_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            home.joinpath("session_index.jsonl").write_text(
+                "\n".join([
+                    json.dumps({"id": "cli-1", "thread_name": "CLI 任务",
+                                "updated_at": "2026-05-20T00:00:00Z"}),
+                    json.dumps({"id": "desktop-1", "thread_name": "桌面任务",
+                                "updated_at": "2026-05-21T00:00:00Z"}),
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            sessions_dir = home / "sessions" / "2026" / "05" / "20"
+            sessions_dir.mkdir(parents=True)
+            for session_id, source in (("cli-1", "cli"), ("desktop-1", "vscode")):
+                sessions_dir.joinpath(f"rollout-{session_id}.jsonl").write_text(
+                    json.dumps({
+                        "type": "session_meta",
+                        "payload": {"session_id": session_id, "source": source,
+                                    "cwd": f"/tmp/{session_id}", "timestamp": "2026-05-19T00:00:00Z"},
+                    }) + "\n",
+                    encoding="utf-8",
+                )
+
+            sessions = list_codex_sessions({"name": "main", "codexHome": str(home)})
+
+            self.assertEqual([item["sessionId"] for item in sessions], ["cli-1"])
+            self.assertEqual(sessions[0]["source"], "cli")
+            self.assertEqual(sessions[0]["cwd"], "/tmp/cli-1")
 
     def test_list_claude_sessions_reads_meta_and_project_log(self):
         with tempfile.TemporaryDirectory() as tmp:

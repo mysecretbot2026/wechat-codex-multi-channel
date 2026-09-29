@@ -7,6 +7,7 @@ from pathlib import Path
 
 COMMAND_TAG_RE = re.compile(r"<command-[^>]+>.*?</command-[^>]+>", re.DOTALL)
 SPACE_RE = re.compile(r"\s+")
+CODEX_CLI_SOURCE_KINDS = ("cli", "exec")
 
 
 def expand_home(path):
@@ -55,16 +56,21 @@ def _codex_rows_from_sqlite(db_path, limit, include_archived=False, archived_onl
     con = sqlite3.connect(uri, uri=True, timeout=1)
     con.row_factory = sqlite3.Row
     try:
-        archived_clause = "where archived = 1" if archived_only else ("" if include_archived else "where archived = 0")
+        filters = [f"source in ({','.join('?' for _ in CODEX_CLI_SOURCE_KINDS)})"]
+        params = list(CODEX_CLI_SOURCE_KINDS)
+        if archived_only:
+            filters.append("archived = 1")
+        elif not include_archived:
+            filters.append("archived = 0")
         rows = con.execute(
             f"""
             select id, title, cwd, source, created_at, updated_at, archived
             from threads
-            {archived_clause}
+            where {' and '.join(filters)}
             order by updated_at desc
             limit ?
             """,
-            (int(limit or 50),),
+            (*params, int(limit or 50)),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -75,19 +81,50 @@ def _codex_rows_from_index(codex_home, limit):
     index_path = codex_home / "session_index.jsonl"
     if not index_path.exists():
         return []
-    rows = []
+    indexed = {}
     for line in index_path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             item = json.loads(line)
         except Exception:
             continue
+        session_id = item.get("id") or ""
+        if session_id:
+            indexed[session_id] = item
+
+    # session_index.jsonl does not record which client created a thread. When
+    # state_5.sqlite is unavailable, recover that field from session_meta rather
+    # than accidentally treating Desktop/VS Code sessions as CLI sessions.
+    metadata = {}
+    wanted = set(indexed)
+    for base in (codex_home / "sessions", codex_home / "archived_sessions"):
+        if not base.exists():
+            continue
+        for path in base.rglob("*.jsonl"):
+            try:
+                with path.open(encoding="utf-8", errors="replace") as handle:
+                    first = json.loads(handle.readline())
+            except Exception:
+                continue
+            if first.get("type") != "session_meta":
+                continue
+            payload = first.get("payload") or {}
+            session_id = payload.get("session_id") or payload.get("id") or ""
+            if session_id in wanted:
+                metadata[session_id] = payload
+
+    rows = []
+    for session_id, item in indexed.items():
+        meta = metadata.get(session_id) or {}
+        source = meta.get("source")
+        if source not in CODEX_CLI_SOURCE_KINDS:
+            continue
         rows.append(
             {
-                "id": item.get("id") or "",
+                "id": session_id,
                 "title": item.get("thread_name") or "",
-                "cwd": "",
-                "source": "index",
-                "created_at": 0,
+                "cwd": meta.get("cwd") or "",
+                "source": source,
+                "created_at": _parse_iso_epoch(meta.get("timestamp")),
                 "updated_at": _parse_iso_epoch(item.get("updated_at")),
                 "archived": 0,
             }

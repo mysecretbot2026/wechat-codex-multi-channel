@@ -107,6 +107,7 @@ class MultiWechatCodexService:
         self.monitor_accounts = set()
         self.monitor_disabled_accounts = set()
         self._model_options = None
+        self.desktop_model_options_cache = {}
         self._claude_model_options = None
 
     def _create_codex_runner(self, config):
@@ -350,7 +351,7 @@ class MultiWechatCodexService:
         active = self.state.get_active_workspace(base_conversation_key)
         workspace_key = self.state.workspace_conversation_key(base_conversation_key, active)
         first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
-        if not first.startswith("/") or first in {"/status", "/guide", "/interrupt", "/cancel", "/reset"}:
+        if not first.startswith("/") or first in {"/status", "/model", "/models", "/guide", "/interrupt", "/cancel", "/reset"}:
             return self._desktop_execution_key(workspace_key)
         return workspace_key
 
@@ -379,6 +380,8 @@ class MultiWechatCodexService:
         return self.state.workspace_conversation_key(base_key, active) == parent
 
     def _desktop_execution_key(self, workspace_key):
+        if self.DESKTOP_RUN_MARKER in workspace_key:
+            return workspace_key
         session = self._get_session(workspace_key)
         thread_id = session.get("codexThreadId") or ""
         if session.get("codexClient") != "desktop":
@@ -396,7 +399,6 @@ class MultiWechatCodexService:
             run_key, agent="codex", codexClient="desktop", codexThreadId=thread_id,
             codexAccount=account_name, cwd=session.get("cwd") or self.config["codex"]["workingDirectory"],
             desktopProjectId=session.get("desktopProjectId") or "",
-            codexModel="", codexReasoningEffort="",
             desktopPendingThread=bool(session.get("desktopPendingId")),
         )
         return run_key
@@ -413,6 +415,12 @@ class MultiWechatCodexService:
                 and not selected.get("codexThreadId")
                 and run_session.get("codexThreadId")):
             self.state.update_session(parent, codexThreadId=run_session["codexThreadId"], desktopPendingId="")
+            resolved_key = self._desktop_execution_key(parent)
+            self.state.update_session(
+                resolved_key, codexModel=run_session.get("codexModel") or "",
+                codexReasoningEffort=run_session.get("codexReasoningEffort") or "",
+                desktopModelOverride=run_session.get("desktopModelOverride") or {},
+            )
 
     @staticmethod
     def _can_run_without_conversation_lock(text):
@@ -631,11 +639,12 @@ class MultiWechatCodexService:
             self._handle_workspace_command(account, user_id, base_conversation_key, conversation_key, command)
             return
         if command == "/status":
+            conversation_key = self._desktop_execution_key(conversation_key)
             session = self._get_session(conversation_key)
             agent = resolve_session_agent(self.config, session)
             codex_account = resolve_session_codex_account(self.config, session)
             claude_account = resolve_session_claude_account(self.config, session)
-            model_selection = resolve_session_model(self.config, session)
+            model_selection = self._current_codex_model(conversation_key, session)
             claude_model = resolve_session_claude_model(self.config, session)
             workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
             session_id = session.get("claudeSessionId") if agent == "claude" else session.get("codexThreadId")
@@ -687,9 +696,13 @@ class MultiWechatCodexService:
                         f"codexRunner: {'desktop-app-server' if session.get('codexClient') == 'desktop' else self.config.get('codex', {}).get('runner') or 'exec'}",
                         f"codexModel: {model_selection.get('model') or 'default'}",
                         f"reasoning: {model_selection.get('reasoningEffort') or 'default'}",
-                        f"codexThreadId: {(session.get('codexThreadId') or '')[:12]}",
+                        f"codexThreadId: {session.get('codexThreadId') or '-'}",
                     ]
                 )
+                if model_selection.get("source"):
+                    lines.append(f"modelSource: {model_selection['source']}")
+                if model_selection.get("warning"):
+                    lines.append(f"modelWarning: {model_selection['warning']}")
             lines.append(
                 "accounts: "
                 + ", ".join(
@@ -1500,7 +1513,10 @@ class MultiWechatCodexService:
         running = self._desktop_running_context(thread_id)
         if action == "status":
             item["lastTurnStatus"] = self.desktop.last_turn_status(target_account, thread_id)
+            native_model = self.desktop.read(target_account, thread_id)
             lines = [f"{item['title']}", f"threadId: {thread_id}",
+                     f"codexModel: {native_model.get('model') or '未记录'}",
+                     f"reasoning: {native_model.get('reasoningEffort') or 'default'}",
                      f"状态: {self._desktop_status_text(item, bool(running))}",
                      f"最近更新: {format_session_time(item['updatedAt'])}",
                      "桌面窗口是否正在运行，当前连接无法确认。"]
@@ -2368,9 +2384,38 @@ class MultiWechatCodexService:
             "\n".join(lines),
         )
 
-    def _available_model_options(self):
+    def _current_codex_model(self, conversation_key, session):
+        if session.get("codexClient") != "desktop":
+            return resolve_session_model(self.config, session)
+        current = {"model": session.get("codexModel") or "",
+                   "reasoningEffort": session.get("codexReasoningEffort") or "",
+                   "source": "本地缓存（会话模型尚未确认）"}
+        thread_id = session.get("codexThreadId") or ""
+        if thread_id:
+            try:
+                native = self.desktop.read(resolve_session_codex_account(self.config, session), thread_id)
+                if native.get("model"):
+                    current.update(model=native["model"], reasoningEffort=native.get("reasoningEffort") or "",
+                                   source="会话设置（默认沿用）")
+                    self.state.update_session(conversation_key, codexModel=current["model"],
+                                              codexReasoningEffort=current["reasoningEffort"])
+                else:
+                    current["warning"] = "未读取到会话模型；续聊时由 Codex 解析，不使用微信全局模型覆盖。"
+            except Exception as err:
+                current["warning"] = f"读取会话模型失败：{err}；显示的是缓存设置。"
+        else:
+            current.update(model="", reasoningEffort="", source="新会话默认（启动时确定）")
+        override = session.get("desktopModelOverride") or {}
+        if override:
+            current.update(model=override.get("model") or "", reasoningEffort=override.get("reasoningEffort") or "",
+                           source="微信指定（下一轮生效，当前任务不变）")
+        return current
+
+    def _available_model_options(self, session=None):
         if self._model_options is not None:
             return self._model_options
+        if (session or {}).get("codexClient") == "desktop":
+            return self.desktop.model_options(resolve_session_codex_account(self.config, session))
         return model_options(self.config)
 
     def _available_claude_model_options(self, session=None):
@@ -2442,19 +2487,36 @@ class MultiWechatCodexService:
         return lines
 
     def _handle_model_switch(self, account, user_id, conversation_key, selector, list_only=False):
+        conversation_key = self._desktop_execution_key(conversation_key)
         session = self._get_session(conversation_key)
         agent = resolve_session_agent(self.config, session)
         if agent == "claude":
             self._handle_claude_model_switch(account, user_id, conversation_key, selector, list_only=list_only)
             return
+        desktop = session.get("codexClient") == "desktop"
+        if desktop and selector.lower() in {"auto", "default", "inherit"}:
+            self.state.update_session(conversation_key, desktopModelOverride={})
+            current = self._current_codex_model(conversation_key, self._get_session(conversation_key))
+            lines = ["已恢复自动沿用会话模型，不重置会话。",
+                     f"当前: {current.get('model') or 'default'}:{current.get('reasoningEffort') or 'default'}",
+                     "来源：" + current["source"]]
+            if current.get("warning"):
+                lines.append(current["warning"])
+            self._send_text(account, user_id, "\n".join(lines))
+            return
         try:
-            options = self._available_model_options()
+            options = self.desktop_model_options_cache.get(conversation_key) if desktop and selector.isdigit() else None
+            if options is None:
+                options = self._available_model_options(session)
+            if desktop and (not selector or list_only):
+                self.desktop_model_options_cache[conversation_key] = list(options)
         except Exception as exc:
             self._send_text(account, user_id, f"无法获取模型列表：{exc}")
             return
-        current = resolve_session_model(self.config, session)
+        current = self._current_codex_model(conversation_key, session)
         if not options:
-            self._send_text(account, user_id, "没有可用模型选项。可在 config.json 的 codex.modelOptions 中配置。")
+            self._send_text(account, user_id, "当前桌面账号未返回可用模型，请检查该账号登录状态。" if desktop else
+                            "没有可用模型选项。可在 config.json 的 codex.modelOptions 中配置。")
             return
         if list_only:
             self._send_text(
@@ -2476,6 +2538,11 @@ class MultiWechatCodexService:
                 ) else "-"
                 lines.append(f"{marker} {index}. {format_model_option(option)}")
             lines.extend(["", "切换：/model <编号或 model:reasoning>", "例如：/model 2 或 /model gpt-5.5:high"])
+            if desktop:
+                lines.extend(["来源：" + current["source"], "切换只影响下一轮，保留会话和历史；默认沿用会话上次设置。",
+                              "取消未生效的手动设置：/model auto"])
+                if current.get("warning"):
+                    lines.append(current["warning"])
             self._send_text(account, user_id, "\n".join(lines))
             return
         target = find_model_option(options, selector)
@@ -2486,7 +2553,15 @@ class MultiWechatCodexService:
             target.get("model") == current.get("model")
             and target.get("reasoningEffort") == current.get("reasoningEffort")
         ):
-            self._send_text(account, user_id, f"当前已在使用: {format_model_option(target)}")
+            label = "下一轮已设置为" if desktop and session.get("desktopModelOverride") else "当前已在使用"
+            self._send_text(account, user_id, f"{label}: {format_model_option(target)}")
+            return
+        if desktop:
+            self.state.update_session(conversation_key, desktopModelOverride={
+                "model": target.get("model") or "", "reasoningEffort": target.get("reasoningEffort") or "",
+            })
+            self._send_text(account, user_id, f"下一轮将使用 {format_model_option(target)}\n"
+                            "保留当前会话和历史，不重置；正在执行的任务不受影响。")
             return
         self.state.update_session(
             conversation_key,
@@ -2698,6 +2773,7 @@ class MultiWechatCodexService:
                 "/d-session 管理桌面会话；/d-account 选择桌面账号",
                 "/new-project <目录> 新建 CLI 工作区；/d-p-n <目录> 新建桌面原生项目",
                 "/ws 工作区；/agent 切换 Agent；/account 切换账号",
+                "/model 查看/切换模型；桌面会话用 /model auto 恢复自动沿用",
                 "/guide <内容> 引导；/interrupt 中断；/reset 重置",
                 "/help all 查看全部命令及归档、删除用法",
                 f"当前 bot accountId: {account_id}",
@@ -2732,6 +2808,7 @@ class MultiWechatCodexService:
                 "/codex-login status|cancel [账号名] 查看或取消设备码登录（adminUsers only）",
                 "/claude [编号|名称|next] 切到 Claude，可同时切账号",
                 "/model 查看或切换当前 Agent 的模型和 effort",
+                "桌面会话切模型不重置历史、下一轮生效；/model auto 恢复沿用会话设置",
                 "/runner 查看或切换 Codex exec/app-server runner",
                 "/cwd <path> 切换当前工作区工作目录",
                 "/ws 查看项目工作区",

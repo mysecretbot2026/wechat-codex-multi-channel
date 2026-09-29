@@ -10,10 +10,24 @@ from wechat_codex_multi.codex_models import (
     format_model_option,
     model_options,
     normalize_model_option,
+    resolve_session_model,
 )
 
 
 class CodexModelTests(unittest.TestCase):
+    def test_desktop_inherits_native_settings_not_stale_cache_or_global_defaults(self):
+        config = {"codex": {"model": "global-model", "reasoningEffort": "low"}}
+        session = {"codexClient": "desktop", "codexModel": "stale-model", "codexReasoningEffort": "high"}
+        self.assertEqual(resolve_session_model(config, session), {"model": "", "reasoningEffort": ""})
+        session["desktopModelOverride"] = {"model": "chosen-model", "reasoningEffort": "xhigh"}
+        self.assertEqual(resolve_session_model(config, session), session["desktopModelOverride"])
+
+    def test_bare_native_model_name_uses_advertised_default_effort(self):
+        options = [{"model": "gpt-test", "reasoningEffort": effort, "defaultReasoningEffort": "high"}
+                   for effort in ("low", "medium", "high")]
+        self.assertEqual(find_model_option(options, "gpt-test")["reasoningEffort"], "high")
+        self.assertEqual(find_model_option(options, "gpt-test:low")["reasoningEffort"], "low")
+
     def test_find_model_option_by_index_and_key(self):
         options = [
             {"model": "gpt-5.5", "reasoningEffort": "medium", "label": "GPT-5.5"},

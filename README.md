@@ -64,7 +64,7 @@ python3 -m wechat_codex_multi start
 | `claude.defaultAccount`、`claude.accounts` | 默认 Claude 账号和各账号的 `claudeConfigDir`；空路径使用系统默认登录态 |
 | `codex.model`、`codex.reasoningEffort` | Codex 默认模型和 reasoning 档位 |
 | `claude.model`、`claude.effort` | Claude 默认模型和 effort 档位 |
-| `codex.modelOptions`、`claude.modelOptions` | 固定微信中的可选模型列表；空数组时由 CLI 发现 |
+| `codex.modelOptions`、`claude.modelOptions` | 固定 CLI 路由的可选模型列表；空数组时由 CLI 发现。桌面路由按所选账号从 App Server 查询 |
 | `codex.modelDiscoveryTimeoutSeconds` | Codex 模型发现超时，默认 30 秒 |
 | `claude.modelDiscoveryTimeoutSeconds`、`modelDiscoveryCacheSeconds` | Claude 模型发现超时和缓存，默认 20 秒、0 秒 |
 | `codex.timeoutMs`、`claude.timeoutMs` | 单次任务超时，默认 2 小时 |
@@ -127,14 +127,19 @@ Claude 普通用量查询通过本机 Claude Code TUI 的 `/usage` 完成；组�
 | `/codex [编号|名称|next|prev]` | 切到 Codex，可同时选择 Codex 账号 |
 | `/claude [编号|名称|next|prev]` | 切到 Claude，可同时选择 Claude 账号 |
 | `/models`、`/model` | 查看当前 Agent 的模型选项与选择说明 |
-| `/model <编号|model:档位>` | 切换模型或 reasoning/effort，重置当前 Agent 会话 |
+| `/model <编号|model:档位>` | 切换模型或 reasoning/effort；桌面会话保留历史，从下一轮生效；CLI 路由重置当前 Agent 会话 |
+| `/model auto` | 桌面会话取消尚未生效的手动模型设置，恢复沿用会话自身设置；`default`、`inherit` 同义 |
 | `/runner [exec|app-server]` | 查看或临时切换 Codex runner |
 
 `/codex-use <名称>` 是旧版兼容命令，等价于 `/codex <名称>`。账号选择支持编号、完整名称和唯一前缀；切换账号会重置该 Agent 的会话 ID。切换 Agent 时，Codex 和 Claude 各自的会话 ID 分开保存。
 
-当 `modelOptions` 为空时，Codex 使用默认账号的 `CODEX_HOME` 调用 `codex debug models`；发现超时才退回内置列表。Claude 通过 CLI 的 stream-json 初始化协议发现模型；失败时会提示错误。模型清单取决于已安装的 CLI 和账号，README 不固定列出某个版本的清单。`/model <编号>` 中的编号以刚查询到的列表为准。
+当 `modelOptions` 为空时，Codex CLI 路由使用默认账号的 `CODEX_HOME` 调用 `codex debug models`；发现超时才退回内置列表。桌面路由使用当前所选会话账号的 App Server `model/list`，读取该账号实际返回的模型和逐模型推理档位；不会用 CLI 默认账号或内置旧列表替代。Claude 通过 CLI 的 stream-json 初始化协议发现模型；失败时会提示错误。模型清单取决于已安装的 CLI 和账号，README 不固定列出某个版本的清单。`/model <编号>` 中的编号以刚查询到的列表为准；桌面路由按当前会话最近一次显示的模型列表解释编号。桌面路由只写模型名、不写档位时，使用该模型返回的默认档位。
 
-Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不是独立模型。切换模型或档位会清空当前 Agent 的会话 ID，下次任务会开启新会话。
+选中 `/d-session` 后，`/status`、`/d-session status <编号>` 会只读原生会话的 `model` / `reasoningEffort`，不会为查询占用写锁。`/status` 还会显示完整会话 ID 和模型来源；若有手动设置，会标明“下一轮生效”。默认不覆盖原生会话模型，续聊沿用上次设置；即使后来在桌面改过模型，微信下一轮也跟随原生设置，而不是旧缓存。读取失败会明确提示缓存/未知，不把微信全局默认模型冒充为会话模型。
+
+桌面示例：先发 `/model` 查看当前模型及选项，再发 `/model 2` 或 `/model gpt-5.6-sol:xhigh`。手动设置只属于所选会话，在下一轮被接受后由 Codex 持久化；模型切换不清空会话 ID，也不打断当前运行。新建桌面项目/会话时也可先指定模型再发第一条任务。`/model auto` 仅取消未执行的手动设置，不会撤销已保存到会话的模型；完全没有历史的新会话使用 Codex 默认设置。
+
+Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不是独立模型。CLI 路由切换模型或档位仍会清空当前 Agent 的会话 ID，下次任务开启新会话；上述不重置行为仅适用于桌面路由。
 
 ### 工作区和会话
 
@@ -175,13 +180,21 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 
 `/d-p-n /Users/bot/Documents/demo` 通过 Codex App Server 的 `project/create` 创建桌面原生项目，以该目录作为项目根目录；目录不存在时先创建。同一路径已有桌面项目则直接选中。微信只保存当前选中的原生项目 ID、目录和会话 ID，不额外创建微信工作区。发送第一条任务时通过 `thread/start` 指定该项目 ID；任务结果发回微信，用户消息和 Codex 回复也写入桌面端同一会话。任务完成后，可在 `/d-sessions <项目编号>` 或桌面应用的该项目中查看、续聊。已有项目可用 `/d-project use <项目编号>` 切换，再发送任务创建新会话。`/d-new-project`、`/d-n-p` 与 `/d-p-n` 等价。
 
-`/sessions` 读取本机 CLI 会话数据，不请求模型。列表中的编号只对当前工作区最近一次查询有效；列出归档会话后，编号用于 `/session unarchive` 或 `/session delete`。`/session use` 在当前任务运行时会拒绝切换。Codex CLI 与桌面 Codex 共用本地会话库，因此归档和删除 Codex CLI 会话也会影响桌面端。Claude Code 没有原生归档命令；`/session archive` 对 Claude 只在本 Bot 的列表中隐藏会话，`/session unarchive` 可恢复显示，本机 Claude CLI 仍可找到它。删除 Claude 会话会移除该账号 `projects` 中对应的会话 JSONL 和 `usage-data/session-meta` 元数据；这不代表清除 Claude Code 的所有缓存或其他副本。
+`/sessions` 只读取本机 CLI 会话数据（Codex 的 `cli`/`exec` 来源与 Claude Code 会话），不混入桌面 Codex 会话，也不请求模型；桌面会话统一使用 `/d-sessions`。列表中的编号只对当前工作区最近一次查询有效；列出归档会话后，编号用于 `/session unarchive` 或 `/session delete`。`/session use` 在当前任务运行时会拒绝切换。Codex CLI 与桌面 Codex 共用底层本地会话库，但这里按来源分开展示；归档和删除同一个 Codex thread 仍会影响所有客户端。Claude Code 没有原生归档命令；`/session archive` 对 Claude 只在本 Bot 的列表中隐藏会话，`/session unarchive` 可恢复显示，本机 Claude CLI 仍可找到它。删除 Claude 会话会移除该账号 `projects` 中对应的会话 JSONL 和 `usage-data/session-meta` 元数据；这不代表清除 Claude Code 的所有缓存或其他副本。
 
-`/d-` 前缀表示桌面 Codex；旧版 `/desktop` 命令继续兼容。桌面命令通过同一 `CODEX_HOME` 的 Codex App Server 协议读写原生项目和会话。桌面应用与微信使用同一份本地项目、会话数据；桌面窗口可能需要刷新才能看到外部进程新建的项目或会话。`status` 显示最后保存的回合状态，只有本 Bot 发起的回合能显示实时运行状态并接受 `guide` 或 `interrupt`。普通 ChatGPT Chat/Work 对话不在此命令范围内。会话编号以最近一次 `/d-sessions` 列表为准；切换账号后需重新列出。归档和删除可能影响派生子会话；删除不可恢复。
+`/d-` 前缀表示桌面 Codex；旧版 `/desktop` 命令继续兼容。桌面命令通过同一 `CODEX_HOME` 的 Codex App Server 协议读写原生项目和会话。`/d-project use` 后第一条任务会携带原生 `projectId` 创建 thread，并立即写入会话名称，供桌面会话索引收录。桌面应用与微信使用同一份本地项目、会话数据；由于桌面窗口运行的是独立 App Server 进程，窗口已打开时仍可能需要切换项目或刷新一次，才会重新扫描外部进程刚创建的会话。`status` 显示最后保存的回合状态，只有本 Bot 发起的回合能显示实时运行状态并接受 `guide` 或 `interrupt`。普通 ChatGPT Chat/Work 对话不在此命令范围内。会话编号以最近一次 `/d-sessions` 列表为准；切换账号后需重新列出。归档和删除可能影响派生子会话；删除不可恢复。
 
 翻页示例：`/d-sessions all 2` 或 `/d-sessions page 2` 查看所有项目的第 2 页；`/d-sessions 3 2` 查看项目 3 的第 2 页。单独的 `/d-sessions 2` 表示“项目 2”，不是“第 2 页”。每页 20 条，第 2 页的编号从 21 开始；发送 `/d-session 21` 或 `/d-session use 21` 就能切到第 21 条。编号以最近一次列表为准，列表末尾会给出上一页和下一页命令。
 
 同一微信用户可以在桌面会话 A 执行期间用 `/d-session use` 切到 B，并向 B 发起另一个任务。各会话独立运行；后台会话完成时暂不主动发送结果。每次成功切换桌面会话，微信都会重发该会话最近一次完整的文字回答，帮助接上进度。若新任务仍在运行，会同时标明“正在执行中”和“上一条完整回答”；任务结束后切回，会显示新结果。回顾消息只发送文字，不重复执行媒体发送动作。当前选中的会话完成时会直接回复微信；`/d-session view` 只读取指定会话的最新结果，不回放历史回合。
+
+#### 微信与桌面的会话占用
+
+Codex 同一会话只能由一个 App Server 进程持有写锁。微信现在为每轮任务使用独立执行进程，在回复、失败、取消或超时后关闭该进程，释放原生会话占用；下一条消息重新恢复同一个会话，不另建会话。列表和历史查询使用独立的共享连接，不会因任务结束而中断；其他会话的运行也不受影响。引导和中断只发送给该任务的执行进程。超时与 `/interrupt` 保留原会话，只有显式重置才清空选择。
+
+不能只依赖 `thread/unsubscribe`：它取消事件订阅，但当前协议允许线程在无订阅后继续驻留 30 分钟，写锁不会立即释放（[官方协议说明](https://learn.chatgpt.com/docs/app-server#unsubscribe-from-a-loaded-thread)）。任务完成后关闭独立执行进程可避免这个等待。此模式以单轮任务为生命周期，不适合依赖 App Server 长期驻留的自主目标或后台执行任务。
+
+若微信提示 `active writer`，表示另一客户端仍持有该会话。请先在占用端结束任务并关闭该会话；若仍有占用，结束其他任务后退出占用端应用再重试，无需删除或归档会话。微信不会强抢桌面的写锁，也不会用新会话替代所选会话。桌面显示“已在另一个应用中打开”时，应等微信任务结束后重新打开该会话；旧版服务遗留的占用需在任务结束后发送 `/restart` 释放并加载新代码。
 
 ### 运行中的任务
 

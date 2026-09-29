@@ -3,6 +3,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from wechat_codex_multi.codex_app_server import AppTurnState
 from wechat_codex_multi.desktop_codex import DesktopCodexCatalog, project_for_thread
@@ -66,17 +67,24 @@ class FakeDesktop:
         self.result_text = "最终回答"
         self.turn_id = "turn-latest"
         self.previous_result_text = "旧回答"
+        self.models = [{"model": "gpt-test", "reasoningEffort": effort, "defaultReasoningEffort": "high"}
+                       for effort in ("low", "high")]
         self.thread = {
             "id": "thread-1234567890", "title": "设计随行助手", "cwd": "/tmp/project",
             "projectId": "project-1",
             "updatedAt": 100, "lastTurnStatus": "completed", "runtimeStatus": "notLoaded",
             "archived": False,
+            "model": "gpt-native", "reasoningEffort": "xhigh",
         }
 
         self.project_list = [{"id": "project-1", "name": "手机控制助手", "roots": ["/tmp/project"]}]
 
     def projects(self, account):
         return [dict(project) for project in self.project_list]
+
+    def model_options(self, account):
+        self.calls.append(("model/list", account["name"]))
+        return list(self.models)
 
     def create_project(self, account, name, cwd, idempotency_key):
         project = {"id": f"project-{len(self.project_list) + 1}", "name": name, "roots": [cwd]}
@@ -97,7 +105,8 @@ class FakeDesktop:
                 {"type": "agentMessage", "phase": "commentary", "text": "处理中"},
                 {"type": "agentMessage", "phase": "final_answer", "text": "最终回答"},
             ]}]}
-        return {"id": thread_id, "turns": []}
+        return {"id": thread_id, "turns": [], "model": self.thread.get("model"),
+                "reasoningEffort": self.thread.get("reasoningEffort")}
 
     def latest_result(self, account, thread_id):
         completed = self.thread["lastTurnStatus"] == "completed"
@@ -139,6 +148,21 @@ def make_config(tmp):
 
 
 class DesktopCatalogTests(unittest.TestCase):
+    def test_native_model_menu_reads_all_pages_and_filters_hidden(self):
+        runner = FakeRunner()
+        first = {"data": [{"model": "gpt-test", "displayName": "Test", "defaultReasoningEffort": "high",
+                           "supportedReasoningEfforts": [{"reasoningEffort": "low"}, {"reasoningEffort": "high"}]},
+                          {"model": "hidden", "hidden": True}], "nextCursor": "next"}
+        second = {"data": [{"model": "gpt-other", "defaultReasoningEffort": "medium"}], "nextCursor": None}
+        account = {"name": "backup", "codexHome": "/tmp/backup"}
+        with patch.object(runner, "request_for_account", side_effect=[first, second]) as request:
+            options = DesktopCodexCatalog(runner).model_options(account)
+        self.assertEqual([(o["model"], o["reasoningEffort"]) for o in options],
+                         [("gpt-test", "low"), ("gpt-test", "high"), ("gpt-other", "medium")])
+        self.assertEqual(options[0]["defaultReasoningEffort"], "high")
+        self.assertTrue(all(call.args[0] == account and call.args[1] == "model/list" for call in request.call_args_list))
+        self.assertEqual(request.call_args_list[1].args[2]["cursor"], "next")
+
     def test_project_uses_longest_matching_root(self):
         projects = [
             {"id": "a", "roots": ["/tmp/project"]},
@@ -206,6 +230,96 @@ class DesktopCommandTests(unittest.TestCase):
     def command(self, text):
         self.service._handle_message(self.account, "user-1", self.key, text)
         return self.sent[-1]
+
+    def select_desktop_thread(self):
+        self.command("/d-sessions all")
+        self.command("/d-session 1")
+        return self.service._desktop_execution_key(self.key)
+
+    def test_status_reads_native_model_and_full_thread_id_without_resuming(self):
+        run_key = self.select_desktop_thread()
+        self.service.config["codex"].update(model="wrong-global", reasoningEffort="low")
+        self.service.state.update_session(run_key, codexModel="stale-cache")
+        status = self.command("/status")
+        self.assertIn("codexModel: gpt-native", status)
+        self.assertIn("reasoning: xhigh", status)
+        self.assertIn("codexThreadId: " + self.fake.thread["id"], status)
+        self.assertIn("默认沿用", status)
+        self.fake.thread.update(model="desktop-changed", reasoningEffort="medium")
+        self.assertIn("codexModel: desktop-changed", self.command("/status"))
+        self.assertIn("codexModel: desktop-changed", self.command("/d-session status 1"))
+        self.assertNotIn("thread/resume", [call[0] for call in self.fake.calls])
+
+    def test_model_switch_preserves_thread_and_survives_route_refresh(self):
+        run_key = self.select_desktop_thread()
+        self.assertEqual(self.service._conversation_key_for_text(self.key, "/model 2"), run_key)
+        self.assertEqual(self.service._conversation_key_for_text(self.key, "/models"), run_key)
+        self.assertIn("当前: gpt-native:xhigh", self.command("/model"))
+        self.assertIn("下一轮将使用 gpt-test:high", self.command("/model 2"))
+        for text in ("/status", "第二轮任务"):
+            self.assertEqual(self.service._conversation_key_for_text(self.key, text), run_key)
+        selected = self.service._get_session(run_key)
+        self.assertEqual(selected["codexThreadId"], self.fake.thread["id"])
+        self.assertEqual(selected["desktopModelOverride"], {"model": "gpt-test", "reasoningEffort": "high"})
+        self.assertIn("codexModel: gpt-test", self.command("/status"))
+        self.assertIn("下一轮生效", self.sent[-1])
+        self.assertIn("恢复自动沿用", self.command("/model auto"))
+        self.assertEqual(self.service._get_session(run_key)["desktopModelOverride"], {})
+        self.assertIn("codexModel: gpt-native", self.command("/status"))
+
+    def test_model_number_uses_last_displayed_menu_and_invalid_choice_changes_nothing(self):
+        run_key = self.select_desktop_thread()
+        self.command("/models")
+        self.fake.models.reverse()
+        self.command("/model 1")
+        self.assertEqual(self.service._get_session(run_key)["desktopModelOverride"]["reasoningEffort"], "low")
+        self.assertIn("未知模型选项", self.command("/model gpt-test:invalid"))
+        self.assertEqual(self.service._get_session(run_key)["desktopModelOverride"]["reasoningEffort"], "low")
+
+    def test_model_override_is_isolated_between_selected_threads(self):
+        first_id = self.fake.thread["id"]
+        first_key = self.select_desktop_thread()
+        self.command("/model gpt-test:high")
+        self.fake.thread["id"] = "other-thread"
+        second_key = self.select_desktop_thread()
+        self.assertFalse(self.service._get_session(second_key).get("desktopModelOverride"))
+        self.command("/model gpt-test:low")
+        self.fake.thread["id"] = first_id
+        self.assertEqual(self.select_desktop_thread(), first_key)
+        self.assertEqual(self.service._get_session(first_key)["desktopModelOverride"]["reasoningEffort"], "high")
+
+    def test_pending_new_thread_preserves_model_and_promotes_it(self):
+        self.command("/d-projects")
+        self.command("/d-project use 1")
+        pending_key = self.service._desktop_execution_key(self.key)
+        self.command("/model gpt-test:high")
+        expected = {"model": "gpt-test", "reasoningEffort": "high"}
+        self.assertEqual(self.service._get_session(pending_key)["desktopModelOverride"], expected)
+        self.service.state.update_session(pending_key, codexThreadId="new-native-thread", codexModel="gpt-test",
+                                          codexReasoningEffort="high")
+        self.service._promote_pending_desktop_thread(pending_key)
+        new_key = self.service._desktop_execution_key(self.key)
+        self.assertEqual(self.service._get_session(new_key)["desktopModelOverride"], expected)
+        self.assertEqual(self.service._get_session(new_key)["codexModel"], "gpt-test")
+
+    def test_model_read_failure_is_explicit_and_auto_works_without_model_list(self):
+        run_key = self.select_desktop_thread()
+        self.command("/status")
+        self.command("/model gpt-test:high")
+        with patch.object(self.fake, "read", side_effect=RuntimeError("read failed")), \
+                patch.object(self.fake, "model_options", side_effect=RuntimeError("list failed")):
+            status = self.command("/status")
+            self.assertIn("codexModel: gpt-test", status)
+            self.assertIn("读取会话模型失败", status)
+            self.assertIn("恢复自动沿用", self.command("/model auto"))
+        self.assertFalse(self.service._get_session(run_key)["desktopModelOverride"])
+
+    def test_model_menu_uses_selected_desktop_account(self):
+        self.service.config["codex"]["accounts"].append({"name": "backup", "codexHome": self.tmp.name + "/backup"})
+        self.command("/d-account backup")
+        self.select_desktop_thread()
+        self.command("/models")
+        self.assertIn(("model/list", "backup"), self.fake.calls)
 
     def test_short_desktop_commands(self):
         self.assertIn("手机控制助手", self.command("/d-projects"))
