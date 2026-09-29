@@ -1236,6 +1236,7 @@ class MultiWechatCodexService:
             "/d-session off 退出桌面 App Server 路由",
             "旧版 /desktop 命令仍可使用。",
             "项目和会话存入桌面 Codex 的本地数据；任务结果同时回传微信。",
+            "每次切换会话都会重发最近一次完整文字回答；运行中会同时提示状态。",
             "列表状态是最后保存的回合状态；桌面窗口实时运行状态无法由独立 App Server 确认。",
         ])
 
@@ -1307,22 +1308,27 @@ class MultiWechatCodexService:
         return ""
 
     def _send_desktop_selected_result(self, account, user_id, run_key, title, latest, running=False):
+        lines = [f"已切换：{title}"]
         if running or latest["status"] == "inProgress":
-            self._send_text(account, user_id, f"已切换：{title}\n正在执行中")
-            return
-        last_error = self._desktop_latest_error(run_key, latest)
-        if last_error:
-            self._send_text(account, user_id, f"已切换：{title}\n最新任务失败：{last_error}")
-            return
-        if latest["status"] == "completed" and latest["text"]:
-            self._deliver_agent_output(
-                account, user_id, run_key,
-                f"已切换：{title}\n最新结果：\n{latest['text']}",
-                turn_id=latest["turnId"],
-            )
-            return
-        self._send_text(account, user_id,
-            f"已切换：{title}\n{self._desktop_status_text({'lastTurnStatus': latest['status']})}")
+            lines.append("正在执行中")
+        else:
+            last_error = self._desktop_latest_error(run_key, latest)
+            if last_error:
+                lines.append(f"最新任务失败：{last_error}")
+            elif latest["status"] != "completed" or not latest.get("text"):
+                lines.append(self._desktop_status_text({"lastTurnStatus": latest["status"]}))
+        answer = latest.get("lastAnswerText") or latest.get("text") or ""
+        if answer:
+            cleaned, actions = extract_actions(answer)
+            cleaned = markdown_to_plain_text(cleaned)
+            label = ("最新结果" if latest["status"] == "completed"
+                     and latest.get("lastAnswerTurnId", latest.get("turnId")) == latest.get("turnId")
+                     and not running else "上一条完整回答")
+            if cleaned:
+                lines.extend([f"{label}：", cleaned])
+            elif actions:
+                lines.append(f"{label}仅包含媒体，切换时不重复发送附件。")
+        self._send_text(account, user_id, "\n".join(lines))
 
     @staticmethod
     def _desktop_status_text(item, bot_running=False):

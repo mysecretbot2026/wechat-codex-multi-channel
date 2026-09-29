@@ -13,6 +13,15 @@ from wechat_codex_multi.state import StateStore
 class FakeServer:
     def __init__(self):
         self.requests = []
+        self.turns = [
+            {"id": "old", "status": "completed", "items": [
+                {"type": "agentMessage", "phase": "final_answer", "text": "旧结果"},
+            ]},
+            {"id": "new", "status": "completed", "items": [
+                {"type": "agentMessage", "phase": "commentary", "text": "过程"},
+                {"type": "agentMessage", "phase": "final_answer", "text": "最新完整结果"},
+            ]},
+        ]
 
     def request(self, method, params=None, timeout_s=30):
         self.requests.append((method, params or {}))
@@ -22,15 +31,7 @@ class FakeServer:
         if method == "project/create":
             return {"project": {"id": "p2", "name": params["name"], "roots": params["roots"]}}
         if method == "thread/read":
-            return {"thread": {"turns": [
-                {"id": "old", "status": "completed", "items": [
-                    {"type": "agentMessage", "phase": "final_answer", "text": "旧结果"},
-                ]},
-                {"id": "new", "status": "completed", "items": [
-                    {"type": "agentMessage", "phase": "commentary", "text": "过程"},
-                    {"type": "agentMessage", "phase": "final_answer", "text": "最新完整结果"},
-                ]},
-            ]}}
+            return {"thread": {"turns": self.turns}}
         if method == "thread/list":
             if (params or {}).get("cursor"):
                 return {"data": [{"id": "thread-2", "cwd": "/tmp/b", "preview": "second",
@@ -64,6 +65,7 @@ class FakeDesktop:
         self.calls = []
         self.result_text = "最终回答"
         self.turn_id = "turn-latest"
+        self.previous_result_text = "旧回答"
         self.thread = {
             "id": "thread-1234567890", "title": "设计随行助手", "cwd": "/tmp/project",
             "projectId": "project-1",
@@ -98,7 +100,14 @@ class FakeDesktop:
         return {"id": thread_id, "turns": []}
 
     def latest_result(self, account, thread_id):
-        return {"status": self.thread["lastTurnStatus"], "text": self.result_text, "turnId": self.turn_id}
+        completed = self.thread["lastTurnStatus"] == "completed"
+        return {
+            "status": self.thread["lastTurnStatus"],
+            "text": self.result_text if completed else "",
+            "turnId": self.turn_id,
+            "lastAnswerText": self.result_text if completed else self.previous_result_text,
+            "lastAnswerTurnId": self.turn_id if completed else "turn-old",
+        }
 
     def last_turn_status(self, account, thread_id):
         return self.thread["lastTurnStatus"]
@@ -155,7 +164,19 @@ class DesktopCatalogTests(unittest.TestCase):
             }))
             self.assertEqual(catalog.latest_result(account, "thread-1"), {
                 "status": "completed", "text": "最新完整结果", "turnId": "new",
+                "lastAnswerText": "最新完整结果", "lastAnswerTurnId": "new",
             })
+
+    def test_running_turn_keeps_last_completed_answer_for_switch_recap(self):
+        runner = FakeRunner()
+        runner.server.turns[-1] = {"id": "running", "status": "inProgress", "items": [
+            {"type": "userMessage", "content": [{"type": "text", "text": "新任务"}]},
+        ]}
+        catalog = DesktopCodexCatalog(runner)
+        self.assertEqual(catalog.latest_result({"name": "main", "codexHome": "/tmp"}, "thread-1"), {
+            "status": "inProgress", "text": "", "turnId": "running",
+            "lastAnswerText": "旧结果", "lastAnswerTurnId": "old",
+        })
 
     def test_unmaterialized_thread_has_no_result_yet(self):
         catalog = DesktopCodexCatalog(EmptyThreadRunner())
@@ -163,6 +184,7 @@ class DesktopCatalogTests(unittest.TestCase):
         self.assertEqual(catalog.last_turn_status(account, "new-thread"), "unknown")
         self.assertEqual(catalog.latest_result(account, "new-thread"), {
             "status": "unknown", "text": "", "turnId": "",
+            "lastAnswerText": "", "lastAnswerTurnId": "",
         })
 
 
@@ -409,10 +431,22 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertEqual(len(self.sent), sent_before)
 
         self.command("/desktop chats all")
-        self.assertIn("正在执行中", self.command("/desktop use 1"))
+        running_recap = self.command("/desktop use 1")
+        self.assertIn("正在执行中", running_recap)
+        self.assertIn("上一条完整回答：\n最终回答", running_recap)
         context.finish("completed")
         self.command("/desktop use 2")
         self.assertIn("最新结果：\n最终回答", self.command("/desktop use 1"))
+
+    def test_switch_resends_latest_text_without_replaying_media_action(self):
+        self.fake.result_text = "本轮结论\n[[send_file:/tmp/summary.pdf]]"
+        self.service._api_for_account = lambda account: self.fail("切换会话不应重新发送媒体")
+        self.command("/d-sessions all")
+        first = self.command("/d-session use 1")
+        second = self.command("/d-session use 1")
+        self.assertEqual(first, second)
+        self.assertIn("最新结果：\n本轮结论", second)
+        self.assertNotIn("send_file", second)
 
     def test_current_thread_sends_only_full_latest_final_result(self):
         self.command("/desktop chats all")

@@ -175,26 +175,40 @@ class DesktopCodexCatalog:
         return result.get("thread") or {}
 
     def latest_result(self, account, thread_id):
+        empty = {"status": "unknown", "text": "", "turnId": "",
+                 "lastAnswerText": "", "lastAnswerTurnId": ""}
         try:
             thread = self.read(account, thread_id, include_turns=True)
         except Exception as error:
             if _is_unmaterialized_thread_error(error):
-                return {"status": "unknown", "text": "", "turnId": ""}
+                return empty
             raise
         turns = thread.get("turns") or []
         if not turns:
-            return {"status": "unknown", "text": "", "turnId": ""}
+            return empty
         turn = turns[-1]
-        final_text = ""
-        for item in turn.get("items") or []:
-            if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
-                value = item.get("text")
-                if isinstance(value, str) and value.strip():
-                    final_text = value.strip()
+        last_answer_text = ""
+        last_answer_turn_id = ""
+        answer_is_latest = False
+        for candidate in reversed(turns):
+            if candidate.get("status") != "completed":
+                continue
+            for item in reversed(candidate.get("items") or []):
+                if item.get("type") == "agentMessage" and item.get("phase") == "final_answer":
+                    value = item.get("text")
+                    if isinstance(value, str) and value.strip():
+                        last_answer_text = value.strip()
+                        last_answer_turn_id = candidate.get("id") or ""
+                        answer_is_latest = candidate is turn
+                        break
+            if last_answer_text:
+                break
         return {
             "status": turn.get("status") or "unknown",
-            "text": final_text,
+            "text": last_answer_text if answer_is_latest else "",
             "turnId": turn.get("id") or "",
+            "lastAnswerText": last_answer_text,
+            "lastAnswerTurnId": last_answer_turn_id,
         }
 
     def last_turn_status(self, account, thread_id):
