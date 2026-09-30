@@ -74,6 +74,12 @@ python3 -m wechat_codex_multi start
 | `concurrency.maxWorkers`、`commandWorkers` | 普通任务与命令任务的线程数，默认 4、2 |
 | `concurrency.perConversationSerial` | 是否串行处理同一工作区，默认 `true` |
 | `state.saveDebounceMs` | 状态文件写入防抖时间，默认 1000 毫秒 |
+| `updates.timeoutSeconds` | 每条更新命令超时，默认 900 秒 |
+| `updates.cliCommand`、`desktopCommand` | 可选的本机更新命令 argv 数组；空数组时自动识别安装方式 |
+| `updates.desktopAppPath` | 可选的 macOS 桌面 App 路径；必须是 `com.openai.codex`，支持 Codex.app 和该应用改名后的 ChatGPT.app，普通独立 ChatGPT App 暂不支持 |
+| `updates.desktopVersionCommand` | 可选的桌面版本查询 argv 数组；其他系统使用自定义更新命令时必须配置 |
+| `updates.desktopMethod` | 桌面更新方式：`native`（默认，App 内置菜单）、`auto`（按 App 运行状态选择）、`installer`（安装包） |
+| `updates.desktopUpdateMenuTitles` | 可选的内置更新菜单标题数组；默认匹配英文和简繁中文的“检查更新”，支持其他界面语言 |
 | `media.maxFileBytes`、`maxConcurrentTransfers` | 单文件发送上限与媒体传输并发数 |
 | `media.generators` | 可选的外部图片、视频等媒体生成命令 |
 | `allowedUsers`、`adminUsers` | 可访问用户与管理员的微信 `userId` 列表 |
@@ -100,6 +106,70 @@ python3 -m wechat_codex_multi start
 ## 微信命令
 
 命令由服务直接处理，不会作为普通提示发给 LLM。以下命令都在与 Bot 的聊天中发送。
+
+### 更新 Codex CLI 和桌面 App
+
+这些命令完全由本机执行，不创建 Agent 回合，不消耗模型 token。微信中仅 `adminUsers` 可用；它们更新的是服务配置选中的本机程序，与当前工作区、登录账号和所选 Agent 无关。`/help` 显示常用更新命令，`/help all` 和 `/update` 显示完整用法、支持范围及授权要求。
+
+| 命令 | 作用 |
+| --- | --- |
+| `/update` | 显示更新命令帮助 |
+| `/update cli`、`/codex-update` | 后台更新 Codex CLI，完成后发送结果 |
+| `/update desktop`、`/d-update` | macOS 上调用桌面 Codex App 自带“检查更新”；需先打开 App 并授予辅助功能权限，无需先退出，回报触发结果 |
+| `/update cli check`、`/update desktop check` | 只查看已安装版本、程序路径和更新方式，不下载或安装 |
+| `/update status` | 查看两种程序的最近更新结果及日志路径 |
+| `/update cli status`、`/update desktop status` | 查看指定程序的最近更新结果 |
+
+快捷命令也接受 `check` 和 `status`，例如 `/codex-update check`、`/d-update status`。`check` 用于预览本机更新方案，不查询远端最新版本。开始更新的通知只代表已启动。安装包更新的最终结果以退出码、更新后的版本查询及 `/update status` 为准；内置菜单方式仅报告“已触发内置更新”，不把检查请求冒充为安装成功。之后查询 `/update status`，检测到更高的已安装 App 构建号时才显示“更新完成”；没有版本变化时仍显示尚未确认安装完成。
+
+终端命令使用相同实现，无需微信账号或模型登录；实际更新会等待完成，失败返回非零退出码：
+
+```bash
+python3 -m wechat_codex_multi update cli --check
+python3 -m wechat_codex_multi update cli
+python3 -m wechat_codex_multi update desktop --check
+python3 -m wechat_codex_multi update desktop
+python3 -m wechat_codex_multi update status
+python3 -m wechat_codex_multi update --help
+```
+
+也可用 `npm run update:codex`、`npm run update:desktop`，追加 `-- --check` 可预览。自定义配置继续使用全局 `--config` 参数或 `WECHAT_CODEX_MULTI_CONFIG`。
+
+CLI 自动更新支持 npm 全局包和 Homebrew 的 `codex` cask/formula，根据 `codex.bin` 指向的实际文件识别安装来源。若同时安装多份，只更新配置选中的程序；npm 的全局目录不匹配、独立安装器安装或手动安装时，会要求配置 `updates.cliCommand`，不会偷偷另装一份。npm 使用 `npm install -g @openai/codex@latest`；Homebrew 先更新索引，再升级对应的 cask/formula。官方方式见 [Codex CLI 文档](https://learn.chatgpt.com/docs/codex/cli)。
+
+macOS 桌面更新默认调用 App 自带的“检查更新”，微信只需发送 `/update desktop`，终端只需运行 `python3 -m wechat_codex_multi update desktop`，通常无需指定 `native` 或 `--method`。它通过 macOS 原生辅助功能接口读取菜单并触发对应条目，使用应用自身更新器；App 未运行时会提示先打开，不自动改用安装包。
+
+支持范围由应用标识决定：目前仅识别 `com.openai.codex`，包括 Codex.app 以及该应用改名后的 ChatGPT.app。普通独立 ChatGPT App（例如标识为 `com.openai.chat`）暂不支持，不能只凭文件名判断兼容性。默认在当前用户的 `~/Applications` 和系统 `/Applications` 中查找，也可从 `codex.desktopBin` 确定应用位置；特殊安装位置或检测到多份 App 时，需配置 `updates.desktopAppPath`。
+
+内置更新无需先退出应用，最终是否需要确认下载、安装或重启，按 App 自己的提示处理。微信服务不点击“安装并重启”，不关闭应用，也不把未变化的版本报告成已升级。它可与 Codex 任务同时运行，不关闭服务中的 App Server。App 实际更新后，可重启微信服务，让后续桌面请求使用更新后的程序。
+
+需要原有安装包方式时，可配置 `updates.desktopMethod: "installer"`；`auto` 则在 App 运行时走内置更新、未运行时走安装包。安装包方式优先使用拥有当前 App 的 Homebrew cask，否则使用 [OpenAI 官方安装包](https://learn.chatgpt.com/docs/enterprise/manage-app-updates)。这些高级方式仍支持终端 `--method` 参数和旧微信命令，日常无需指定方式。
+
+自动点击菜单需要 macOS 辅助功能权限，部署到每台 Mac 后都要单独授权：
+
+1. 打开“系统设置 → 隐私与安全性 → 辅助功能”。
+2. 为运行服务的 Python（launchd 部署时）或终端（终端启动时）开启权限。缺少权限的报错会显示当前 Python 路径；若列表里没有它，可用 Finder 的“前往文件夹”定位该路径，将实际可执行文件加入列表。若路径是符号链接，应选择其指向的实际文件。
+3. macOS 要求验证身份时，在系统窗口中完成。管理员身份不等于已经获得辅助功能授权；本项目不提供自动授予权限的命令。
+4. 授权后重启微信服务，再发送 `/update desktop`；也可直接在 App 菜单中选择“检查更新”。
+
+此方式使用系统原生 API，无需给 System Events 添加自动化权限，不依赖额外 GUI 工具、应用私有 IPC、固定用户名、Python 安装位置或 App 版本。默认匹配英文和简繁中文菜单；其他界面语言可配置 `updates.desktopUpdateMenuTitles`，值为菜单标题字符串数组，按应用实际显示的文字填写。应用未来若更改菜单结构或更新入口，可能需要调整实现；企业策略禁用内置更新时，以 App 提示为准。
+
+安装包方式需先完全退出桌面 App，服务不会主动关闭它。直接安装包方式会验证 Apple 信任链、OpenAI 开发者签名和应用标识，比较构建号后复制到临时目录，再替换原位置；替换失败恢复旧 App，不降级，不修改账号和会话数据。Homebrew 管理的 App 采用 Homebrew 自身的安装流程。
+
+同一 `stateDir` 下的终端更新和微信更新共用文件锁。CLI 和桌面安装包更新与 Codex 任务互斥；这类更新期间拒绝新的 Codex 任务，Claude 任务可继续。更新成功后微信服务关闭空闲的 Codex App Server 并清除模型缓存，后续请求启动新程序。内置菜单请求使用独立的请求锁，可在 Codex 任务运行时发起。外部独立运行的 CLI 进程不在微信服务的任务锁范围内。日志和结果存入 `stateDir/updates/`，服务重启后仍可查询。安装包更新期间应等待最终结果再重启服务；服务退出会中断更新流程，已启动的安装命令可能继续运行。在 macOS/Linux 上该命令继承更新锁，结束前不会允许另一轮更新；未记录成功结果时不会报告更新完成。
+
+本实现不依赖本机 skill、个人脚本、固定用户名、安装前缀或 launchd。其他安装方式可在本机配置明确的 argv 数组，例如使用独立 npm 前缀：
+
+```json
+{
+  "codex": {"bin": "/your/npm-prefix/bin/codex"},
+  "updates": {
+    "cliCommand": ["npm", "install", "-g", "--prefix", "/your/npm-prefix", "@openai/codex@latest"]
+  }
+}
+```
+
+桌面更新内置流程面向 macOS。Windows、Linux 或企业软件分发可配置 `updates.desktopCommand` 和 `updates.desktopVersionCommand`，由管理员填写适用于本机的更新、版本查询程序；macOS 也可覆盖默认方式。命令以 argv 直接启动，默认不经过 shell，不接受微信用户传入任意命令；确需 shell 时须在本机配置中显式指定解释器。服务不自动提权，目录权限或更新命令错误会写入日志并返回失败。
 
 ### 状态和用量
 

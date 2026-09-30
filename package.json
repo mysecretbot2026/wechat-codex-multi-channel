@@ -6,6 +6,8 @@
     "start": "python3 -m wechat_codex_multi start",
     "setup": "python3 -m wechat_codex_multi add-account",
     "status": "python3 -m wechat_codex_multi status",
+    "update:codex": "python3 -m wechat_codex_multi update cli",
+    "update:desktop": "python3 -m wechat_codex_multi update desktop",
     "deploy:macos": "./scripts/deploy_macos.sh"
   },
   "dependencies": {

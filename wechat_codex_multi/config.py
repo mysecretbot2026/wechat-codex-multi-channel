@@ -66,6 +66,15 @@ DEFAULT_CONFIG = {
     "state": {
         "saveDebounceMs": 1000,
     },
+    "updates": {
+        "timeoutSeconds": 900,
+        "cliCommand": [],
+        "desktopCommand": [],
+        "desktopVersionCommand": [],
+        "desktopAppPath": "",
+        "desktopMethod": "native",
+        "desktopUpdateMenuTitles": [],
+    },
     "media": {
         "enabled": True,
         "maxFileBytes": 52_428_800,

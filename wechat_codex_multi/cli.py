@@ -6,6 +6,7 @@ from pathlib import Path
 from . import logging as log
 from .config import PROJECT_DIR, load_config
 from .codex_accounts import default_codex_account
+from .codex_update import CodexUpdateManager, format_update_result, make_update_plan
 from .claude_usage import format_claude_admin_usage, read_claude_admin_usage
 from .login import login_with_qr
 from .media_outbox import queue_media
@@ -135,6 +136,20 @@ def media_send(args):
         print(f"queued {action['kind']}: {action['path']}")
 
 
+def update_codex(args):
+    config = load_config(args.config)
+    manager = CodexUpdateManager(config)
+    if args.target == "status" or args.status:
+        print(manager.status("" if args.target == "status" else args.target))
+    elif args.check:
+        print(make_update_plan(config, args.target, args.method).describe())
+    else:
+        result = manager.run(args.target, desktop_method=args.method) if args.method else manager.run(args.target)
+        print(format_update_result(result))
+        if result["status"] not in {"success", "requested"}:
+            raise SystemExit(1)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="wechat-codex-multi")
     parser.add_argument("--config", help="配置文件路径，默认 ./config.json")
@@ -167,6 +182,25 @@ def main(argv=None):
 
     p = sub.add_parser("status", help="查看本地状态")
     p.set_defaults(func=status)
+
+    p = sub.add_parser(
+        "update", help="更新本机 Codex CLI 或触发桌面内置更新，不调用模型",
+        description="更新已安装的 Codex CLI，或调用桌面 App 自带的“检查更新”；不调用模型，不消耗 token。",
+        epilog=(
+            "桌面默认调用内置更新菜单，通常无需指定 --method。\n"
+            "内置更新仅支持 macOS，需先打开 App 并给运行命令的 Python 或终端授予辅助功能权限。\n"
+            "支持应用标识 com.openai.codex 的 Codex.app 或 ChatGPT.app；普通独立 ChatGPT App 暂不支持。\n"
+            "触发检查不代表安装完成；下载、安装和重启按 App 提示操作。\n"
+            "其他系统的桌面更新需配置 updates.desktopCommand 和 desktopVersionCommand。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("target", choices=["cli", "desktop", "status"], help="CLI 更新、桌面更新，或查看两种程序的最近更新结果")
+    p.add_argument("--method", choices=["auto", "native", "installer"], default="", help="覆盖桌面更新配置：自动选择、内置菜单、安装包；通常无需指定")
+    flags = p.add_mutually_exclusive_group()
+    flags.add_argument("--check", action="store_true", help="只预览已安装版本和更新方式，不查询最新版本，不安装")
+    flags.add_argument("--status", action="store_true", help="查看该目标最近一次更新结果")
+    p.set_defaults(func=update_codex)
 
     p = sub.add_parser("claude-usage", help="通过 Anthropic Admin API 查看 Claude API 用量")
     p.add_argument("--days", type=int, default=7, help="查询最近 N 天，接口日粒度最大 31 天")

@@ -1,4 +1,5 @@
 import concurrent.futures
+import contextlib
 import os
 import re
 import threading
@@ -49,6 +50,7 @@ from .codex_device_login import CodexDeviceLoginManager, cached_email, login_sta
 from .desktop_codex import DesktopCodexCatalog, project_for_thread
 from .codex_models import find_model_option, format_model_option, model_options, resolve_session_model
 from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
+from .codex_update import CodexUpdateManager, UPDATE_HELP, format_update_result, make_update_plan, parse_update_command
 from .config import PROJECT_DIR
 from .login import login_with_qr, render_qr_png
 from .media import send_local_media
@@ -84,6 +86,7 @@ class MultiWechatCodexService:
         )
         self.desktop = DesktopCodexCatalog(self.codex.runner_for("desktop"))
         self.codex_device_login = CodexDeviceLoginManager(config["codex"].get("bin") or "codex")
+        self.updates = CodexUpdateManager(config)
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(config.get("concurrency", {}).get("maxWorkers") or 4)
         )
@@ -462,6 +465,9 @@ class MultiWechatCodexService:
             "/d-project",
             "/cwd",
             "/runner",
+            "/update",
+            "/codex-update",
+            "/d-update",
             "/restart",
         }
 
@@ -620,6 +626,9 @@ class MultiWechatCodexService:
     def _handle_message(self, account, user_id, base_conversation_key, text, conversation_key=None):
         conversation_key = conversation_key or base_conversation_key
         command = text.strip()
+        if command and command.split(maxsplit=1)[0] in {"/update", "/codex-update", "/d-update"}:
+            self._handle_update_command(account, user_id, command)
+            return
         if command == "/help" or command == "/help all":
             self._send_text(account, user_id, self._help_text(account["accountId"], full=command.endswith(" all")))
             return
@@ -919,7 +928,45 @@ class MultiWechatCodexService:
         self._run_codex_and_reply(account, user_id, conversation_key, text)
         self._run_pending_guidance(account, user_id, conversation_key)
 
+    def _handle_update_command(self, account, user_id, command):
+        if not self._is_admin(user_id):
+            self._send_text(account, user_id, "只有 adminUsers 可以通过微信使用 Codex 更新命令。")
+            return
+        try:
+            target, action = parse_update_command(command)
+            if action == "help":
+                self._send_text(account, user_id, UPDATE_HELP)
+            elif action == "status":
+                self._send_text(account, user_id, self.updates.status(target))
+            elif action == "check":
+                self._send_text(account, user_id, make_update_plan(self.config, target).describe())
+            else:
+                self.updates.start(
+                    target,
+                    on_started=lambda text: self._send_text(account, user_id, text),
+                    on_complete=lambda result: self._send_text(account, user_id, format_update_result(result)),
+                    on_updated=self._refresh_codex_after_update,
+                    desktop_method=action if action in {"native", "installer"} else "",
+                )
+        except Exception as err:
+            self._send_text(account, user_id, str(err))
+
+    def _refresh_codex_after_update(self):
+        # Close idle App Servers so subsequent requests launch the new binary.
+        for agent in ["codex", "desktop"]:
+            runner = self.codex.runners.get(agent)
+            if runner:
+                runner.terminate_all()
+        self._model_options = None
+        self.desktop_model_options_cache.clear()
+
     def _run_codex_and_reply(self, account, user_id, conversation_key, text):
+        agent = resolve_session_agent(self.config, self._get_session(conversation_key))
+        guard = self.updates.agent_run() if agent == "codex" else contextlib.nullcontext()
+        with guard:
+            self._run_codex_and_reply_locked(account, user_id, conversation_key, text)
+
+    def _run_codex_and_reply_locked(self, account, user_id, conversation_key, text):
         if self.DESKTOP_RUN_MARKER in conversation_key:
             thread_id = self._get_session(conversation_key).get("codexThreadId") or ""
             running = self._desktop_running_context(thread_id) if thread_id else None
@@ -2775,6 +2822,9 @@ class MultiWechatCodexService:
                 "/ws 工作区；/agent 切换 Agent；/account 切换账号",
                 "/model 查看/切换模型；桌面会话用 /model auto 恢复自动沿用",
                 "/guide <内容> 引导；/interrupt 中断；/reset 重置",
+                "/update cli 更新 Codex CLI；/update desktop 触发桌面内置更新（管理员，不消耗 token）",
+                "桌面内置更新仅 macOS，需先打开 App 并授予辅助功能权限；最终安装按 App 提示操作",
+                "/update 查看更新用法；/update status 查看结果及日志",
                 "/help all 查看全部命令及归档、删除用法",
                 f"当前 bot accountId: {account_id}",
             ])
@@ -2810,6 +2860,7 @@ class MultiWechatCodexService:
                 "/model 查看或切换当前 Agent 的模型和 effort",
                 "桌面会话切模型不重置历史、下一轮生效；/model auto 恢复沿用会话设置",
                 "/runner 查看或切换 Codex exec/app-server runner",
+                UPDATE_HELP,
                 "/cwd <path> 切换当前工作区工作目录",
                 "/ws 查看项目工作区",
                 "/ws add <名称> <路径> 添加项目工作区",
