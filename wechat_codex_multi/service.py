@@ -1098,7 +1098,7 @@ class MultiWechatCodexService:
                 "/session new [codex|claude] 新建当前工作区会话",
                 "/sessions archived [codex|claude|all] 查看归档会话",
                 "/session archive|unarchive <编号> 归档或恢复（管理员）",
-                "/session delete <编号> 预览删除，再加 confirm 确认（管理员）",
+                "/session delete <编号|ID前缀> [更多编号或前缀] 预览批量删除，再加 confirm 确认（管理员）",
             ]
         )
 
@@ -1185,7 +1185,7 @@ class MultiWechatCodexService:
         self._send_text(account, user_id, self._session_help_text())
 
     @staticmethod
-    def _delete_claude_session_files(claude_account, session_id):
+    def _claude_session_files(claude_account, session_id):
         if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id or ""):
             raise ValueError("无效的 Claude 会话 ID。")
         base = Path(claude_account.get("claudeConfigDir") or "~/.claude").expanduser().resolve()
@@ -1195,27 +1195,18 @@ class MultiWechatCodexService:
         for path in existing:
             if base not in path.resolve().parents or not path.is_file():
                 raise ValueError("Claude 会话文件路径异常，已停止删除。")
+        return existing
+
+    @staticmethod
+    def _delete_claude_session_files(claude_account, session_id):
+        existing = MultiWechatCodexService._claude_session_files(claude_account, session_id)
         for path in existing:
             path.unlink()
         return len(existing)
 
-    def _manage_cli_session(self, account, user_id, conversation_key, action, rest):
-        if not self._is_admin(user_id):
-            raise ValueError("归档、恢复和删除仅限 adminUsers。")
-        parts = rest.split()
-        if (not parts or len(parts) > 2
-                or (len(parts) == 2 and (action != "delete" or parts[1].lower() != "confirm"))):
-            raise ValueError(f"用法：/session {action} <编号|sessionId前缀>" + (" [confirm]" if action == "delete" else ""))
-        item, error = self._find_cached_session(conversation_key, parts[0])
-        if error:
-            raise ValueError(error)
+    def _session_operation_account(self, item, action):
         session_id = item["sessionId"]
         account_name = item["account"]
-        archived = bool(item.get("archived"))
-        if action == "archive" and archived:
-            raise ValueError("该会话已经归档。")
-        if action == "unarchive" and not archived:
-            raise ValueError("该会话未归档。")
         if action != "unarchive":
             with self.state.lock:
                 refs = [(key, value) for key, value in self.state.state["sessions"].items()
@@ -1231,43 +1222,132 @@ class MultiWechatCodexService:
                 raise ValueError("该会话可能正在运行，请先结束任务。")
         else:
             target_account = get_claude_account(self.config, account_name)
-        if action == "delete" and len(parts) == 1:
-            self.session_delete_pending[conversation_key] = {
-                "agent": item["agent"], "account": account_name, "sessionId": session_id,
-                "expires": time.monotonic() + 60,
-            }
-            self._send_text(account, user_id,
-                f"即将永久删除：{item['title']}\n{session_id}\n60 秒内发送 /session delete {parts[0]} confirm 确认。")
+        return target_account
+
+    def _delete_session_batch(self, account, user_id, conversation_key, rest, desktop=False):
+        if not self._is_admin(user_id):
+            raise ValueError("归档、恢复和删除仅限 adminUsers。")
+        command = "/d-session delete" if desktop else "/session delete"
+        list_command = "/d-sessions all" if desktop else "/sessions all"
+        pending_cache = self.desktop_delete_pending if desktop else self.session_delete_pending
+        selection_cache = self.desktop_thread_cache if desktop else self.session_selection_cache
+        parts = rest.split()
+        confirmed = bool(parts and parts[-1].lower() == "confirm")
+        selectors = parts[:-1] if confirmed else parts
+        if not selectors or any(value.lower() == "confirm" for value in selectors):
+            raise ValueError(f"用法：{command} <编号|ID前缀> [更多编号或前缀] [confirm]。")
+        if not confirmed:
+            pending_cache.pop(conversation_key, None)
+
+        # Resolve the whole batch before deleting anything. Deduplicate by full
+        # identity so repeated numbers and ID prefixes never delete twice.
+        items, identities = [], set()
+        for selector in selectors:
+            if desktop:
+                item = dict(self._desktop_thread_selector(conversation_key, selector),
+                            agent="codex")
+                item["sessionId"] = item["id"]
+            else:
+                item, error = self._find_cached_session(conversation_key, selector)
+                if error:
+                    raise ValueError(error)
+                item = dict(item)
+            identity = (item["agent"], item["account"], item["sessionId"])
+            if identity not in identities:
+                identities.add(identity)
+                items.append(item)
+        if confirmed:
+            pending = pending_cache.pop(conversation_key, None) or {}
+            if (identities != set(pending.get("targets") or [])
+                    or time.monotonic() > pending.get("expires", 0)):
+                raise ValueError(f"删除确认已失效或所选会话发生变化；请重新发送 {command} <会话编号>。")
+
+        targets = []
+        for item in items:
+            try:
+                target_account = self._session_operation_account(item, "delete")
+                if item["agent"] == "claude" and not self._claude_session_files(target_account, item["sessionId"]):
+                    raise ValueError("没有找到可删除的 Claude 会话文件。")
+            except Exception as error:
+                raise ValueError(f"{item.get('title') or item['sessionId']}：{error}") from error
+            targets.append((item, target_account))
+        if not confirmed:
+            pending_cache[conversation_key] = {"targets": list(identities), "expires": time.monotonic() + 60}
+            lines = [f"即将永久删除 {len(items)} 条会话："]
+            for item in items:
+                lines.append(f"{item['agent']}:{item['account']} {item.get('title') or 'untitled'}\n{item['sessionId']}")
+            if any(item["agent"] == "codex" for item in items):
+                lines.append("Codex 派生子会话也会被删除。")
+            lines.append(f"60 秒内发送 {command} {' '.join(selectors)} confirm 确认。")
+            self._send_text(account, user_id, "\n".join(lines))
             return
+
+        deleted = []
+        try:
+            for item, target_account in targets:
+                try:
+                    if item["agent"] == "codex":
+                        self.desktop.delete(target_account, item["sessionId"])
+                        self.state.clear_codex_thread(item["sessionId"], item["account"])
+                    else:
+                        if not self._delete_claude_session_files(target_account, item["sessionId"]):
+                            raise ValueError("没有找到可删除的 Claude 会话文件。")
+                        self.state.set_claude_archived(item["account"], item["sessionId"], False)
+                        self.state.clear_claude_session(item["sessionId"], item["account"])
+                except Exception as error:
+                    if len(items) == 1:
+                        raise
+                    lines = [f"批量删除中断：已完成 {len(deleted)}/{len(items)} 条。"]
+                    lines.extend(f"已永久删除：{value.get('title') or value['sessionId']}（{value['sessionId']}）" for value in deleted)
+                    lines.append(f"处理失败：{item.get('title') or item['sessionId']}（{item['sessionId']}）：{error}")
+                    lines.append(f"后续 {len(items) - len(deleted) - 1} 条未执行；请重新发送 {list_command} 查看后再删除。")
+                    self._send_text(account, user_id, "\n".join(lines))
+                    return
+                deleted.append(item)
+        finally:
+            selection_cache.pop(conversation_key, None)
+        if len(deleted) == 1:
+            message = f"已永久删除：{deleted[0].get('title') or 'untitled'}"
+        else:
+            message = f"已永久删除 {len(deleted)} 条会话：\n" + "\n".join(
+                f"{item.get('title') or 'untitled'}（{item['sessionId']}）" for item in deleted)
+        self._send_text(account, user_id, message + f"\n请重新发送 {list_command} 查看最新编号。")
+
+    def _manage_cli_session(self, account, user_id, conversation_key, action, rest):
         if action == "delete":
-            pending = self.session_delete_pending.get(conversation_key) or {}
-            if (pending.get("agent") != item["agent"] or pending.get("account") != account_name
-                    or pending.get("sessionId") != session_id or time.monotonic() > pending.get("expires", 0)):
-                raise ValueError("删除确认已失效；请重新发送 /session delete <会话编号>。")
+            self._delete_session_batch(account, user_id, conversation_key, rest)
+            return
+        if not self._is_admin(user_id):
+            raise ValueError("归档、恢复和删除仅限 adminUsers。")
+        parts = rest.split()
+        if len(parts) != 1:
+            raise ValueError(f"用法：/session {action} <编号|sessionId前缀>")
+        item, error = self._find_cached_session(conversation_key, parts[0])
+        if error:
+            raise ValueError(error)
+        session_id = item["sessionId"]
+        account_name = item["account"]
+        archived = bool(item.get("archived"))
+        if action == "archive" and archived:
+            raise ValueError("该会话已经归档。")
+        if action == "unarchive" and not archived:
+            raise ValueError("该会话未归档。")
+        target_account = self._session_operation_account(item, action)
         if item["agent"] == "codex":
             if action == "archive":
                 self.desktop.archive(target_account, session_id)
                 self.state.clear_codex_thread(session_id, account_name)
             elif action == "unarchive":
                 self.desktop.unarchive(target_account, session_id)
-            else:
-                self.desktop.delete(target_account, session_id)
-                self.state.clear_codex_thread(session_id, account_name)
         else:
             if action == "archive":
                 self.state.set_claude_archived(account_name, session_id, True)
                 self.state.clear_claude_session(session_id, account_name)
             elif action == "unarchive":
                 self.state.set_claude_archived(account_name, session_id, False)
-            else:
-                removed = self._delete_claude_session_files(target_account, session_id)
-                if not removed:
-                    raise ValueError("没有找到可删除的 Claude 会话文件。")
-                self.state.set_claude_archived(account_name, session_id, False)
-                self.state.clear_claude_session(session_id, account_name)
         self.session_selection_cache.pop(conversation_key, None)
         self.session_delete_pending.pop(conversation_key, None)
-        self._send_text(account, user_id, f"已{'归档' if action == 'archive' else '恢复' if action == 'unarchive' else '永久删除'}：{item['title']}")
+        self._send_text(account, user_id, f"已{'归档' if action == 'archive' else '恢复'}：{item['title']}")
 
     def _desktop_account(self, conversation_key):
         session = self._get_session(conversation_key)
@@ -1292,7 +1372,7 @@ class MultiWechatCodexService:
             "/d-session guide <编号> <内容> 引导本 Bot 发起的运行",
             "/d-session interrupt <编号> 打断本 Bot 发起的运行",
             "/d-session archive|unarchive <编号> 归档或恢复（管理员）",
-            "/d-session delete <编号> 删除预览；再加 confirm 确认（管理员）",
+            "/d-session delete <编号|ID前缀> [更多编号或前缀] 预览批量删除；再加 confirm 确认（管理员）",
             "/d-session off 退出桌面 App Server 路由",
             "旧版 /desktop 命令仍可使用。",
             "项目和会话存入桌面 Codex 的本地数据；任务结果同时回传微信。",
@@ -1552,6 +1632,9 @@ class MultiWechatCodexService:
             return
         if action not in {"view", "status", "use", "guide", "interrupt", "archive", "unarchive", "delete"}:
             raise ValueError(f"未知桌面会话操作：{action}。切换请用 /d-session <编号>；查看帮助发送 /d-session。")
+        if action == "delete":
+            self._delete_session_batch(account, user_id, conversation_key, " ".join(parts[1:]), desktop=True)
+            return
         if len(parts) < 2:
             raise ValueError(f"用法：/d-session {action} <会话编号>。先发送 /d-sessions all。")
         item = self._desktop_thread_selector(conversation_key, parts[1])
@@ -1630,25 +1713,6 @@ class MultiWechatCodexService:
             self.desktop.unarchive(target_account, thread_id)
             self.desktop_thread_cache.pop(conversation_key, None)
             self._send_text(account, user_id, f"已恢复：{item['title']}")
-            return
-        if action == "delete":
-            pending = self.desktop_delete_pending.get(conversation_key) or {}
-            confirmed = len(parts) >= 3 and parts[2].lower() == "confirm"
-            if not confirmed:
-                self.desktop_delete_pending[conversation_key] = {
-                    "threadId": thread_id, "account": target_account["name"], "expires": time.monotonic() + 60,
-                }
-                self._send_text(account, user_id,
-                    f"即将永久删除：{item['title']}\n{thread_id}\n派生子会话也会被删除。60 秒内发送 /d-session delete {parts[1]} confirm 确认。")
-                return
-            if (pending.get("threadId") != thread_id or pending.get("account") != target_account["name"]
-                    or time.monotonic() > pending.get("expires", 0)):
-                raise ValueError("删除确认已失效；请重新发送 /d-session delete <会话编号>。")
-            self.desktop.delete(target_account, thread_id)
-            self.desktop_delete_pending.pop(conversation_key, None)
-            self.state.clear_codex_thread(thread_id, target_account["name"])
-            self.desktop_thread_cache.pop(conversation_key, None)
-            self._send_text(account, user_id, f"已永久删除：{item['title']}")
             return
 
     @staticmethod
@@ -2816,6 +2880,7 @@ class MultiWechatCodexService:
                 "常用命令：",
                 "/status 状态；/active 运行中的任务",
                 "/sessions [codex|claude|all] CLI 会话；/session 管理 CLI 会话",
+                "/session delete 3 4 5 批量删除预览；60 秒内再加 confirm 确认（管理员）",
                 "/d-projects 桌面项目；/d-sessions all 2 查看会话第 2 页",
                 "/d-session 管理桌面会话；/d-account 选择桌面账号",
                 "/new-project <目录> 新建 CLI 工作区；/d-p-n <目录> 新建桌面原生项目",
@@ -2843,11 +2908,13 @@ class MultiWechatCodexService:
                 "/d-p-n <目录> 新建并切换桌面原生项目（/d-new-project、/d-n-p）",
                 "/sessions archived [codex|claude|all] 查看 CLI 归档会话",
                 "/session use|new|archive|unarchive|delete 管理 CLI 会话（/session 看用法）",
+                "/session delete 3 4 5 批量删除预览；60 秒内发送 /session delete 3 4 5 confirm（管理员）",
                 "/d-projects 查看桌面项目；/d-sessions [all|项目编号] [页码] 查看会话",
                 "/d-sessions page <页码> 查看全部项目指定页；/d-session <编号> 快速切换",
                 "/d-project use <编号> 切换已有桌面项目并准备新会话",
                 "/d-sessions archived [all|项目编号] [页码] 查看桌面归档会话",
                 "/d-session new 在当前桌面项目新建会话；/d-session 查看其他操作；/d-account [账号] 选择桌面账号",
+                "/d-session delete 3 4 5 桌面批量删除预览；再加 confirm 确认（管理员）",
                 "桌面项目和会话使用 Codex 原生数据；任务结果回传微信。",
                 "/agents 查看可用 Agent",
                 "/agent <codex|claude> 切换当前工作区使用的 CLI",

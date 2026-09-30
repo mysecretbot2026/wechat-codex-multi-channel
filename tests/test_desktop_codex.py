@@ -505,6 +505,225 @@ class DesktopCommandTests(unittest.TestCase):
             self.command("/session delete 1")
         self.assertTrue(log.exists())
 
+    def cache_delete_batch(self, desktop):
+        self.fake.calls.clear()
+        self.service.session_selection_cache.clear()
+        self.service.desktop_thread_cache.clear()
+        self.service.session_delete_pending.clear()
+        self.service.desktop_delete_pending.clear()
+        items = [dict(self.fake.thread, id=f"thread-{index}", sessionId=f"thread-{index}",
+                      title=f"会话{index}", agent="codex", account="main") for index in range(1, 6)]
+        cache = self.service.desktop_thread_cache if desktop else self.service.session_selection_cache
+        cache[self.key] = items
+        pending = self.service.desktop_delete_pending if desktop else self.service.session_delete_pending
+        return ("/d-session delete" if desktop else "/session delete"), cache, pending
+
+    def test_batch_delete_previews_all_targets_and_clears_only_deleted_refs(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, cache, pending = self.cache_delete_batch(desktop)
+                for index in range(1, 6):
+                    self.service.state.update_session(f"{self.key}:ref-{index}",
+                        codexThreadId=f"thread-{index}", codexAccount="main")
+                preview = self.command(f"{command} 3 4 5")
+                self.assertIn("即将永久删除 3 条会话", preview)
+                self.assertIn(f"{command} 3 4 5 confirm", preview)
+                for index in (3, 4, 5):
+                    self.assertIn(f"thread-{index}", preview)
+                self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+                result = self.command(f"{command} 3 4 5 confirm")
+                self.assertIn("已永久删除 3 条会话", result)
+                self.assertEqual([call[1] for call in self.fake.calls if call[0] == "delete"],
+                                 ["thread-3", "thread-4", "thread-5"])
+                self.assertNotIn(self.key, cache)
+                self.assertNotIn(self.key, pending)
+                for index in range(1, 6):
+                    expected = "" if index in (3, 4, 5) else f"thread-{index}"
+                    self.assertEqual(self.service._get_session(f"{self.key}:ref-{index}")["codexThreadId"], expected)
+
+    def test_batch_delete_deduplicates_ids_and_accepts_reordered_confirmation(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, _, _ = self.cache_delete_batch(desktop)
+                self.assertIn("即将永久删除 2 条会话", self.command(f"{command} 3 thread-3 4 3"))
+                self.command(f"{command} 4 3 confirm")
+                self.assertEqual([call[1] for call in self.fake.calls if call[0] == "delete"],
+                                 ["thread-4", "thread-3"])
+
+    def test_batch_delete_requires_preview_of_the_entire_same_set(self):
+        for desktop in (False, True):
+            for preview in (None, "1", "1 2 3", "2 3"):
+                with self.subTest(desktop=desktop, preview=preview):
+                    command, _, _ = self.cache_delete_batch(desktop)
+                    if preview:
+                        self.command(f"{command} {preview}")
+                    with self.assertRaisesRegex(ValueError, "删除确认已失效"):
+                        self.command(f"{command} 1 2 confirm")
+                    self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_rejects_expired_confirmation(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, _, pending = self.cache_delete_batch(desktop)
+                self.command(f"{command} 1 2")
+                pending[self.key]["expires"] = 0
+                with self.assertRaisesRegex(ValueError, "删除确认已失效"):
+                    self.command(f"{command} 1 2 confirm")
+                self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_does_not_follow_changed_list_numbers(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, cache, _ = self.cache_delete_batch(desktop)
+                self.command(f"{command} 1 2")
+                cache[self.key].reverse()
+                with self.assertRaisesRegex(ValueError, "所选会话发生变化"):
+                    self.command(f"{command} 1 2 confirm")
+                self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_confirmation_is_bound_to_the_account(self):
+        self.service.config["codex"]["accounts"].append({"name": "backup", "codexHome": self.tmp.name + "/backup"})
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, cache, _ = self.cache_delete_batch(desktop)
+                self.command(f"{command} 1 2")
+                cache[self.key][1]["account"] = "backup"
+                with self.assertRaisesRegex(ValueError, "所选会话发生变化"):
+                    self.command(f"{command} 1 2 confirm")
+                self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_rejects_invalid_targets_and_malformed_confirmation(self):
+        for desktop in (False, True):
+            for args in ("", "confirm", "1 99", "1 missing-id", "1 thread", "1 confirm 2", "1 2 confirm extra"):
+                with self.subTest(desktop=desktop, args=args):
+                    command, _, pending = self.cache_delete_batch(desktop)
+                    with self.assertRaises(ValueError):
+                        self.command(f"{command} {args}".strip())
+                    self.assertNotIn(self.key, pending)
+                    self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_checks_running_targets_at_preview_and_confirmation(self):
+        for desktop in (False, True):
+            for confirming in (False, True):
+                with self.subTest(desktop=desktop, confirming=confirming):
+                    command, _, _ = self.cache_delete_batch(desktop)
+                    if confirming:
+                        self.command(f"{command} 3 4 5")
+                    status = lambda account, thread_id: "inProgress" if thread_id == "thread-4" else "completed"
+                    with patch.object(self.fake, "last_turn_status", side_effect=status):
+                        with self.assertRaisesRegex(ValueError, "正在运行"):
+                            self.command(f"{command} 3 4 5" + (" confirm" if confirming else ""))
+                    self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_rejects_running_cli_refs_even_for_desktop_commands(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, _, _ = self.cache_delete_batch(desktop)
+                self.service.state.update_session(f"{self.key}:running", codexThreadId="thread-4", codexAccount="main")
+                with patch.object(self.service.codex, "is_running", side_effect=lambda key: key.endswith(":running")):
+                    with self.assertRaisesRegex(ValueError, "正在运行"):
+                        self.command(f"{command} 3 4 5")
+                self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_batch_delete_stops_and_reports_partial_failure(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, cache, pending = self.cache_delete_batch(desktop)
+                self.command(f"{command} 3 4 5")
+                def delete(account, thread_id):
+                    if thread_id == "thread-4":
+                        raise RuntimeError("delete failed")
+                    self.fake.calls.append(("delete", thread_id))
+                with patch.object(self.fake, "delete", side_effect=delete) as request:
+                    result = self.command(f"{command} 3 4 5 confirm")
+                self.assertIn("已完成 1/3 条", result)
+                self.assertIn("已永久删除：会话3（thread-3）", result)
+                self.assertIn("处理失败：会话4（thread-4）：delete failed", result)
+                self.assertIn("后续 1 条未执行", result)
+                self.assertEqual([call.args[1] for call in request.call_args_list], ["thread-3", "thread-4"])
+                self.assertNotIn(self.key, cache)
+                self.assertNotIn(self.key, pending)
+
+    def test_batch_delete_requires_admin_for_preview_and_confirmation(self):
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                self.service.config["adminUsers"] = ["user-1"]
+                command, _, _ = self.cache_delete_batch(desktop)
+                self.command(f"{command} 1 2")
+                self.service.config["adminUsers"] = []
+                for suffix in ("", " confirm"):
+                    with self.assertRaisesRegex(ValueError, "仅限 adminUsers"):
+                        self.command(f"{command} 1 2{suffix}")
+                self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_cli_batch_delete_mixes_codex_and_claude_and_removes_metadata(self):
+        command, cache, _ = self.cache_delete_batch(False)
+        files = []
+        for index in (4, 5):
+            session_id = f"claude-{index}"
+            cache[self.key][index - 1].update(agent="claude", sessionId=session_id)
+            for path in (Path(self.tmp.name) / "projects" / "example" / f"{session_id}.jsonl",
+                         Path(self.tmp.name) / "usage-data" / "session-meta" / f"{session_id}.json"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+                files.append(path)
+            self.service.state.set_claude_archived("main", session_id, True)
+            self.service.state.update_session(f"{self.key}:claude-{index}", claudeSessionId=session_id, claudeAccount="main")
+        preview = self.command(f"{command} 3 4 5")
+        self.assertIn("codex:main", preview)
+        self.assertIn("claude:main", preview)
+        self.assertTrue(all(path.exists() for path in files))
+        self.assertIn("已永久删除 3 条会话", self.command(f"{command} 3 4 5 confirm"))
+        self.assertEqual([call[1] for call in self.fake.calls if call[0] == "delete"], ["thread-3"])
+        self.assertFalse(any(path.exists() for path in files))
+        self.assertEqual(self.service.state.archived_claude_ids("main"), set())
+        for index in (4, 5):
+            self.assertEqual(self.service._get_session(f"{self.key}:claude-{index}")["claudeSessionId"], "")
+
+    def test_cli_batch_delete_preflights_missing_claude_files(self):
+        command, cache, _ = self.cache_delete_batch(False)
+        cache[self.key][3].update(agent="claude", sessionId="missing-claude")
+        with self.assertRaisesRegex(ValueError, "没有找到可删除"):
+            self.command(f"{command} 3 4 5")
+        self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_cli_batch_delete_checks_all_files_again_before_confirmation(self):
+        command, cache, _ = self.cache_delete_batch(False)
+        cache[self.key][3].update(agent="claude", sessionId="claude-4")
+        path = Path(self.tmp.name) / "projects" / "example" / "claude-4.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("{}\n", encoding="utf-8")
+        self.command(f"{command} 3 4 5")
+        path.unlink()
+        with self.assertRaisesRegex(ValueError, "没有找到可删除"):
+            self.command(f"{command} 3 4 5 confirm")
+        self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_cli_batch_delete_preflights_claude_files_outside_account(self):
+        command, cache, _ = self.cache_delete_batch(False)
+        cache[self.key][3].update(agent="claude", sessionId="claude-link")
+        with tempfile.TemporaryDirectory() as outside:
+            target = Path(outside) / "session.jsonl"
+            target.write_text("{}\n", encoding="utf-8")
+            link = Path(self.tmp.name) / "projects" / "example" / "claude-link.jsonl"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "路径异常"):
+                self.command(f"{command} 3 4 5")
+            self.assertTrue(target.exists())
+        self.assertFalse(any(call[0] == "delete" for call in self.fake.calls))
+
+    def test_legacy_desktop_batch_delete_and_single_target_still_work(self):
+        self.cache_delete_batch(True)
+        self.command("/desktop delete 3 4 5")
+        self.assertIn("已永久删除 3 条会话", self.command("/desktop delete 3 4 5 confirm"))
+        for desktop in (False, True):
+            with self.subTest(desktop=desktop):
+                command, _, _ = self.cache_delete_batch(desktop)
+                self.command(f"{command} 3")
+                self.assertIn("已永久删除：会话3", self.command(f"{command} 3 confirm"))
+                self.assertEqual([call[1] for call in self.fake.calls if call[0] == "delete"], ["thread-3"])
+
     def test_project_chat_number_and_desktop_continuation_route(self):
         self.assertIn("手机控制助手", self.command("/desktop projects"))
         self.fake.thread["lastTurnStatus"] = "interrupted"

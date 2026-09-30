@@ -229,7 +229,7 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 | `/session use <编号|sessionId前缀>` | 将当前工作区切换到指定会话 |
 | `/session new [codex|claude]` | 新建当前工作区的 CLI 会话 |
 | `/session archive|unarchive <编号|sessionId前缀>` | 归档或恢复 CLI 会话，仅管理员可用 |
-| `/session delete <编号|sessionId前缀>` | 预览永久删除；60 秒内再加 `confirm` 确认，仅管理员可用 |
+| `/session delete <编号或sessionId前缀> [更多编号或前缀]` | 预览单个或批量永久删除；60 秒内在同一命令末尾加 `confirm` 确认，仅管理员可用 |
 | `/d-projects` | 列出当前 Codex 账号的桌面原生项目 |
 | `/d-project use <项目编号>` | 切换已有桌面项目，并准备新会话 |
 | `/d-sessions [all|项目编号] [页码]` | 列出全部项目或指定项目的 Codex 会话，20 条一页 |
@@ -240,7 +240,7 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 | `/d-session new` | 在当前桌面项目准备一个全新的会话 |
 | `/d-session guide <会话编号> <内容>`、`/d-session interrupt <会话编号>` | 引导或打断本 Bot 发起的回合 |
 | `/d-session archive|unarchive <会话编号>` | 归档或恢复会话，仅管理员可用 |
-| `/d-session delete <会话编号>` | 预览永久删除；60 秒内再加 `confirm` 确认，仅管理员可用 |
+| `/d-session delete <会话编号或ID前缀> [更多编号或前缀]` | 预览单个或批量永久删除；60 秒内在同一命令末尾加 `confirm` 确认，仅管理员可用 |
 | `/d-account [账号]`、`/d-session off` | 选择会话账号、退出桌面 App Server 路由 |
 | `/reset` | 取消当前任务并重置当前 Agent 会话 |
 
@@ -251,6 +251,10 @@ Claude 的 `ultracode` 是支持 `xhigh` 的模型可选的 effort 模式，不�
 `/d-p-n /Users/bot/Documents/demo` 通过 Codex App Server 的 `project/create` 创建桌面原生项目，以该目录作为项目根目录；目录不存在时先创建。同一路径已有桌面项目则直接选中。微信只保存当前选中的原生项目 ID、目录和会话 ID，不额外创建微信工作区。发送第一条任务时通过 `thread/start` 指定该项目 ID；任务结果发回微信，用户消息和 Codex 回复也写入桌面端同一会话。任务完成后，可在 `/d-sessions <项目编号>` 或桌面应用的该项目中查看、续聊。已有项目可用 `/d-project use <项目编号>` 切换，再发送任务创建新会话。`/d-new-project`、`/d-n-p` 与 `/d-p-n` 等价。
 
 `/sessions` 只读取本机 CLI 会话数据（Codex 的 `cli`/`exec` 来源与 Claude Code 会话），不混入桌面 Codex 会话，也不请求模型；桌面会话统一使用 `/d-sessions`。列表中的编号只对当前工作区最近一次查询有效；列出归档会话后，编号用于 `/session unarchive` 或 `/session delete`。`/session use` 在当前任务运行时会拒绝切换。Codex CLI 与桌面 Codex 共用底层本地会话库，但这里按来源分开展示；归档和删除同一个 Codex thread 仍会影响所有客户端。Claude Code 没有原生归档命令；`/session archive` 对 Claude 只在本 Bot 的列表中隐藏会话，`/session unarchive` 可恢复显示，本机 Claude CLI 仍可找到它。删除 Claude 会话会移除该账号 `projects` 中对应的会话 JSONL 和 `usage-data/session-meta` 元数据；这不代表清除 Claude Code 的所有缓存或其他副本。
+
+批量删除示例：先发送 `/sessions all` 查看编号，再发送 `/session delete 3 4 5` 查看目标清单；确认无误后，在 60 秒内发送 `/session delete 3 4 5 confirm` 执行。桌面会话使用 `/d-sessions all`、`/d-session delete 3 4 5` 和 `/d-session delete 3 4 5 confirm`，旧版 `/desktop delete` 同样支持多个目标。编号和唯一 ID 前缀可以混用，重复目标只删除一次；CLI 列表中的 Codex 与 Claude 会话可在同一批次删除。
+
+预览和确认都会检查全部目标及其运行状态；任何目标无效、匹配不唯一或正在运行，整批都不会开始删除。确认绑定完整会话 ID 和所属账号；若列表刷新使同一组编号对应了其他会话，确认会被拒绝，需要重新预览。实际删除按目标逐个执行；如果中途失败，会停止执行后续目标，并列出已完成删除的会话、失败目标及未执行数量，已完成的删除无法回滚。删除尝试后需重新查询会话列表获取最新编号；归档和恢复命令仍只接受一个目标。
 
 `/d-` 前缀表示桌面 Codex；旧版 `/desktop` 命令继续兼容。桌面命令通过同一 `CODEX_HOME` 的 Codex App Server 协议读写原生项目和会话。`/d-project use` 后第一条任务会携带原生 `projectId` 创建 thread，并立即写入会话名称，供桌面会话索引收录。桌面应用与微信使用同一份本地项目、会话数据；由于桌面窗口运行的是独立 App Server 进程，窗口已打开时仍可能需要切换项目或刷新一次，才会重新扫描外部进程刚创建的会话。`status` 显示最后保存的回合状态，只有本 Bot 发起的回合能显示实时运行状态并接受 `guide` 或 `interrupt`。普通 ChatGPT Chat/Work 对话不在此命令范围内。会话编号以最近一次 `/d-sessions` 列表为准；切换账号后需重新列出。归档和删除可能影响派生子会话；删除不可恢复。
 
