@@ -66,6 +66,12 @@ DEFAULT_CONFIG = {
     "state": {
         "saveDebounceMs": 1000,
     },
+    "notifications": {
+        "taskReceipts": True,
+        "backgroundCompletion": True,
+        "retryFailedDeliveriesOnMessage": True,
+        "menuTimeoutSeconds": 120,
+    },
     "updates": {
         "timeoutSeconds": 900,
         "cliCommand": [],

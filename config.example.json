@@ -66,6 +66,12 @@
   "state": {
     "saveDebounceMs": 1000
   },
+  "notifications": {
+    "taskReceipts": true,
+    "backgroundCompletion": true,
+    "retryFailedDeliveriesOnMessage": true,
+    "menuTimeoutSeconds": 120
+  },
   "updates": {
     "timeoutSeconds": 900,
     "cliCommand": [],

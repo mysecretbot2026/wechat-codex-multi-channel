@@ -23,6 +23,7 @@ class StateStore:
             "contextTokens": {},
             "workspaces": {},
             "archivedClaudeSessions": {},
+            "userPreferences": {},
         }
         self.load()
 
@@ -39,6 +40,7 @@ class StateStore:
             self.state["contextTokens"] = dict(loaded.get("contextTokens") or {})
             self.state["workspaces"] = dict(loaded.get("workspaces") or {})
             self.state["archivedClaudeSessions"] = dict(loaded.get("archivedClaudeSessions") or {})
+            self.state["userPreferences"] = dict(loaded.get("userPreferences") or {})
             if self._ensure_account_nicknames_locked():
                 self._write_locked()
             return self.state
@@ -78,6 +80,16 @@ class StateStore:
             if changed:
                 self.save(debounce=True)
             return [dict(a) for a in self.state["accounts"]]
+
+    def user_preferences(self, conversation_key):
+        with self.lock:
+            return dict(self.state["userPreferences"].get(conversation_key) or {})
+
+    def set_user_preferences(self, conversation_key, **updates):
+        with self.lock:
+            preferences = self.state["userPreferences"].setdefault(conversation_key, {})
+            preferences.update(updates)
+            self.save()
 
     @staticmethod
     def _normalize_account_nickname(nickname):

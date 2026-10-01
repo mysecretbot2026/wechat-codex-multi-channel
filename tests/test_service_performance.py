@@ -92,6 +92,7 @@ def make_test_config(state_dir):
         "media": {"maxFileBytes": 1024, "maxConcurrentTransfers": 1, "generators": []},
         "allowedUsers": [],
         "adminUsers": [],
+        "notifications": {"taskReceipts": False, "retryFailedDeliveriesOnMessage": False},
         "textChunkLimit": 4000,
     }
 
@@ -151,6 +152,7 @@ class ServicePerformanceTests(unittest.TestCase):
             service.executor = CapturingExecutor()
             service.command_executor = CapturingExecutor()
             account = {"accountId": "acct-1"}
+            service.state.upsert_workspace("acct-1:user-1", "a", tmp)
             msg = {
                 "message_type": MESSAGE_TYPE_USER,
                 "from_user_id": "user-1",

@@ -52,9 +52,10 @@ from .codex_models import find_model_option, format_model_option, model_options,
 from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
 from .codex_update import CodexUpdateManager, UPDATE_HELP, format_update_result, make_update_plan, parse_update_command
 from .config import PROJECT_DIR
+from .commands import COMMANDS, normalize_command, unknown_command_message
 from .login import login_with_qr, render_qr_png
 from .media import send_local_media
-from .media_outbox import media_outbox_path, read_and_clear_media_outbox
+from .media_outbox import acknowledge_media_outbox, media_outbox_path, read_media_outbox
 from .session_discovery import (
     format_session_time,
     list_claude_sessions,
@@ -63,6 +64,7 @@ from .session_discovery import (
     sort_sessions,
 )
 from .state import StateStore
+from .task_journal import TASK_LABELS, TaskJournal, task_elapsed
 from .util import markdown_to_plain_text, split_text
 from .wechat import MESSAGE_TYPE_USER, TYPING_STATUS_CANCEL, TYPING_STATUS_TYPING, WechatClient, extract_text
 
@@ -93,6 +95,13 @@ class MultiWechatCodexService:
         self.command_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=int(config.get("concurrency", {}).get("commandWorkers") or 2)
         )
+        self.notification_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self.tasks = TaskJournal(config["stateDir"])
+        self.task_context = threading.local()
+        self.task_guard = threading.RLock()
+        self.active_task_ids = {}
+        self.menu_choices = {}
+        self.menu_guard = threading.Lock()
         self.media_semaphore = threading.Semaphore(
             int(config.get("media", {}).get("maxConcurrentTransfers") or 1)
         )
@@ -168,6 +177,7 @@ class MultiWechatCodexService:
         self.codex_device_login.stop()
         self.codex.terminate_all()
         self.command_executor.shutdown(wait=False, cancel_futures=True)
+        self.notification_executor.shutdown(wait=False, cancel_futures=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
         self.state.flush()
 
@@ -223,11 +233,109 @@ class MultiWechatCodexService:
             log.warn(f"user not allowed: {user_id}")
             return
         base_conversation_key = self.state.conversation_key(account_id, user_id)
+        text = self._local_input(base_conversation_key, text)
         log.info(f"inbound accountId={account_id} user={user_id} conversation={base_conversation_key} len={len(text)}")
+        if self.config.get("notifications", {}).get("retryFailedDeliveriesOnMessage", True):
+            self.notification_executor.submit(self._retry_local_deliveries, account, user_id, base_conversation_key)
+        with self._desktop_selection_lock(base_conversation_key):
+            conversation_key = self._conversation_key_for_text(base_conversation_key, text)
         if self._is_command(text) and not self._is_workspace_run_command(text):
-            self.command_executor.submit(self._handle_message_safe, account, user_id, base_conversation_key, text, None)
+            if text.split(maxsplit=1)[0] == "/guide" and self._target_has_task(conversation_key):
+                self.command_executor.submit(self._receive_guidance, account, user_id, conversation_key, text, msg,
+                                             self.active_task_ids.get(conversation_key))
+            else:
+                self.command_executor.submit(self._handle_message_safe, account, user_id, base_conversation_key,
+                                             text, None, conversation_key)
         else:
-            self.executor.submit(self._handle_message_safe, account, user_id, base_conversation_key, text, msg)
+            parts = self._workspace_run_parts(text)
+            if parts and (len(parts) < 4 or not self.state.get_workspace(base_conversation_key, parts[2])):
+                self.command_executor.submit(self._send_text_safe, account, user_id,
+                                             "工作区或任务内容无效。发送 /项目 查看工作区；用法：/ws run <名称> <任务>")
+                return
+            with self.task_guard:
+                if (self.config.get("concurrency", {}).get("perConversationSerial", True)
+                        and (self._target_has_task(conversation_key) or self._conversation_lock(conversation_key).locked())):
+                    self.command_executor.submit(self._receive_guidance, account, user_id, conversation_key, text, msg,
+                                                 self.active_task_ids.get(conversation_key))
+                    return
+                session = self._task_session(conversation_key)
+                prompt = parts[3] if parts else text
+                task = self.tasks.create(base_conversation_key, conversation_key, session, prompt,
+                                         self._workspace_name_from_key(base_conversation_key, conversation_key))
+                self.active_task_ids[conversation_key] = task["id"]
+            receipt = None
+            if self.config.get("notifications", {}).get("taskReceipts", True):
+                receipt = self.notification_executor.submit(self._send_text_safe, account, user_id,
+                    f"任务已接收 [{task['id']}]\n项目：{task['workspace']}\n目录：{task['cwd']}\n"
+                    f"Agent：{self._agent_label(task['agent'])} · 账号：{task.get('account') or 'default'}\n"
+                    f"会话：{task.get('sessionId') or '新会话'}\n"
+                    f"任务：{task['title']}\n已固定目标会话并进入执行队列。发送 /任务 查看状态。")
+            self.executor.submit(self._run_received_task, account, user_id, base_conversation_key,
+                                 text, msg, conversation_key, task["id"], receipt)
+
+    def _run_received_task(self, account, user_id, base_key, text, msg, conversation_key, task_id,
+                           receipt=None, conversation_lock_held=False):
+        try:
+            if receipt is not None:
+                receipt.result()
+            if self.stop_event.is_set() or self.tasks.get(task_id)["status"] == "cancelled":
+                if self.tasks.get(task_id)["status"] != "cancelled":
+                    self.tasks.update(task_id, status="cancelled", finishedAt=time.time())
+                return
+            self.task_context.queued_task_id = task_id
+            self.task_context.received_task_id = task_id
+            self._handle_message_safe(account, user_id, base_key, text, msg, conversation_key,
+                                      conversation_lock_held=conversation_lock_held)
+        finally:
+            self.task_context.queued_task_id = None
+            self.task_context.received_task_id = None
+            self.task_context.last_task_id = None
+            with self.task_guard:
+                if self.active_task_ids.get(conversation_key) == task_id:
+                    self.active_task_ids.pop(conversation_key, None)
+            record = self.tasks.get(task_id)
+            if record["status"] == "queued":
+                self.tasks.update(task_id, status="failed", finishedAt=time.time(),
+                                  error="任务未开始执行，请查看服务回复。", unread=True)
+            if record["status"] in {"cancelled", "failed"}:
+                self._clear_pending_guidance(conversation_key)
+
+    def _target_has_task(self, conversation_key):
+        with self.task_guard:
+            task = self.tasks.get(self.active_task_ids.get(conversation_key))
+            return bool(task and task["status"] in {"queued", "running"}) or self.codex.is_running(conversation_key)
+
+    def _task_session(self, conversation_key):
+        session = self._get_session(conversation_key)
+        session.update(agent=resolve_session_agent(self.config, session),
+                       codexAccount=resolve_session_codex_account(self.config, session)["name"],
+                       claudeAccount=resolve_session_claude_account(self.config, session)["name"])
+        return session
+
+    def _receive_guidance(self, account, user_id, conversation_key, text, msg=None, origin_task_id=None):
+        try:
+            origin = self.tasks.get(origin_task_id)
+            if origin and origin["status"] in {"cancelled", "failed", "interrupted"}:
+                self._send_text_safe(account, user_id, "原任务已停止或失败，这条补充不会继续执行。请重新发送需要处理的任务。")
+                return
+            if msg is not None:
+                # Keep command prefixes normalized, including voice transcriptions.
+                text = normalize_command(self._extract_message_text(account, user_id, msg))
+            value = self._guidance_text(text)
+            if not value:
+                self._send_text_safe(account, user_id, "补充引导不能为空。")
+            elif self.codex.is_running(conversation_key) and self.codex.steer(conversation_key, value):
+                self._send_text_safe(account, user_id, "已发送引导，会在当前任务中调整方向。")
+            else:
+                self._append_pending_guidance(conversation_key, value)
+                self._send_text_safe(account, user_id, "已收到补充引导，将在已接收的任务结束后继续处理。")
+                if not self._target_has_task(conversation_key) and not self._conversation_lock(conversation_key).locked():
+                    def continue_guidance():
+                        with self._conversation_lock(conversation_key):
+                            self._run_pending_guidance(account, user_id, conversation_key)
+                    self.executor.submit(continue_guidance)
+        except Exception as err:
+            self._send_text_safe(account, user_id, f"补充引导未被接受：{err}")
 
     def _conversation_lock(self, key):
         with self.conversation_locks_guard:
@@ -235,14 +343,19 @@ class MultiWechatCodexService:
                 self.conversation_locks[key] = threading.Lock()
             return self.conversation_locks[key]
 
-    def _handle_message_safe(self, account, user_id, base_conversation_key, text, msg=None):
-        conversation_key = base_conversation_key
+    def _handle_message_safe(self, account, user_id, base_conversation_key, text, msg=None, conversation_key=None,
+                             conversation_lock_held=False):
+        self.task_context.last_task_id = None
+        text = self._local_input(base_conversation_key, text)
         try:
-            conversation_key = self._conversation_key_for_text(base_conversation_key, text)
+            conversation_key = conversation_key or self._conversation_key_for_text(base_conversation_key, text)
+            if self._is_command(text) and text.split(maxsplit=1)[0] not in COMMANDS:
+                self._send_text(account, user_id, unknown_command_message(text))
+                return
             if self._can_run_without_conversation_lock(text):
                 self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
                 return
-            if self.config.get("concurrency", {}).get("perConversationSerial", True):
+            if self.config.get("concurrency", {}).get("perConversationSerial", True) and not conversation_lock_held:
                 lock = self._conversation_lock(conversation_key)
                 if not lock.acquire(blocking=False):
                     interrupt_action, interrupt_text = self._parse_interrupt_command(text)
@@ -267,7 +380,8 @@ class MultiWechatCodexService:
                             message = f"已中断当前 {agent_label} 任务，已保留当前会话。" if killed else f"当前没有运行中的 {agent_label} 任务，当前会话保持不变。"
                             self._send_text(account, user_id, message)
                         return
-                    if self._is_command(text) and not self._is_workspace_run_command(text):
+                    if (self._is_command(text) and not self._is_workspace_run_command(text)
+                            and text.split(maxsplit=1)[0] != "/guide"):
                         self._send_text(account, user_id, "当前任务运行中，命令不会作为引导处理。可发送 /status、/usage、/interrupt、/reset 等命令。")
                         return
                     if msg is not None:
@@ -308,6 +422,16 @@ class MultiWechatCodexService:
             log.info(f"handler cancelled conversation={base_conversation_key}")
         except Exception as err:
             log.error(f"handler error conversation={base_conversation_key}: {err}")
+            task_id = (getattr(self.task_context, "last_task_id", None)
+                       or getattr(self.task_context, "received_task_id", None))
+            task = self.tasks.get(task_id)
+            if task and task["status"] in {"queued", "running"}:
+                task = self.tasks.update(task_id, status="failed", finishedAt=time.time(), error=str(err),
+                                         background=not self._conversation_is_selected(conversation_key), unread=True)
+            if task and task.get("background"):
+                self._notify_background_task(account, user_id, task)
+            if task and task["status"] == "failed":
+                self._clear_pending_guidance(conversation_key)
             if self.DESKTOP_RUN_MARKER in conversation_key:
                 run_session = self._get_session(conversation_key)
                 turn_id = ""
@@ -322,6 +446,8 @@ class MultiWechatCodexService:
                 with self._desktop_selection_lock(conversation_key):
                     if self._desktop_is_selected(conversation_key):
                         self._send_text(account, user_id, f"执行失败：{err}")
+                return
+            if task and task.get("background"):
                 return
             self._send_text(account, user_id, f"执行失败：{err}")
 
@@ -347,6 +473,7 @@ class MultiWechatCodexService:
         return bool(cls._workspace_run_parts(text))
 
     def _conversation_key_for_text(self, base_conversation_key, text):
+        text = normalize_command(text)
         parts = self._workspace_run_parts(text)
         if len(parts) >= 3:
             workspace_key = self.state.workspace_conversation_key(base_conversation_key, parts[2])
@@ -427,13 +554,14 @@ class MultiWechatCodexService:
 
     @staticmethod
     def _can_run_without_conversation_lock(text):
-        command = text.strip()
+        command = normalize_command(text)
         first = command.split()[0] if command else ""
         if first == "/ws":
             parts = command.split(maxsplit=2)
             return len(parts) < 2 or parts[1].lower() != "run"
         return first in {
             "/help",
+            "/menu", "/choose", "/tasks", "/result", "/resend", "/notify",
             "/accounts",
             "/users",
             "/user",
@@ -623,9 +751,137 @@ class MultiWechatCodexService:
         lines.append(f"共 {len(cleaned)} 个用户正在交互中")
         return "\n".join(lines)
 
+    def _local_input(self, base_key, text):
+        command = normalize_command(text)
+        parts = command.split(maxsplit=1)
+        selector = parts[1] if len(parts) == 2 and parts[0] == "/choose" else command
+        with self.menu_guard:
+            menu = self.menu_choices.get(base_key)
+            if menu and (selector.isdigit() or command.startswith("/choose")):
+                if time.monotonic() > menu["expires"]:
+                    self.menu_choices.pop(base_key, None)
+                    return "/choose expired"
+                if selector == "0":
+                    self.menu_choices.pop(base_key, None)
+                    return "/choose closed"
+                selected = menu["choices"].get(selector)
+                if selected:
+                    self.menu_choices.pop(base_key, None)
+                    return selected
+                return "/choose invalid"
+            if command != "/menu" and not command.startswith("/choose"):
+                self.menu_choices.pop(base_key, None)
+        return command
+
+    def _show_menu(self, account, user_id, base_key, conversation_key):
+        session = self._get_session(conversation_key)
+        workspace = self._workspace_name_from_key(base_key, conversation_key)
+        choices = [
+            ("当前状态", "/status"), ("项目工作区", "/ws"),
+            ("会话列表", "/d-sessions all" if session.get("codexClient") == "desktop" else "/sessions"),
+            ("任务与未读结果", "/tasks"), ("最近结果", "/result"),
+            ("模型选项", "/model"), ("账号用量", "/usage"), ("停止当前任务，保留会话", "/interrupt"),
+        ]
+        timeout = max(10, int(self.config.get("notifications", {}).get("menuTimeoutSeconds", 120)))
+        with self.menu_guard:
+            self.menu_choices[base_key] = {
+                "choices": {str(index): command for index, (_, command) in enumerate(choices, 1)},
+                "expires": time.monotonic() + timeout,
+            }
+        lines = [f"中文菜单 · {workspace} · {self._agent_label(session.get('agent'))}"]
+        lines.extend(f"{index}. {label}" for index, (label, _) in enumerate(choices, 1))
+        lines.extend([f"{timeout} 秒内回复编号选择；回复 0 退出。其他消息会退出菜单并按原用途处理。",
+                      "也可直接发送 /项目、/会话、/任务、/结果、/停止。菜单和查询由本地处理，不调用模型。"])
+        self._send_text(account, user_id, "\n".join(lines))
+
+    def _handle_task_command(self, account, user_id, base_key, command):
+        parts = command.split(maxsplit=1)
+        first, selector = parts[0], parts[1] if len(parts) > 1 else ""
+        if first == "/notify":
+            value = {"开启": "on", "关闭": "off"}.get(selector, selector.lower())
+            if value in {"on", "off"}:
+                self.state.set_user_preferences(base_key, backgroundCompletion=value == "on")
+            elif value:
+                self._send_text(account, user_id, "用法：/提醒 on|off（开启或关闭后台完成提醒）")
+                return
+            enabled = self._background_notifications_enabled(base_key)
+            self._send_text(account, user_id, f"后台完成提醒：{'开启' if enabled else '关闭'}。设置会保留到服务重启后。")
+            return
+        if first == "/tasks":
+            if selector not in {"", "unread", "未读"}:
+                self._send_text(account, user_id, "用法：/任务 或 /任务 未读")
+                return
+            records = self.tasks.list(base_key, limit=None)
+            if selector:
+                records = [item for item in records if item.get("unread")]
+            lines = ["最近任务：" if not selector else "未读任务结果："]
+            for item in records[:10]:
+                suffix = " · 未读" if item.get("unread") else ""
+                if item.get("deliveryError"):
+                    suffix += " · 发送待重试"
+                lines.extend([f"[{item['id']}] {TASK_LABELS.get(item['status'], item['status'])}{suffix} · {task_elapsed(item)}",
+                              f"{item['workspace']} · {item['title']}"])
+            if not records:
+                lines.append("暂无记录。")
+            lines.append("查看：/结果 <任务ID>；补发：/重发 <任务ID>。均不重新执行任务。")
+            self._send_text(account, user_id, "\n".join(lines))
+            return
+        record = self.tasks.find(base_key, selector, output_only=first == "/resend" or not selector)
+        if not record and first == "/result" and not selector:
+            record = self.tasks.find(base_key)
+        if not record:
+            self._send_text(account, user_id, "没有找到任务，或任务 ID 前缀不唯一。发送 /任务 查看自己的任务。")
+            return
+        if not record.get("hasOutput"):
+            self._send_text(account, user_id,
+                            f"任务 [{record['id']}]：{TASK_LABELS.get(record['status'], record['status'])}\n"
+                            f"{record.get('error') or '尚未生成结果，请稍后查看。'}")
+            return
+        if first == "/resend" or not self._output_was_sent(record):
+            self._send_task_output(account, user_id, record["id"])
+            if first == "/resend" and self._output_was_sent(record):
+                self._send_text(account, user_id, "该任务的文字和附件已发送成功，无需重发。")
+        else:
+            self._send_text(account, user_id, "\n".join(item["text"] for item in record["chunks"]) or "该结果仅包含附件。")
+            self.tasks.update(record["id"], unread=False)
+
+    def _reject_target_change(self, conversation_key, command):
+        parts = command.split()
+        if not parts or not self._target_has_task(conversation_key):
+            return False
+        first = parts[0]
+        if len(parts) == 1:
+            return first in {"/codex", "/claude"} and self._get_session(conversation_key).get("agent") != first[1:]
+        task = self.tasks.get(self.active_task_ids.get(conversation_key))
+        return (first in {"/agent", "/account", "/codex", "/codex-use", "/claude", "/cwd"}
+                or (first == "/session" and parts[1] in {"use", "switch", "new"})
+                or first in {"/d-new-project", "/d-n-p", "/d-p-n"}
+                or (first == "/d-project" and parts[1] == "use")
+                or (first == "/d-session" and (parts[1] in {"use", "switch", "select", "new", "off"} or parts[1].isdigit()))
+                or (first == "/desktop" and parts[1] in {"use", "switch", "select", "new", "off", "project"})
+                or (first == "/model" and (self._get_session(conversation_key).get("codexClient") != "desktop"
+                                          or bool(task and task["status"] == "queued"))))
+
     def _handle_message(self, account, user_id, base_conversation_key, text, conversation_key=None):
         conversation_key = conversation_key or base_conversation_key
-        command = text.strip()
+        command = self._local_input(base_conversation_key, text)
+        text = command
+        first = command.split(maxsplit=1)[0] if command else ""
+        if first.startswith("/") and first not in COMMANDS:
+            self._send_text(account, user_id, unknown_command_message(command))
+            return
+        if first == "/menu":
+            self._show_menu(account, user_id, base_conversation_key, conversation_key)
+            return
+        if first == "/choose":
+            self._send_text(account, user_id, "已退出菜单。" if command == "/choose closed" else "菜单已过期或编号无效，请发送 菜单 重新选择。")
+            return
+        if first in {"/tasks", "/result", "/resend", "/notify"}:
+            self._handle_task_command(account, user_id, base_conversation_key, command)
+            return
+        if self._reject_target_change(conversation_key, command):
+            self._send_text(account, user_id, "该会话有任务运行中或排队中，请等待完成或发送 /停止 后再修改账号、模型、目录或会话。")
+            return
         if command and command.split(maxsplit=1)[0] in {"/update", "/codex-update", "/d-update"}:
             self._handle_update_command(account, user_id, command)
             return
@@ -790,7 +1046,7 @@ class MultiWechatCodexService:
             )
             self._send_text(account, user_id, "\n".join(lines))
             return
-        if command == "/codex" or command.startswith("/codex ") or command.startswith("/codex-use"):
+        if first in {"/codex", "/codex-use"}:
             selector = command[len("/codex"):].strip() if command.startswith("/codex ") else command[len("/codex-use"):].strip()
             self._handle_codex_switch(account, user_id, conversation_key, selector)
             return
@@ -883,12 +1139,13 @@ class MultiWechatCodexService:
             killed = self._cancel_runner(conversation_key, reset_session=False)
             if interrupt_text:
                 self._send_text(account, user_id, "已中断当前工作区，保留当前会话，开始处理新任务。")
-                self._run_codex_and_reply(account, user_id, conversation_key, interrupt_text)
+                self._schedule_after_lock(account, user_id, base_conversation_key, conversation_key, interrupt_text)
             else:
                 message = f"已中断当前 {agent_label} 任务，已保留当前会话。" if killed else "当前没有运行中的任务，当前会话保持不变。"
                 self._send_text(account, user_id, message)
             return
         if command == "/reset":
+            self._cancel_runner(conversation_key, reset_session=True)
             self._clear_pending_guidance(conversation_key)
             agent = resolve_session_agent(self.config, self._get_session(conversation_key))
             self.state.reset_session(conversation_key, agent=agent)
@@ -898,7 +1155,7 @@ class MultiWechatCodexService:
                 self.state.update_session(self._desktop_parent_key(conversation_key), desktopPendingId="")
             self._send_text(account, user_id, f"已重置当前工作区 {self._agent_label(agent)} 会话。")
             return
-        if command.startswith("/cwd"):
+        if first == "/cwd":
             arg = command[4:].strip()
             session = self._get_session(conversation_key)
             if not arg:
@@ -921,6 +1178,13 @@ class MultiWechatCodexService:
                     updates["desktopProjectId"] = ""
                 self.state.update_session(conversation_key, **updates)
                 self._send_text(account, user_id, f"已切换 CWD: {cwd}\n已重置当前工作区 Codex thread 和 Claude session。")
+            return
+
+        if first == "/guide":
+            self._send_text(account, user_id, "当前没有任务运行，可直接发送任务内容；/补充 用于运行中或排队中的任务。")
+            return
+        if first.startswith("/"):
+            self._send_text(account, user_id, f"命令参数无效：{command}\n发送 /help 或 菜单 查看用法。命令不会交给 Agent。")
             return
 
         workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
@@ -961,10 +1225,48 @@ class MultiWechatCodexService:
         self.desktop_model_options_cache.clear()
 
     def _run_codex_and_reply(self, account, user_id, conversation_key, text):
-        agent = resolve_session_agent(self.config, self._get_session(conversation_key))
+        session = self._task_session(conversation_key)
+        owner = self.state.conversation_key(account["accountId"], user_id)
+        task_id = getattr(self.task_context, "queued_task_id", None)
+        self.task_context.queued_task_id = None
+        with self.task_guard:
+            task = self.tasks.get(task_id)
+            if task is None:
+                task = self.tasks.create(owner, conversation_key, session, text,
+                                         self._workspace_name_from_key(owner, conversation_key))
+                task_id = task["id"]
+            if task["status"] == "cancelled":
+                return
+            if any((session.get(key) or "") != (value or "")
+                   for key, value in task.get("routing", {}).items()):
+                raise ValueError("排队期间目标会话设置发生变化，本次任务未执行。请确认目标后重新发送任务。")
+            self.tasks.update(task_id, status="running", startedAt=time.time())
+        if task.get("status") == "queued" and time.time() - task["receivedAt"] >= 2:
+            self._send_text_safe(account, user_id, f"任务 [{task_id}] 开始执行 · {task['workspace']}")
+        previous_task = getattr(self.task_context, "current_task_id", None)
+        self.task_context.current_task_id = task_id
+        self.task_context.last_task_id = task_id
+        agent = resolve_session_agent(self.config, session)
         guard = self.updates.agent_run() if agent == "codex" else contextlib.nullcontext()
-        with guard:
-            self._run_codex_and_reply_locked(account, user_id, conversation_key, text)
+        try:
+            with guard:
+                self._run_codex_and_reply_locked(account, user_id, conversation_key, text)
+        except CodexCancelled:
+            self.tasks.update(task_id, status="cancelled", finishedAt=time.time())
+            raise
+        except Exception as err:
+            self.tasks.update(task_id, status="failed", finishedAt=time.time(), error=str(err), unread=True,
+                              background=not self._conversation_is_selected(conversation_key))
+            raise
+        finally:
+            self.task_context.current_task_id = previous_task
+
+    def _conversation_is_selected(self, conversation_key):
+        if self.DESKTOP_RUN_MARKER in conversation_key:
+            return self._desktop_is_selected(conversation_key)
+        owner = ":".join(conversation_key.split(":", 2)[:2])
+        active = self.state.get_active_workspace(owner)
+        return self.state.workspace_conversation_key(owner, active) == conversation_key
 
     def _run_codex_and_reply_locked(self, account, user_id, conversation_key, text):
         if self.DESKTOP_RUN_MARKER in conversation_key:
@@ -980,6 +1282,8 @@ class MultiWechatCodexService:
             self.state.update_session(conversation_key, desktopLastError="", desktopLastErrorTurnId="")
         stop_typing = self._start_typing_loop(account, user_id)
         try:
+            if self.tasks.get(self.task_context.current_task_id)["status"] == "cancelled":
+                raise CodexCancelled("任务已停止")
             result = self.codex.run(conversation_key, text)
         finally:
             stop_typing()
@@ -987,8 +1291,6 @@ class MultiWechatCodexService:
         if self.DESKTOP_RUN_MARKER in conversation_key:
             with self._desktop_selection_lock(conversation_key):
                 self._promote_pending_desktop_thread(conversation_key)
-                if not self._desktop_is_selected(conversation_key):
-                    return
                 run_session = self._get_session(conversation_key)
                 try:
                     codex_account = resolve_session_codex_account(self.config, run_session)
@@ -999,44 +1301,154 @@ class MultiWechatCodexService:
                 except Exception as err:
                     log.warn(f"desktop latest result unavailable conversation={conversation_key}: {err}")
                 if turn_id and self._get_session(conversation_key).get("desktopDeliveredTurnId") == turn_id:
+                    self.tasks.update(self.task_context.current_task_id, status="completed", finishedAt=time.time(),
+                                      error="本轮结果已经发送，可在会话中查看。")
                     return
-                self._deliver_agent_output(account, user_id, conversation_key, result, turn_id=turn_id)
+                self._deliver_agent_output(account, user_id, conversation_key, result, turn_id=turn_id,
+                                           background=not self._desktop_is_selected(conversation_key))
             return
-        self._deliver_agent_output(account, user_id, conversation_key, result)
+        self._deliver_agent_output(account, user_id, conversation_key, result,
+                                   background=not self._conversation_is_selected(conversation_key))
 
-    def _deliver_agent_output(self, account, user_id, conversation_key, result, turn_id=""):
+    def _deliver_agent_output(self, account, user_id, conversation_key, result, turn_id="", background=False):
         cleaned, actions = extract_actions(result)
-        session = self._get_session(conversation_key)
-        already_delivered = bool(turn_id and session.get("desktopDeliveredTurnId") == turn_id)
-        if already_delivered:
-            actions = []
-        else:
-            actions.extend(read_and_clear_media_outbox(media_outbox_path(self.state.state_dir, conversation_key)))
         cleaned = markdown_to_plain_text(cleaned)
-        if cleaned:
-            self._send_text(account, user_id, cleaned)
-        if actions:
-            client = self._api_for_account(account)
-            context_token = self.state.get_context_token(account["accountId"], user_id)
-            if not context_token:
-                raise RuntimeError("缺少 context_token，无法发送媒体")
-            sent = execute_actions(
-                client,
-                user_id,
-                context_token,
-                actions,
-                int(self.config.get("media", {}).get("maxFileBytes") or 52_428_800),
-                transfer_semaphore=self.media_semaphore,
+        task_id = getattr(self.task_context, "current_task_id", None)
+        if not task_id:
+            owner = self.state.conversation_key(account["accountId"], user_id)
+            task_id = self.tasks.create(owner, conversation_key, self._get_session(conversation_key), "任务结果",
+                                        self._workspace_name_from_key(owner, conversation_key))["id"]
+        with self._conversation_lock(f"{conversation_key}:delivery"):
+            claimed = self.tasks.claimed_media_ids(conversation_key)
+            outbox = [item for item in read_media_outbox(media_outbox_path(self.state.state_dir, conversation_key))
+                      if item["id"] not in claimed]
+            media = {}
+            for action in actions + outbox:
+                key = (action["kind"], action["path"])
+                item = media.setdefault(key, {"kind": action["kind"], "path": action["path"],
+                                               "sent": False, "outboxIds": []})
+                if action.get("id"):
+                    item["outboxIds"].append(action["id"])
+            if not cleaned.strip() and not media:
+                cleaned = f"任务 [{task_id}] 已完成，本轮没有可发送的文字或附件。"
+            record = self.tasks.update(
+                task_id, status="completed", finishedAt=time.time(), hasOutput=True, background=background,
+                turnId=turn_id, chunks=[{"text": chunk, "sent": False}
+                                       for chunk in split_text(cleaned, int(self.config.get("textChunkLimit") or 4000))],
+                media=list(media.values()), unread=True,
             )
-            log.info(f"sent media conversation={conversation_key} count={len(sent)}")
-        if turn_id and not already_delivered:
-            self.state.update_session(conversation_key, desktopDeliveredTurnId=turn_id)
+        if background:
+            self._notify_background_task(account, user_id, record)
+        else:
+            self._send_task_output(account, user_id, task_id)
+
+    @staticmethod
+    def _output_was_sent(record):
+        return all(item.get("sent") for item in record.get("chunks", []) + record.get("media", []))
+
+    def _send_task_output(self, account, user_id, task_id, report_error=True):
+        with self._conversation_lock(f"task-delivery:{task_id}"):
+            record = self.tasks.get(task_id)
+            if not record or record.get("owner") != self.state.conversation_key(account["accountId"], user_id):
+                return False
+            try:
+                for chunk in record["chunks"]:
+                    if not chunk["sent"]:
+                        self._send_text(account, user_id, chunk["text"])
+                        chunk["sent"] = True
+                        self.tasks.update(task_id, chunks=record["chunks"])
+                for media in record["media"]:
+                    if not media["sent"]:
+                        context_token = self.state.get_context_token(account["accountId"], user_id)
+                        if not context_token:
+                            raise RuntimeError("缺少 context_token，无法发送媒体")
+                        sent = execute_actions(
+                            self._api_for_account(account), user_id, context_token,
+                            [{"kind": media["kind"], "path": media["path"]}],
+                            int(self.config.get("media", {}).get("maxFileBytes") or 52_428_800),
+                            transfer_semaphore=self.media_semaphore,
+                        )
+                        if not sent:
+                            raise RuntimeError("媒体未发送成功")
+                        media["sent"] = True
+                        self.tasks.update(task_id, media=record["media"])
+                    acknowledge_media_outbox(media_outbox_path(self.state.state_dir, record["conversationKey"]),
+                                             media.get("outboxIds", []))
+                self.tasks.update(task_id, unread=False, deliveryError="")
+                if record.get("turnId"):
+                    self.state.update_session(record["conversationKey"], desktopDeliveredTurnId=record["turnId"])
+                return True
+            except Exception as err:
+                self.tasks.update(task_id, unread=True, deliveryError=str(err))
+                log.warn(f"result delivery pending task={task_id}: {err}")
+                if report_error:
+                    retry_note = ("下次发消息时自动补发，也可发送 "
+                                  if self.config.get("notifications", {}).get("retryFailedDeliveriesOnMessage", True)
+                                  else "可发送 ")
+                    self._send_text_safe(account, user_id,
+                        f"任务 [{task_id}] 已完成，但部分结果发送失败：{err}\n"
+                        "未发送的内容已保留；" + retry_note + "/重发 " + task_id + "。不会重新执行任务。")
+                return False
+
+    def _background_notifications_enabled(self, owner):
+        return self.state.user_preferences(owner).get(
+            "backgroundCompletion", self.config.get("notifications", {}).get("backgroundCompletion", True))
+
+    def _notify_background_task(self, account, user_id, record):
+        with self._conversation_lock(f"task-notice:{record['id']}"):
+            record = self.tasks.get(record["id"])
+            if record.get("notified"):
+                return
+            if not self._background_notifications_enabled(record["owner"]):
+                self.tasks.update(record["id"], notified=True)
+                return
+            label = "已完成" if record["status"] == "completed" else "失败"
+            preview = " ".join(" ".join(chunk["text"] for chunk in record["chunks"]).split())[:160]
+            lines = [f"后台任务 [{record['id']}] {label} · {record['workspace']}",
+                     f"任务：{record['title']}", f"用时：{task_elapsed(record)}"]
+            if record.get("error"):
+                lines.append("原因：" + record["error"])
+            elif preview:
+                lines.append("结果摘录：" + preview)
+            lines.append("查看完整结果及附件：/结果 " + record["id"])
+            if self._send_text_safe(account, user_id, "\n".join(lines)):
+                self.tasks.update(record["id"], notified=True)
+
+    def _retry_local_deliveries(self, account, user_id, owner):
+        try:
+            records = self.tasks.list(owner, limit=None)
+            failed = next((item for item in records if item.get("deliveryError") and item.get("hasOutput")), None)
+            if failed:
+                self._send_task_output(account, user_id, failed["id"], report_error=False)
+            notice = next((item for item in records if item.get("background") and not item.get("notified")
+                           and item["status"] in {"completed", "failed"}), None)
+            if notice:
+                self._notify_background_task(account, user_id, notice)
+        except Exception as err:
+            log.warn(f"local delivery retry failed owner={owner}: {err}")
+
+    def _send_text_safe(self, account, user_id, text):
+        try:
+            self._send_text(account, user_id, text)
+            return True
+        except Exception as err:
+            log.warn(f"local notice failed user={user_id}: {err}")
+            return False
 
     def _cancel_runner(self, conversation_key, reset_session=True):
+        with self.task_guard:
+            task = self.tasks.get(self.active_task_ids.get(conversation_key))
+            if task and task["status"] == "queued":
+                self.tasks.update(task["id"], status="cancelled", finishedAt=time.time())
+                if reset_session:
+                    self.state.reset_session(conversation_key, agent=self._get_session(conversation_key).get("agent"))
+                return True
+            if task and task["status"] == "running":
+                self.tasks.update(task["id"], status="cancelled", finishedAt=time.time())
         try:
-            return self.codex.cancel(conversation_key, reset_session=reset_session)
+            return self.codex.cancel(conversation_key, reset_session=reset_session) or bool(task and task["status"] == "running")
         except TypeError:
-            return self.codex.cancel(conversation_key)
+            return self.codex.cancel(conversation_key) or bool(task and task["status"] == "running")
 
     def _discover_sessions(self, conversation_key, scope="", limit=20, archived=False):
         current = self._get_session(conversation_key)
@@ -1212,8 +1624,8 @@ class MultiWechatCodexService:
                 refs = [(key, value) for key, value in self.state.state["sessions"].items()
                         if value.get("codexThreadId" if item["agent"] == "codex" else "claudeSessionId") == session_id
                         and value.get("codexAccount" if item["agent"] == "codex" else "claudeAccount") in {None, "", account_name}]
-            if any(self.codex.is_running(key) for key, _ in refs):
-                raise ValueError("该会话正在运行，请先结束任务。")
+            if any(self._target_has_task(key) for key, _ in refs):
+                raise ValueError("该会话正在运行或排队，请先结束任务。")
         if item["agent"] == "codex":
             target_account = get_codex_account(self.config, account_name)
             if self._desktop_running_context(session_id):
@@ -1377,6 +1789,7 @@ class MultiWechatCodexService:
             "旧版 /desktop 命令仍可使用。",
             "项目和会话存入桌面 Codex 的本地数据；任务结果同时回传微信。",
             "每次切换会话都会重发最近一次完整文字回答；运行中会同时提示状态。",
+            "切到其他会话后，后台任务完成或失败会发送简短提醒；用 /结果 <任务ID> 查看完整结果及未发送附件。",
             "列表状态是最后保存的回合状态；桌面窗口实时运行状态无法由独立 App Server 确认。",
         ])
 
@@ -1775,12 +2188,28 @@ class MultiWechatCodexService:
             self._run_codex_and_reply(account, user_id, conversation_key, self._format_guidance_prompt(items))
 
     def _schedule_after_lock(self, account, user_id, base_conversation_key, conversation_key, text):
+        with self.task_guard:
+            task = self.tasks.create(base_conversation_key, conversation_key, self._task_session(conversation_key), text,
+                                     self._workspace_name_from_key(base_conversation_key, conversation_key))
+            self.active_task_ids[conversation_key] = task["id"]
+        receipt = None
+        if self.config.get("notifications", {}).get("taskReceipts", True):
+            receipt = self.notification_executor.submit(self._send_text_safe, account, user_id,
+                f"任务已接收 [{task['id']}] · {task['workspace']}\n任务：{task['title']}\n已固定目标会话，等待上一任务退出后执行。")
+
         def run():
             lock = self._conversation_lock(conversation_key)
             with lock:
-                if self.stop_event.is_set():
-                    return
-                self._handle_message(account, user_id, base_conversation_key, text, conversation_key)
+                # A starting task may publish its new session ID before interruption.
+                current = self._task_session(conversation_key)
+                routing = dict(task["routing"])
+                for key in ("codexThreadId", "claudeSessionId"):
+                    routing[key] = current.get(key)
+                self.tasks.update(task["id"], routing=routing,
+                                  sessionId=current.get("claudeSessionId") if current.get("agent") == "claude"
+                                  else current.get("codexThreadId"))
+                self._run_received_task(account, user_id, base_conversation_key, text, None, conversation_key,
+                                         task["id"], receipt, conversation_lock_held=True)
 
         self.executor.submit(run)
 
@@ -1987,7 +2416,7 @@ class MultiWechatCodexService:
             cwd = self._new_project_path(arg, current.get("cwd"))
             name = self._project_workspace_name(base_conversation_key, cwd)
             workspace_key = self._workspace_key(base_conversation_key, name)
-            if self.codex.is_running(workspace_key):
+            if self._target_has_task(workspace_key):
                 raise ValueError("该项目工作区有任务运行中，请稍后再新建会话。")
             updates = {
                 "cwd": cwd,
@@ -2120,6 +2549,9 @@ class MultiWechatCodexService:
             if error:
                 self._send_text(account, user_id, error)
                 return
+            if self._target_has_task(self._workspace_key(base_conversation_key, name)):
+                self._send_text(account, user_id, "该工作区有任务运行中或排队中，请等待或停止任务后再修改目录。")
+                return
             cwd, error = self._resolve_cwd(parts[3], self.config["codex"]["workingDirectory"])
             if error:
                 self._send_text(account, user_id, error)
@@ -2182,7 +2614,7 @@ class MultiWechatCodexService:
                 self._send_text(account, user_id, "未知 Agent。可用：codex、claude")
                 return
             workspace_key = self._workspace_key(base_conversation_key, name)
-            if self.codex.is_running(workspace_key):
+            if self._target_has_task(workspace_key):
                 self._send_text(account, user_id, "该工作区有任务运行中，请等待结束或 /ws reset 后再切换 Agent。")
                 return
             self.state.update_session(workspace_key, agent=target)
@@ -2209,7 +2641,9 @@ class MultiWechatCodexService:
             if item and item.get("cwd"):
                 self.state.update_session(workspace_key, cwd=item["cwd"])
             self.state.touch_workspace(base_conversation_key, name)
-            self._run_codex_and_reply(account, user_id, self._desktop_execution_key(workspace_key), prompt)
+            run_key = (conversation_key if self._desktop_parent_key(conversation_key) == workspace_key
+                       else self._desktop_execution_key(workspace_key))
+            self._run_codex_and_reply(account, user_id, run_key, prompt)
             return
         if action in {"reset", "cancel"}:
             if len(parts) < 3:
@@ -2843,13 +3277,13 @@ class MultiWechatCodexService:
         context_token = self.state.get_context_token(account["accountId"], user_id)
         if not context_token:
             log.error(f"cannot reply: missing context_token account={account['accountId']} user={user_id}")
-            return
+            raise RuntimeError("缺少 context_token，消息尚未发送")
         self._send_text_with_context_token(account, user_id, context_token, text)
 
     def _send_text_with_context_token(self, account, user_id, context_token, text):
         if not context_token:
             log.error(f"cannot reply: missing context_token account={account['accountId']} user={user_id}")
-            return
+            raise RuntimeError("缺少 context_token，消息尚未发送")
         client = self._api_for_account(account)
         for chunk in split_text(text, int(self.config.get("textChunkLimit") or 4000)):
             client.send_text(user_id, context_token, chunk)
@@ -2878,6 +3312,12 @@ class MultiWechatCodexService:
         if not full:
             return "\n".join([
                 "常用命令：",
+                "菜单 或 /menu 中文编号菜单；/帮助 等同 /help",
+                "/任务（/tasks）查看任务；/任务 未读 查看未读结果",
+                "/结果 [任务ID]（/result）查看文字和附件；/重发 [任务ID]（/resend）只补发未成功内容",
+                "/提醒 on|off（/notify）设置后台完成提醒；/停止 等同 /interrupt",
+                "任务自动回执并固定目标；后台完成自动提醒；发送失败保留记录并在下次消息时补发。",
+                "菜单、查询、回执、提醒和重发均不调用模型。",
                 "/status 状态；/active 运行中的任务",
                 "/sessions [codex|claude|all] CLI 会话；/session 管理 CLI 会话",
                 "/session delete 3 4 5 批量删除预览；60 秒内再加 confirm 确认（管理员）",
@@ -2896,6 +3336,17 @@ class MultiWechatCodexService:
         return "\n".join(
             [
                 "命令：",
+                "菜单 或 /menu 打开中文菜单，限时回复编号选择；/choose <编号> 或 /选择 <编号> 也可选择；0 退出",
+                "/任务 [unread|未读] 或 /tasks 查看自己的最近任务、排队状态、用时和未读结果",
+                "/结果 [任务ID|唯一前缀] 或 /result 查看结果及未发送附件，默认最近有结果的任务",
+                "/重发 [任务ID|唯一前缀] 或 /resend 只补发未成功的文字分片和附件，不重新执行任务",
+                "/提醒 [on|off|开启|关闭] 或 /notify 查看、设置后台完成提醒，重启后保留",
+                "中文别名：/菜单 /帮助 /状态 /项目 /切换项目 <名称> /会话 /切换会话 <编号>",
+                "桌面别名：/桌面项目 /桌面会话 /切换桌面会话 <编号>",
+                "其他别名：/停止 /取消 /重置 /补充 <要求> /模型 /账号 /用量 /目录",
+                "自动回执、菜单、任务查询、后台提醒和结果重发不调用模型；实际任务由所选 Agent 执行。",
+                "未知或参数错误的 /命令会被本地拦截；排队任务不会因切换项目而改投。",
+                "结果与发送状态保存在 stateDir/tasks；下次消息自动补发最近一条发送失败的结果。",
                 "/status 查看当前工作区状态",
                 "/reset 重置当前工作区当前 Agent 会话",
                 "/cancel 或 /interrupt 中断当前任务，保留当前会话",

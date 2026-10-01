@@ -439,7 +439,7 @@ class DesktopCommandTests(unittest.TestCase):
         self.assertEqual(self.service._get_session(self.key)["codexThreadId"], "new-thread-123")
         self.assertIn("最终回答", self.sent[-1])
 
-    def test_first_pending_desktop_turn_stays_silent_after_switch(self):
+    def test_first_pending_desktop_turn_notifies_after_switch(self):
         self.command("/d-session new")
         pending_key = self.service._conversation_key_for_text(self.key, "第一条任务")
         self.command("/d-sessions all")
@@ -453,7 +453,8 @@ class DesktopCommandTests(unittest.TestCase):
         self.service.codex.run = run
         sent_before = len(self.sent)
         self.service._run_codex_and_reply(self.account, "user-1", pending_key, "第一条任务")
-        self.assertEqual(len(self.sent), sent_before)
+        self.assertEqual(len(self.sent), sent_before + 1)
+        self.assertIn("后台任务", self.sent[-1])
         self.assertEqual(self.service._get_session(self.key)["codexThreadId"], self.fake.thread["id"])
 
     def test_cli_codex_archive_restore_and_confirmed_delete(self):
@@ -761,7 +762,8 @@ class DesktopCommandTests(unittest.TestCase):
         self.service.codex.run = lambda conversation_key, message: "A 的完整结果"
         sent_before = len(self.sent)
         self.service._run_codex_and_reply(self.account, "user-1", first_run_key, "任务 A")
-        self.assertEqual(len(self.sent), sent_before)
+        self.assertEqual(len(self.sent), sent_before + 1)
+        self.assertIn("后台任务", self.sent[-1])
 
         self.command("/desktop chats all")
         running_recap = self.command("/desktop use 1")
@@ -805,7 +807,8 @@ class DesktopCommandTests(unittest.TestCase):
         self.service.codex.run = lambda conversation_key, message: self.fake.result_text
         sent_before = len(self.sent)
         self.service._run_codex_and_reply(self.account, "user-1", run_key, "任务 A")
-        self.assertEqual(len(self.sent), sent_before)
+        self.assertEqual(len(self.sent), sent_before + 1)
+        self.assertIn("后台任务", self.sent[-1])
         self.assertIn(self.fake.result_text, self.command("/ws use default"))
 
     def test_delete_requires_second_matching_confirmation(self):
