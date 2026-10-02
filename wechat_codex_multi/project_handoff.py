@@ -94,8 +94,16 @@ def local_transcript(account, agent, session_id, cwd):
 def journal_transcript(records, owner, conversation_key, session, agent):
     account = session.get("claudeAccount" if agent == "claude" else "codexAccount")
     session_id = session.get("claudeSessionId" if agent == "claude" else "codexThreadId")
+    def same_conversation(item):
+        key = item.get("conversationKey") or ""
+        if key == conversation_key:
+            return True
+        marker = ":desktop-thread:"
+        return (marker in key and marker in conversation_key and bool(session_id)
+                and key.split(marker, 1)[0] == conversation_key.split(marker, 1)[0]
+                and item.get("sessionId") == session_id)
     candidates = [item for item in records if item.get("owner") == owner
-                  and item.get("conversationKey") == conversation_key and item.get("agent") == agent
+                  and same_conversation(item) and item.get("agent") == agent
                   and item.get("account") == account and item.get("cwd") == session.get("cwd")]
     if session_id:
         candidates = [item for item in candidates if item.get("sessionId") == session_id]
@@ -125,7 +133,9 @@ def build_handoff(session, agent, source_account, target_account, records, max_c
     if not records and previous.get("cwd") == cwd:
         records = list(previous.get("records") or [])
     # Keep the original request and the latest two rounds; never recursively embed handoffs.
-    selected = records[:1] + records[max(1, len(records) - 2):]
+    original = next((item for item in records if str(item.get("prompt") or "").strip()),
+                    records[0] if records else None)
+    selected = ([original] if original is not None else []) + [item for item in records[-2:] if item is not original]
     selected = [dict(item, result=extract_actions(item.get("result") or "")[0]) for item in selected]
     max_chars = max(1000, min(int(max_chars), 20000))
     header = (f"[本地项目交接：{source_account} → {target_account}]\n"

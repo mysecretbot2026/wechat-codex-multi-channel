@@ -222,6 +222,30 @@ class AccountHandoffTests(unittest.TestCase):
         self.assertTrue(any(item[0] == "project/create" for item in fake.calls))
         self.assertIsNone(self.service._get_session(self.owner)["codexAccountHandoff"])
 
+    def test_new_desktop_thread_keeps_handoff_when_pending_key_becomes_a_real_thread(self):
+        self.service.desktop = desktop_tests.FakeDesktop()
+        self.command("/d-sessions all")
+        self.command("/d-session 1")
+        self.command("/codex backup")
+        def finish(key, text):
+            self.runs.append((key, text))
+            self.service.state.update_session(key, codexThreadId="new-backup-thread")
+            return "处理完成"
+        self.service.codex.run = finish
+        self.command("B 账号新增的要求：保留原数据")
+        self.assertEqual(self.service._get_session(self.owner)["codexThreadId"], "new-backup-thread")
+        self.command("/codex third")
+        packet = self.service._get_session(self.owner)["codexAccountHandoff"]
+        self.assertIn("用户提问", packet["text"])
+        self.assertIn("B 账号新增的要求：保留原数据", packet["text"])
+        self.assertEqual(packet["text"].count("[本地项目交接："), 1)
+
+        self.command("C 账号的新进度")
+        self.command("/codex main")
+        packet = self.service._get_session(self.owner)["codexAccountHandoff"]
+        self.assertIn("用户提问", packet["text"])
+        self.assertIn("C 账号的新进度", packet["text"])
+
     def test_desktop_browsing_keeps_execution_target_until_new_session_is_selected(self):
         self.service.desktop = desktop_tests.FakeDesktop()
         self.command("/d-sessions all")
@@ -291,6 +315,24 @@ class AccountHandoffTests(unittest.TestCase):
         self.assertFalse(self.runs)
         self.assertIn("正在登录", self.sent[-1])
         self.assertIsNotNone(self.service._get_session(self.owner)["codexAccountHandoff"])
+
+    def test_pending_guidance_can_be_cancelled_before_its_agent_process_starts(self):
+        typing_calls, stopped = [], []
+        def run(key, text):
+            self.runs.append((key, text))
+            self.service._append_pending_guidance(key, "稍后处理的补充")
+            return "第一项完成"
+        def typing(*_args):
+            typing_calls.append(True)
+            if len(typing_calls) == 2:
+                stopped.append(self.service._cancel_runner(self.owner, reset_session=False))
+            return lambda: None
+        self.service.codex.run = run
+        self.service._start_typing_loop = typing
+        self.command("第一项任务")
+        self.assertEqual(len(self.runs), 1)
+        self.assertEqual(stopped, [True])
+        self.assertEqual(self.latest()["status"], "cancelled")
 
     def test_overspecified_login_alias_does_not_create_a_wechat_bot(self):
         with patch.object(self.service.codex_device_login, "start") as start, \

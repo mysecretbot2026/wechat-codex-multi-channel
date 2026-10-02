@@ -1251,6 +1251,7 @@ class MultiWechatCodexService:
                    for key, value in task.get("routing", {}).items()):
                 raise ValueError("排队期间目标会话设置发生变化，本次任务未执行。请确认目标后重新发送任务。")
             self.tasks.update(task_id, status="running", startedAt=time.time())
+            self.active_task_ids[conversation_key] = task_id
         if task.get("status") == "queued" and time.time() - task["receivedAt"] >= 2:
             self._send_text_safe(account, user_id, f"任务 [{task_id}] 开始执行 · {task['workspace']}")
         previous_task = getattr(self.task_context, "current_task_id", None)
@@ -1277,6 +1278,9 @@ class MultiWechatCodexService:
             raise
         finally:
             self.task_context.current_task_id = previous_task
+            with self.task_guard:
+                if self.active_task_ids.get(conversation_key) == task_id:
+                    self.active_task_ids.pop(conversation_key, None)
 
     def _conversation_is_selected(self, conversation_key):
         if self.DESKTOP_RUN_MARKER in conversation_key:
