@@ -58,6 +58,7 @@ class TaskJournal:
                 "sessionId": session.get("claudeSessionId") if session.get("agent") == "claude" else session.get("codexThreadId"),
                 "routing": {key: copy.deepcopy(session.get(key)) for key in ROUTING_FIELDS},
                 "title": " ".join(str(prompt or "").split())[:100] or "媒体任务",
+                "prompt": str(prompt or ""),
                 "status": "queued", "receivedAt": time.time(), "startedAt": None, "finishedAt": None,
                 "chunks": [], "media": [], "hasOutput": False, "unread": False,
                 "background": False, "notified": False, "deliveryError": "", "error": "",
@@ -93,6 +94,11 @@ class TaskJournal:
             return records[0] if records else None
         matches = [item for item in records if item["id"].startswith(value)]
         return matches[0] if len(matches) == 1 else None
+
+    def active(self):
+        with self.lock:
+            return copy.deepcopy([item for item in self.records.values()
+                                  if item.get("status") in {"queued", "running"}])
 
     def claimed_media_ids(self, conversation_key):
         with self.lock:

@@ -9,6 +9,7 @@ node_modules/
 
 .env
 config.json
+*.accounts.lock
 .venv/
 venv/
 

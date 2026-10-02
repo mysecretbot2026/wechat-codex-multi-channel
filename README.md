@@ -63,6 +63,7 @@ python3 -m wechat_codex_multi start
 | `codex.workingDirectory` | 默认项目目录；`claude.workingDirectory` 为空时沿用此目录 |
 | `codex.runner` | `exec` 或 `app-server`；默认 `exec` |
 | `codex.defaultAccount`、`codex.accounts` | 默认 Codex 账号和各账号的 `codexHome` |
+| `codex.accountsDirectory` | 自动注册新 Codex 账号时的目录根路径，默认 `~/.codex-accounts` |
 | `claude.defaultAccount`、`claude.accounts` | 默认 Claude 账号和各账号的 `claudeConfigDir`；空路径使用系统默认登录态 |
 | `codex.model`、`codex.reasoningEffort` | Codex 默认模型和 reasoning 档位 |
 | `claude.model`、`claude.effort` | Claude 默认模型和 effort 档位 |
@@ -90,6 +91,7 @@ python3 -m wechat_codex_multi start
 | `notifications.backgroundCompletion` | 后台任务完成或失败时发送简短提醒，默认 `true`；微信用户可单独设置 |
 | `notifications.retryFailedDeliveriesOnMessage` | 收到新消息时自动补发最近一条发送失败的结果，并重试未送达的后台提醒，默认 `true` |
 | `notifications.menuTimeoutSeconds` | 中文菜单编号选择的有效时间，默认 120 秒，最短 10 秒 |
+| `handoff.enabled`、`handoff.maxChars` | 切换账号后自动生成本地项目交接，默认开启；下一条任务携带的交接原文最多 6000 字符，可设置 1000–20000 |
 
 例如添加独立 Codex 账号：
 
@@ -107,7 +109,7 @@ python3 -m wechat_codex_multi start
 }
 ```
 
-修改 `config.json` 后重启服务才会加载新设置。微信中的 `/runner` 切换仅作用于当前服务进程，重启后仍采用配置文件中的值。
+新增 `codex.accounts` 项会在下一条微信消息或账号命令时加载，无需重启；登录命令自动注册的账号立即生效。已有账号的目录修改、删除、默认账号，以及其他配置字段需要重启服务加载。热加载只追加独立账号，不替换运行中任务的身份；无效 JSON 或重复账号目录不会覆盖当前账号列表。微信中的 `/runner` 切换仅作用于当前服务进程，重启后仍采用配置文件中的值。
 
 ## 微信命令
 
@@ -236,7 +238,17 @@ Claude 普通用量查询通过本机 Claude Code TUI 的 `/usage` 完成；组�
 | `/model auto` | 桌面会话取消尚未生效的手动模型设置，恢复沿用会话自身设置；`default`、`inherit` 同义 |
 | `/runner [exec|app-server]` | 查看或临时切换 Codex runner |
 
-`/codex-use <名称>` 是旧版兼容命令，等价于 `/codex <名称>`。账号选择支持编号、完整名称和唯一前缀；切换账号会重置该 Agent 的会话 ID。切换 Agent 时，Codex 和 Claude 各自的会话 ID 分开保存。
+`/codex-use <名称>` 是旧版兼容命令，等价于 `/codex <名称>`。账号选择支持编号、完整名称和唯一前缀；切换账号会重置该 Agent 的会话 ID，保留当前项目目录，并为下一条任务准备本地交接。切回旧账号也会新建会话，不自动恢复那个账号曾经处理的其他会话；原会话可通过会话列表手动选择。切换 Agent 时，Codex 和 Claude 各自的会话 ID 分开保存。
+
+#### 切换账号继续同一项目
+
+CLI 工作区先用 `/ws use <项目名>` 选中项目，等待任务结束或发送 `/停止`，然后 `/codex backup3`（Claude 使用 `/claude <账号>`）。下一条普通任务会在新账号下新建会话，沿用原目录，并自动带入交接内容。切换账号这一步只处理本地记录，不启动模型；不自动恢复目标账号以前的会话，也不自动重跑失败任务。
+
+桌面 Codex 可直接用 `/codex backup3` 或 `/account backup3` 切换当前项目的执行账号。`/d-account backup3` 仍只切换项目和会话列表的浏览账号；随后 `/d-session new` 才在当前目录准备新账号会话，并生成交接。首次执行时，系统会在新账号的本地项目列表中找到对应目录，或创建指向同一目录的项目记录。原账号的会话、项目和凭据保留在原目录。
+
+交接只读取同一 Bot、微信用户、工作区及所选会话的记录：保留最初要求和最近两轮的要求、结果或失败信息，以及本地 Git 文件状态。没有 Bot 任务记录时，会读取所选桌面会话或本地 CLI 会话的文字历史。交接使用有长度上限的原文摘录，不调用 LLM 总结，不复制登录凭据，不回放历史媒体发送动作。新账号实际处理任务时，这些上下文仍计入正常输入 token。
+
+交接在成功完成一轮任务后清除；登录或执行失败会保留，供下一次任务使用。连续切换账号且未执行任务时，交接可继续传递，不嵌套重复上下文。`/reset`、显式新建同账号会话、选择其他历史会话或更换目录会清除待交接内容。设置 `handoff.enabled: false` 可恢复仅清空会话 ID 的旧行为。
 
 当 `modelOptions` 为空时，Codex CLI 路由使用默认账号的 `CODEX_HOME` 调用 `codex debug models`；发现超时才退回内置列表。桌面路由使用当前所选会话账号的 App Server `model/list`，读取该账号实际返回的模型和逐模型推理档位；不会用 CLI 默认账号或内置旧列表替代。Claude 通过 CLI 的 stream-json 初始化协议发现模型；失败时会提示错误。模型清单取决于已安装的 CLI 和账号，README 不固定列出某个版本的清单。`/model <编号>` 中的编号以刚查询到的列表为准；桌面路由按当前会话最近一次显示的模型列表解释编号。桌面路由只写模型名、不写档位时，使用该模型返回的默认档位。
 
@@ -334,7 +346,9 @@ Codex 同一会话只能由一个 App Server 进程持有写锁。微信现在�
 
 ## 远程登录 Codex
 
-先在 `config.json` 注册独立账号目录，例如 `backup` 对应 `~/.codex-accounts/backup`。如果要用 `~/.codex-accounts/backup2`，就在 `codex.accounts` 中添加 `{"name":"backup2","codexHome":"~/.codex-accounts/backup2"}`。后台服务需要能够调用 `codex`，但此目录可以尚未登录。新增配置后重启服务。
+后台服务需要能够调用 `codex`。管理员可以直接发送 `/codex-login backup3 user@example.com`；新账号会自动创建独立目录、追加到实际加载的 `config.json` 并立即生效。目录默认是 `~/.codex-accounts/backup3`，可用 `codex.accountsDirectory` 设置根路径。账号名支持 1–64 位字母、数字、下划线、点和短横线，不接受路径或纯数字。`status` 和 `cancel` 查询不会自动创建账号；没有写入权限或配置无效时，会返回本地错误提示。
+
+`/login backup3 user@example.com` 是等价的 Codex 登录简写。原有 `/login` 和 `/login <微信Bot昵称>` 继续用于微信扫码添加 Bot，不改变含义。也可手工在 `codex.accounts` 中添加独立目录定义；新增项会在下一条消息加载。
 
 管理员在微信中发送：
 

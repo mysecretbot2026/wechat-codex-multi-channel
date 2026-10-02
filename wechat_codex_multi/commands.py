@@ -8,7 +8,7 @@ COMMANDS = {
     "/ws", "/sessions", "/session", "/desktop", "/d-projects", "/d-project", "/d-sessions",
     "/d-session", "/d-account", "/new-project", "/n-p", "/d-new-project", "/d-n-p", "/d-p-n",
     "/usage", "/agents", "/agent", "/account", "/codex", "/codex-use", "/codex-accounts",
-    "/codex-login", "/claude", "/claude-accounts", "/model", "/models", "/runner", "/login",
+    "/codex-login", "/codex-logout", "/claude", "/claude-accounts", "/model", "/models", "/runner", "/login",
     "/restart", "/cancel", "/interrupt", "/reset", "/cwd", "/guide", "/update", "/codex-update",
     "/d-update", "/tasks", "/result", "/resend", "/notify",
 }
@@ -31,6 +31,9 @@ def normalize_command(text):
     if value.startswith("／"):
         value = "/" + value[1:]
     parts = value.split(maxsplit=1)
+    login_parts = value.split()
+    if len(login_parts) >= 3 and login_parts[0] == "/login" and any("@" in part for part in login_parts[2:]):
+        return "/codex-login " + " ".join(login_parts[1:])
     if parts and parts[0] in ALIASES:
         return ALIASES[parts[0]] + (" " + parts[1] if len(parts) > 1 else "")
     return value

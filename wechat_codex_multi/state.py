@@ -368,27 +368,20 @@ class StateStore:
         with self.lock:
             session = self.state["sessions"].setdefault(conversation_key, {})
             target = str(agent or "codex").strip().lower()
-            if target == "claude":
-                key = "claudeSessionId"
-            elif target == "all":
-                changed = False
-                for key in ("codexThreadId", "claudeSessionId"):
-                    if session.get(key):
-                        session[key] = ""
-                        changed = True
-                if not changed:
-                    return False
-                session["lastActive"] = int(time.time() * 1000)
-                self.save()
-                return True
-            else:
-                key = "codexThreadId"
-            if session.get(key) == "":
-                return False
-            session[key] = ""
+            agents = ("codex", "claude") if target == "all" else ("claude" if target == "claude" else "codex",)
+            changed = False
+            for name in agents:
+                key = "claudeSessionId" if name == "claude" else "codexThreadId"
+                field = name + "AccountHandoff"
+                if session.get(key) != "" or session.get(field):
+                    session[key] = ""
+                    session[field] = None
+                    changed = True
+                session[name + "ContextResetAt"] = time.time()
+            # A fresh context also separates past task records when there is no thread yet.
             session["lastActive"] = int(time.time() * 1000)
             self.save()
-            return True
+            return changed
 
     def clear_codex_thread(self, thread_id, account_name=""):
         """Drop references to a thread removed from the shared Codex store."""

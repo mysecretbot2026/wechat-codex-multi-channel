@@ -26,6 +26,7 @@ DEFAULT_CONFIG = {
         "timeoutMs": 7200_000,
         "bypassApprovalsAndSandbox": True,
         "defaultAccount": "main",
+        "accountsDirectory": "~/.codex-accounts",
         "accounts": [
             {
                 "name": "main",
@@ -72,6 +73,7 @@ DEFAULT_CONFIG = {
         "retryFailedDeliveriesOnMessage": True,
         "menuTimeoutSeconds": 120,
     },
+    "handoff": {"enabled": True, "maxChars": 6000},
     "updates": {
         "timeoutSeconds": 900,
         "cliCommand": [],

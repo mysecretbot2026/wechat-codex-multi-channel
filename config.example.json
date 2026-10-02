@@ -18,6 +18,7 @@
     "timeoutMs": 7200000,
     "bypassApprovalsAndSandbox": true,
     "defaultAccount": "main",
+    "accountsDirectory": "~/.codex-accounts",
     "accounts": [
       {
         "name": "main",
@@ -80,6 +81,10 @@
     "desktopAppPath": "",
     "desktopMethod": "native",
     "desktopUpdateMenuTitles": []
+  },
+  "handoff": {
+    "enabled": true,
+    "maxChars": 6000
   },
   "media": {
     "enabled": true,

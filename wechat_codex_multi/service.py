@@ -9,6 +9,7 @@ from pathlib import Path
 
 from . import logging as log
 from .actions import execute_actions, extract_actions
+from .account_registry import CodexAccountRegistry
 from .agent_runner import AgentRunnerManager
 from .agents import normalize_agent, resolve_session_agent
 from .claude_accounts import (
@@ -56,6 +57,7 @@ from .commands import COMMANDS, normalize_command, unknown_command_message
 from .login import login_with_qr, render_qr_png
 from .media import send_local_media
 from .media_outbox import acknowledge_media_outbox, media_outbox_path, read_media_outbox
+from .project_handoff import build_handoff, journal_transcript, local_transcript, native_transcript, pending_handoff
 from .session_discovery import (
     format_session_time,
     list_claude_sessions,
@@ -75,6 +77,7 @@ class MultiWechatCodexService:
 
     def __init__(self, config):
         self.config = config
+        self.account_registry = CodexAccountRegistry(config)
         self.state = StateStore(
             config["stateDir"],
             save_debounce_ms=int(config.get("state", {}).get("saveDebounceMs") or 0),
@@ -219,6 +222,7 @@ class MultiWechatCodexService:
             log.info(f"monitor stopped accountId={account_id}")
 
     def _submit_message(self, account, msg):
+        self._refresh_account_catalog()
         account_id = account["accountId"]
         user_id = msg.get("from_user_id")
         if not user_id:
@@ -239,6 +243,7 @@ class MultiWechatCodexService:
             self.notification_executor.submit(self._retry_local_deliveries, account, user_id, base_conversation_key)
         with self._desktop_selection_lock(base_conversation_key):
             conversation_key = self._conversation_key_for_text(base_conversation_key, text)
+            received_session = self._task_session(conversation_key)
         if self._is_command(text) and not self._is_workspace_run_command(text):
             if text.split(maxsplit=1)[0] == "/guide" and self._target_has_task(conversation_key):
                 self.command_executor.submit(self._receive_guidance, account, user_id, conversation_key, text, msg,
@@ -258,7 +263,7 @@ class MultiWechatCodexService:
                     self.command_executor.submit(self._receive_guidance, account, user_id, conversation_key, text, msg,
                                                  self.active_task_ids.get(conversation_key))
                     return
-                session = self._task_session(conversation_key)
+                session = received_session
                 prompt = parts[3] if parts else text
                 task = self.tasks.create(base_conversation_key, conversation_key, session, prompt,
                                          self._workspace_name_from_key(base_conversation_key, conversation_key))
@@ -307,6 +312,7 @@ class MultiWechatCodexService:
 
     def _task_session(self, conversation_key):
         session = self._get_session(conversation_key)
+        session["cwd"] = session.get("cwd") or self.config["codex"]["workingDirectory"]
         session.update(agent=resolve_session_agent(self.config, session),
                        codexAccount=resolve_session_codex_account(self.config, session)["name"],
                        claudeAccount=resolve_session_claude_account(self.config, session)["name"])
@@ -530,6 +536,7 @@ class MultiWechatCodexService:
             codexAccount=account_name, cwd=session.get("cwd") or self.config["codex"]["workingDirectory"],
             desktopProjectId=session.get("desktopProjectId") or "",
             desktopPendingThread=bool(session.get("desktopPendingId")),
+            codexAccountHandoff=session.get("codexAccountHandoff"),
         )
         return run_key
 
@@ -863,6 +870,7 @@ class MultiWechatCodexService:
                                           or bool(task and task["status"] == "queued"))))
 
     def _handle_message(self, account, user_id, base_conversation_key, text, conversation_key=None):
+        self._refresh_account_catalog()
         conversation_key = conversation_key or base_conversation_key
         command = self._local_input(base_conversation_key, text)
         text = command
@@ -1169,6 +1177,8 @@ class MultiWechatCodexService:
                 if workspace_name != self.state.DEFAULT_WORKSPACE:
                     self.state.upsert_workspace(base_conversation_key, workspace_name, cwd)
                 updates = {"cwd": cwd, "codexThreadId": "", "claudeSessionId": "", "desktopPendingId": ""}
+                updates.update(codexAccountHandoff=None, claudeAccountHandoff=None,
+                               codexContextResetAt=time.time(), claudeContextResetAt=time.time())
                 if session.get("codexClient") == "desktop":
                     codex_account = resolve_session_codex_account(self.config, session)
                     project_id = project_for_thread({"cwd": cwd}, self.desktop.projects(codex_account))
@@ -1249,13 +1259,20 @@ class MultiWechatCodexService:
         agent = resolve_session_agent(self.config, session)
         guard = self.updates.agent_run() if agent == "codex" else contextlib.nullcontext()
         try:
+            if agent == "codex" and self.codex_device_login.is_running(
+                    resolve_session_codex_account(self.config, session)["codexHome"]):
+                raise ValueError("该 Codex 账号正在登录，请完成登录后重新发送任务。")
             with guard:
                 self._run_codex_and_reply_locked(account, user_id, conversation_key, text)
         except CodexCancelled:
-            self.tasks.update(task_id, status="cancelled", finishedAt=time.time())
+            self.tasks.update(task_id, status="cancelled", finishedAt=time.time(),
+                              sessionId=self._get_session(conversation_key).get(
+                                  "claudeSessionId" if agent == "claude" else "codexThreadId"))
             raise
         except Exception as err:
             self.tasks.update(task_id, status="failed", finishedAt=time.time(), error=str(err), unread=True,
+                              sessionId=self._get_session(conversation_key).get(
+                                  "claudeSessionId" if agent == "claude" else "codexThreadId"),
                               background=not self._conversation_is_selected(conversation_key))
             raise
         finally:
@@ -1269,6 +1286,20 @@ class MultiWechatCodexService:
         return self.state.workspace_conversation_key(owner, active) == conversation_key
 
     def _run_codex_and_reply_locked(self, account, user_id, conversation_key, text):
+        session = self._task_session(conversation_key)
+        agent = session["agent"]
+        account_name = session.get("claudeAccount" if agent == "claude" else "codexAccount")
+        packet = pending_handoff(session, agent, account_name)
+        if packet and self.DESKTOP_RUN_MARKER in conversation_key and not session.get("codexThreadId"):
+            target = resolve_session_codex_account(self.config, session)
+            projects = self.desktop.projects(target)
+            project = next((item for item in projects if session["cwd"] in item.get("roots", [])), None)
+            if project is None:
+                project = self.desktop.create_project(target, packet["projectName"], session["cwd"], packet["id"])
+            self.state.update_session(conversation_key, desktopProjectId=project["id"])
+        if packet:
+            self.tasks.update(self.task_context.current_task_id, handoffRecords=packet["records"])
+            text += "\n\n" + packet["text"]
         if self.DESKTOP_RUN_MARKER in conversation_key:
             thread_id = self._get_session(conversation_key).get("codexThreadId") or ""
             running = self._desktop_running_context(thread_id) if thread_id else None
@@ -1287,6 +1318,8 @@ class MultiWechatCodexService:
             result = self.codex.run(conversation_key, text)
         finally:
             stop_typing()
+        if packet:
+            self._consume_account_handoff(conversation_key, agent, packet["id"])
         turn_id = ""
         if self.DESKTOP_RUN_MARKER in conversation_key:
             with self._desktop_selection_lock(conversation_key):
@@ -1333,6 +1366,8 @@ class MultiWechatCodexService:
                 cleaned = f"任务 [{task_id}] 已完成，本轮没有可发送的文字或附件。"
             record = self.tasks.update(
                 task_id, status="completed", finishedAt=time.time(), hasOutput=True, background=background,
+                sessionId=self._get_session(conversation_key).get(
+                    "claudeSessionId" if self._get_session(conversation_key).get("agent") == "claude" else "codexThreadId"),
                 turnId=turn_id, chunks=[{"text": chunk, "sent": False}
                                        for chunk in split_text(cleaned, int(self.config.get("textChunkLimit") or 4000))],
                 media=list(media.values()), unread=True,
@@ -1563,6 +1598,7 @@ class MultiWechatCodexService:
                 self._send_text(account, user_id, "该会话已归档，请先 /session unarchive。")
                 return
             updates = {"agent": item["agent"], "codexClient": "", "desktopPendingId": ""}
+            updates[item["agent"] + "AccountHandoff"] = None
             if item.get("cwd"):
                 updates["cwd"] = item["cwd"]
             if item["agent"] == "claude":
@@ -1774,6 +1810,7 @@ class MultiWechatCodexService:
             "桌面 Codex 项目与会话：",
             "/d-p-n <目录> 创建桌面原生项目并切换；/d-new-project、/d-n-p 等价",
             "/d-account [账号] 选择本地 Codex 账号",
+            "/d-account 只切换浏览账号；跨账号 /d-session new 沿用当前目录并自动交接",
             "/d-projects 列桌面原生项目并编号",
             "/d-project use <编号> 切换桌面项目并准备新会话",
             "/d-sessions all 2 或 /d-sessions page 2 查看全部会话第 2 页",
@@ -1950,6 +1987,7 @@ class MultiWechatCodexService:
                     base_key, agent="codex", codexClient="desktop", codexThreadId="",
                     codexAccount=codex_account["name"], cwd=project["roots"][0],
                     desktopProjectId=project_id, desktopPendingId=uuid.uuid4().hex,
+                    codexAccountHandoff=None,
                     codexModel="", codexReasoningEffort="",
                 )
             self._send_text(account, user_id,
@@ -1960,6 +1998,11 @@ class MultiWechatCodexService:
                 raise ValueError("用法：/d-session new；指定新目录请使用 /d-new-project <目录>。")
             if self.codex.is_running(conversation_key):
                 raise ValueError("当前工作区有任务运行中，请先中断或等待完成。")
+            previous = resolve_session_codex_account(self.config, self._get_session(conversation_key))
+            switching_account = previous["name"] != codex_account["name"]
+            if switching_account and not self._switch_execution_account(
+                    account, user_id, conversation_key, "codex", previous, codex_account):
+                return
             with self._desktop_selection_lock(conversation_key):
                 cwd = self._get_session(conversation_key).get("cwd") or self.config["codex"]["workingDirectory"]
                 current = self._get_session(conversation_key)
@@ -1978,6 +2021,7 @@ class MultiWechatCodexService:
                     codexThreadId="", codexAccount=codex_account["name"],
                     desktopProjectId=project_id,
                     codexModel="", codexReasoningEffort="", desktopPendingId=uuid.uuid4().hex,
+                    codexAccountHandoff=current.get("codexAccountHandoff") if switching_account else None,
                 )
                 self.desktop_thread_cache.pop(conversation_key, None)
             self._send_text(account, user_id,
@@ -2087,6 +2131,7 @@ class MultiWechatCodexService:
                     codexAccount=target_account["name"], cwd=item["cwd"] or self._get_session(conversation_key).get("cwd"),
                     desktopProjectId="" if project_id == "_ungrouped" else project_id,
                     codexModel="", codexReasoningEffort="", desktopPendingId="",
+                    codexAccountHandoff=None,
                 )
                 run_key = self._desktop_execution_key(conversation_key)
                 latest = self.desktop.latest_result(target_account, thread_id)
@@ -2558,7 +2603,9 @@ class MultiWechatCodexService:
                 return
             self.state.upsert_workspace(base_conversation_key, name, cwd)
             workspace_key = self._workspace_key(base_conversation_key, name)
-            self.state.update_session(workspace_key, cwd=cwd, codexThreadId="", claudeSessionId="", desktopPendingId="")
+            self.state.update_session(workspace_key, cwd=cwd, codexThreadId="", claudeSessionId="", desktopPendingId="",
+                                      codexAccountHandoff=None, claudeAccountHandoff=None,
+                                      codexContextResetAt=time.time(), claudeContextResetAt=time.time())
             self._send_text(
                 account,
                 user_id,
@@ -2731,6 +2778,67 @@ class MultiWechatCodexService:
             return
         self._handle_codex_switch(account, user_id, conversation_key, selector)
 
+    def _refresh_account_catalog(self):
+        try:
+            if self.account_registry.refresh():
+                self._model_options = None
+                self.desktop_model_options_cache.clear()
+        except (OSError, ValueError, TypeError, RuntimeError) as error:
+            log.warn(f"account config unchanged: {error}")
+
+    def _switch_execution_account(self, account, user_id, conversation_key, agent, source, target):
+        with self._desktop_selection_lock(conversation_key):
+            session = self._task_session(conversation_key)
+            desktop = agent == "codex" and session.get("codexClient") == "desktop"
+            source_key = self._desktop_execution_key(conversation_key) if desktop else conversation_key
+            if self._target_has_task(source_key):
+                self._send_text(account, user_id, "当前会话有任务运行中或排队中，请先 /停止 或等待完成后再切换账号。")
+                return False
+            packet = None
+            if self.config.get("handoff", {}).get("enabled", True):
+                owner = ":".join(self._desktop_parent_key(conversation_key).split(":", 2)[:2])
+                records = journal_transcript(self.tasks.list(owner, limit=None), owner, source_key, session, agent)
+                if not records and desktop and session.get("codexThreadId"):
+                    # Read existing local history through App Server; this does not start an Agent turn.
+                    try:
+                        records = native_transcript(self.desktop.read(source, session["codexThreadId"], include_turns=True))
+                    except Exception as error:
+                        log.warn(f"native history unavailable for account handoff: {error}")
+                if not records:
+                    records = local_transcript(source, agent,
+                                               session.get("claudeSessionId" if agent == "claude" else "codexThreadId"),
+                                               session.get("cwd") or "")
+                packet = build_handoff(session, agent, source["name"], target["name"], records,
+                                       self.config.get("handoff", {}).get("maxChars", 6000))
+            updates = {"agent": agent, "cwd": session["cwd"], agent + "Account": target["name"],
+                       "claudeSessionId" if agent == "claude" else "codexThreadId": "",
+                       agent + "AccountHandoff": packet, agent + "ContextResetAt": time.time()}
+            if desktop:
+                updates.update(desktopProjectId="", desktopPendingId=uuid.uuid4().hex,
+                               codexModel="", codexReasoningEffort="", desktopModelOverride={})
+                self.desktop_account_selection[conversation_key] = target["name"]
+                self.desktop_project_cache.pop(conversation_key, None)
+                self.desktop_thread_cache.pop(conversation_key, None)
+            self.state.update_session(conversation_key, **updates)
+            return True
+
+    def _codex_account_has_task(self, target):
+        target_home = str(Path(target["codexHome"]).expanduser().resolve())
+        return any(item.get("agent") == "codex"
+                   and str(Path(get_codex_account(self.config, item.get("account"))["codexHome"]).expanduser().resolve()) == target_home
+                   for item in self.tasks.active())
+
+    def _consume_account_handoff(self, conversation_key, agent, packet_id):
+        field = agent + "AccountHandoff"
+        with self._desktop_selection_lock(conversation_key):
+            for key in {conversation_key, self._desktop_parent_key(conversation_key)}:
+                current = self._get_session(key).get(field) or {}
+                if current.get("id") == packet_id:
+                    updates = {field: None}
+                    if self.DESKTOP_RUN_MARKER in conversation_key:
+                        updates["desktopProjectId"] = self._get_session(conversation_key).get("desktopProjectId") or ""
+                    self.state.update_session(key, **updates)
+
     def _handle_codex_switch(self, account, user_id, conversation_key, selector):
         session = self._get_session(conversation_key)
         current_agent = resolve_session_agent(self.config, session)
@@ -2779,15 +2887,19 @@ class MultiWechatCodexService:
         updates = {"agent": "codex"}
         account_changed = name != current.get("name")
         if account_changed:
-            updates.update(codexAccount=name, codexThreadId="")
-        self.state.update_session(conversation_key, **updates)
+            if not self._switch_execution_account(account, user_id, conversation_key, "codex", current, target):
+                return
+        else:
+            self.state.update_session(conversation_key, **updates)
         lines = []
         if switching_agent:
             lines.append("已切换 Agent: codex")
         if account_changed:
             lines.append(f"已切换 Codex 账号: {name}")
             lines.append(f"CODEX_HOME: {target.get('codexHome')}")
-            lines.append("已重置当前 Codex thread。")
+            lines.append("已重置当前 Codex thread，保留原项目目录；下一条任务新建会话。")
+            if self.config.get("handoff", {}).get("enabled", True):
+                lines.append("已准备本地项目交接，下一条任务自动带入历史要求和结果摘录。")
         else:
             lines.append(f"当前已在使用 Codex 账号: {name}")
         self._send_text(
@@ -2812,8 +2924,25 @@ class MultiWechatCodexService:
                 self._send_text(account, user_id, "用法：/codex-login [账号名] [期望邮箱]")
                 return
             selector = parts[1] if len(parts) > 1 else ""
+        expected_email = parts[2] if len(parts) > 2 and action not in {"status", "cancel"} else ""
+        if expected_email and (not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", expected_email)
+                               or len(expected_email) > 254):
+            self._send_text(account, user_id, "期望邮箱格式无效。用法：/codex-login [账号名] [期望邮箱]")
+            return
         target = (find_codex_account(self.config, selector) if selector else
                   resolve_session_codex_account(self.config, self._get_session(conversation_key)))
+        if not target and selector and action not in {"status", "cancel"}:
+            if any(item["name"].lower().startswith(selector.lower()) for item in list_codex_accounts(self.config)):
+                self._send_text(account, user_id, "账号前缀不唯一，请使用完整账号名。")
+                return
+            try:
+                target, created = self.account_registry.register(selector)
+            except (OSError, ValueError, TypeError, RuntimeError) as error:
+                self._send_text(account, user_id, f"未知 Codex 账号：{selector}；自动注册失败：{error}")
+                return
+            if created:
+                self._send_text(account, user_id, f"已添加 Codex 账号 {target['name']}\n目录：{target['codexHome']}\n"
+                                "配置已保存并立即生效，无需重启。完成登录后可切换到该账号。")
         if not target:
             self._send_text(account, user_id, f"未知 Codex 账号：{selector}。发送 /codex-accounts 查看可用账号。")
             return
@@ -2833,12 +2962,11 @@ class MultiWechatCodexService:
             cancelled = self.codex_device_login.cancel(home)
             self._send_text(account, user_id, f"已取消 {name} 的设备码登录。" if cancelled else f"{name} 当前没有进行中的设备码登录。")
             return
-        expected_email = parts[2] if len(parts) > 2 else ""
-        if expected_email and ("@" not in expected_email or len(expected_email) > 254):
-            self._send_text(account, user_id, "期望邮箱格式无效。用法：/codex-login [账号名] [期望邮箱]")
-            return
         if self.codex_device_login.is_running(home):
             self._send_text(account, user_id, f"{name} 的设备码登录已在进行中。发送 /codex-login status {name} 查看状态。")
+            return
+        if self._codex_account_has_task(target):
+            self._send_text(account, user_id, f"{name} 当前有 Codex 任务运行中或排队中，请任务结束或停止后再登录。")
             return
         for run in self._active_runs():
             if run.get("agent") != "codex":
@@ -2912,15 +3040,19 @@ class MultiWechatCodexService:
         updates = {"agent": "claude"}
         account_changed = name != current.get("name")
         if account_changed:
-            updates.update(claudeAccount=name, claudeSessionId="")
-        self.state.update_session(conversation_key, **updates)
+            if not self._switch_execution_account(account, user_id, conversation_key, "claude", current, target):
+                return
+        else:
+            self.state.update_session(conversation_key, **updates)
         lines = []
         if switching_agent:
             lines.append("已切换 Agent: claude")
         if account_changed:
             lines.append(f"已切换 Claude 账号: {name}")
             lines.append(f"CLAUDE_CONFIG_DIR: {target.get('claudeConfigDir')}")
-            lines.append("已重置当前 Claude session。")
+            lines.append("已重置当前 Claude session，保留原项目目录；下一条任务新建会话。")
+            if self.config.get("handoff", {}).get("enabled", True):
+                lines.append("已准备本地项目交接，下一条任务自动带入历史要求和结果摘录。")
         else:
             lines.append(f"当前已在使用 Claude 账号: {name}")
         self._send_text(
@@ -3325,6 +3457,8 @@ class MultiWechatCodexService:
                 "/d-session 管理桌面会话；/d-account 选择桌面账号",
                 "/new-project <目录> 新建 CLI 工作区；/d-p-n <目录> 新建桌面原生项目",
                 "/ws 工作区；/agent 切换 Agent；/account 切换账号",
+                "切换账号保留项目目录，下一条任务新建会话并带入本地交接；切回旧账号也不自动恢复旧会话",
+                "/login <Codex账号> <邮箱> 注册并登录（管理员）；/login [昵称] 添加微信 Bot",
                 "/model 查看/切换模型；桌面会话用 /model auto 恢复自动沿用",
                 "/guide <内容> 引导；/interrupt 中断；/reset 重置",
                 "/update cli 更新 Codex CLI；/update desktop 触发桌面内置更新（管理员，不消耗 token）",
@@ -3373,6 +3507,8 @@ class MultiWechatCodexService:
                 "/account <编号|名称|next> 切换当前 Agent 账号",
                 "/codex [编号|名称|next] 切到 Codex，可同时切账号",
                 "/codex-login [账号名] [期望邮箱] 远程登录 Codex CLI（adminUsers only）",
+                "新账号自动创建目录并写入 config.json，立即生效；/login <账号名> <邮箱> 为简写",
+                "手动新增 codex.accounts 也无需重启；其他配置、账号目录修改和删除需重启",
                 "/codex-login status|cancel [账号名] 查看或取消设备码登录（adminUsers only）",
                 "/claude [编号|名称|next] 切到 Claude，可同时切账号",
                 "/model 查看或切换当前 Agent 的模型和 effort",
