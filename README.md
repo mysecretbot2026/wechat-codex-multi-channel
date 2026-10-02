@@ -213,13 +213,15 @@ macOS 桌面更新默认调用 App 自带的“检查更新”，微信只需发
 | 命令 | 作用 |
 | --- | --- |
 | `/help`、`/help all` | 查看常用命令或完整命令清单 |
-| `/status` | 查看当前工作区、目录、Agent、账号、模型、会话与运行状态 |
+| `/status` | 查看当前对话标题、Desktop/CLI 来源、会话所属账号，以及工作区、目录、模型和运行状态 |
 | `/active` | 查看正在运行的任务 |
 | `/accounts`、`/users` | 列出已连接的微信 Bot 账号和用户信息 |
 | `/usage` | 查看当前 Agent、当前账号用量 |
 | `/usage codex`、`/usage claude` | 查看当前工作区对应的 Codex 或 Claude 账号用量 |
 | `/usage all`、`/usage codex all`、`/usage claude all` | 汇总配置中的全部账号用量 |
 | `/usage claude api [days]` | 用 Anthropic Admin API 查看组织级 Claude API 用量；需要 Admin Key |
+
+`/status` 顶部显示当前执行会话的标题、来源（Codex Desktop、Codex CLI 或 Claude CLI）及所属账号。仅用 `/d-account` 切换列表浏览账号不会改变状态里的会话归属。标题按当前账号和完整会话 ID 从本地元数据读取，桌面会话会复用已有的只读 `thread/read`；不创建、恢复会话，也不调用模型。标题变更在下次查询时读取；本地元数据不可用时会注明列表缓存或“标题暂不可用”。切换账号、新建或重置后的空会话显示“新会话（尚未创建）”。
 
 Claude 普通用量查询通过本机 Claude Code TUI 的 `/usage` 完成；组织级 `api` 查询是另一条路径。`ANTHROPIC_ADMIN_KEY` 可通过环境变量或 macOS Keychain 提供，Keychain service 默认是 `wechat-codex-multi.anthropic-admin-key`。相关超时、查询天数和 Keychain service 可在 `claude.*` 中配置。
 

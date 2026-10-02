@@ -25,6 +25,94 @@ def clean_title(value, fallback="untitled", limit=90):
     return text[: limit - 1] + "…" if len(text) > limit else text
 
 
+def _session_title_row(db_path, query, session_id):
+    if not db_path.is_file():
+        return {}
+    con = None
+    try:
+        con = sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        con.row_factory = sqlite3.Row
+        row = con.execute(query, (session_id,)).fetchone()
+        return dict(row) if row else {}
+    except (OSError, sqlite3.Error):
+        return {}
+    finally:
+        if con is not None:
+            con.close()
+
+
+def read_codex_session_title(codex_account, session_id, desktop=False):
+    """Read one account's selected title without listing or resuming threads."""
+    if not session_id:
+        return ""
+    home = expand_home((codex_account or {}).get("codexHome") or "~/.codex")
+    row = _session_title_row(home / "state_5.sqlite", "select * from threads where id = ?", session_id)
+    titles = [row.get("name")]
+    if desktop:
+        native = _session_title_row(
+            home / "sqlite" / "codex-dev.db",
+            "select display_title from local_thread_catalog where thread_id = ? and source_kind != 'chatgpt'",
+            session_id,
+        )
+        titles.append(native.get("display_title"))
+    titles.extend([row.get("title"), row.get("preview")])
+    for value in titles:
+        title = clean_title(value, fallback="")
+        if title:
+            return title
+    title = ""
+    try:
+        with (home / "session_index.jsonl").open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(item, dict) and item.get("id") == session_id:
+                    title = clean_title(item.get("thread_name"), fallback="")
+    except OSError:
+        pass
+    return title
+
+
+def read_claude_session_title(claude_account, session_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", session_id or ""):
+        return ""
+    home = expand_home((claude_account or {}).get("claudeConfigDir") or "~/.claude")
+    try:
+        meta = json.loads((home / "usage-data" / "session-meta" / f"{session_id}.json").read_text())
+        title = clean_title(meta.get("first_prompt"), fallback="") if isinstance(meta, dict) else ""
+        if title:
+            return title
+    except (OSError, ValueError):
+        pass
+    for path in (home / "projects").glob(f"*/{session_id}.jsonl"):
+        if home not in path.resolve().parents:
+            continue
+        try:
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                # Only inspect the opening messages of the selected conversation.
+                for _ in range(128):
+                    line = handle.readline(65536)
+                    if not line:
+                        break
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(item, dict) or item.get("type") != "user":
+                        continue
+                    message = item.get("message") or {}
+                    if not isinstance(message, dict):
+                        continue
+                    title = clean_title(_content_text(message.get("content")), fallback="")
+                    if title:
+                        return title
+        except OSError:
+            continue
+    return ""
+
+
 def short_session_id(session_id, size=12):
     return str(session_id or "")[:size] or "-"
 

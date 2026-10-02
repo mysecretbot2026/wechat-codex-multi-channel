@@ -59,9 +59,12 @@ from .media import send_local_media
 from .media_outbox import acknowledge_media_outbox, media_outbox_path, read_media_outbox
 from .project_handoff import build_handoff, journal_transcript, local_transcript, native_transcript, pending_handoff
 from .session_discovery import (
+    clean_title,
     format_session_time,
     list_claude_sessions,
     list_codex_sessions,
+    read_claude_session_title,
+    read_codex_session_title,
     short_session_id,
     sort_sessions,
 )
@@ -487,6 +490,9 @@ class MultiWechatCodexService:
         active = self.state.get_active_workspace(base_conversation_key)
         workspace_key = self.state.workspace_conversation_key(base_conversation_key, active)
         first = text.strip().split(maxsplit=1)[0] if text.strip() else ""
+        if first == "/status" and resolve_session_agent(self.config, self._get_session(workspace_key)) != "codex":
+            # A different Agent may retain the previous Desktop session settings.
+            return workspace_key
         if not first.startswith("/") or first in {"/status", "/model", "/models", "/guide", "/interrupt", "/cancel", "/reset"}:
             return self._desktop_execution_key(workspace_key)
         return workspace_key
@@ -912,16 +918,19 @@ class MultiWechatCodexService:
             self._handle_workspace_command(account, user_id, base_conversation_key, conversation_key, command)
             return
         if command == "/status":
-            conversation_key = self._desktop_execution_key(conversation_key)
             session = self._get_session(conversation_key)
             agent = resolve_session_agent(self.config, session)
+            if agent == "codex":
+                conversation_key = self._desktop_execution_key(conversation_key)
+                session = self._get_session(conversation_key)
             codex_account = resolve_session_codex_account(self.config, session)
             claude_account = resolve_session_claude_account(self.config, session)
-            model_selection = self._current_codex_model(conversation_key, session)
+            model_selection = self._current_codex_model(conversation_key, session) if agent == "codex" else {}
             claude_model = resolve_session_claude_model(self.config, session)
             workspace_name = self._workspace_name_from_key(base_conversation_key, conversation_key)
             session_id = session.get("claudeSessionId") if agent == "claude" else session.get("codexThreadId")
-            lines = [
+            lines = self._status_conversation_lines(conversation_key, session, model_selection) + [
+                "",
                 f"accountId: {account['accountId']}",
                 f"conversation: {conversation_key}",
                 f"workspace: {workspace_name}",
@@ -3075,6 +3084,7 @@ class MultiWechatCodexService:
         if thread_id:
             try:
                 native = self.desktop.read(resolve_session_codex_account(self.config, session), thread_id)
+                current["sessionTitle"] = clean_title(native.get("name"), fallback="")
                 if native.get("model"):
                     current.update(model=native["model"], reasoningEffort=native.get("reasoningEffort") or "",
                                    source="会话设置（默认沿用）")
@@ -3091,6 +3101,36 @@ class MultiWechatCodexService:
             current.update(model=override.get("model") or "", reasoningEffort=override.get("reasoningEffort") or "",
                            source="微信指定（下一轮生效，当前任务不变）")
         return current
+
+    def _status_conversation_lines(self, conversation_key, session, model_selection):
+        agent = resolve_session_agent(self.config, session)
+        desktop = agent == "codex" and session.get("codexClient") == "desktop"
+        selected_account = (resolve_session_claude_account(self.config, session) if agent == "claude"
+                            else resolve_session_codex_account(self.config, session))
+        session_id = session.get("claudeSessionId" if agent == "claude" else "codexThreadId") or ""
+        source = "Claude CLI" if agent == "claude" else "Codex Desktop（桌面）" if desktop else "Codex CLI"
+        title = "新会话（尚未创建）"
+        if session_id:
+            title = model_selection.get("sessionTitle") or ""
+            if not title:
+                try:
+                    title = (read_claude_session_title(selected_account, session_id) if agent == "claude"
+                             else read_codex_session_title(selected_account, session_id, desktop=desktop))
+                except (OSError, ValueError, RuntimeError):
+                    title = ""
+            if not title:
+                cache = self.desktop_thread_cache if desktop else self.session_selection_cache
+                key = self._desktop_parent_key(conversation_key) if desktop else conversation_key
+                for item in cache.get(key) or []:
+                    if (item.get("id" if desktop else "sessionId") == session_id
+                            and item.get("account") == selected_account["name"]
+                            and (desktop or item.get("agent") == agent)):
+                        title = clean_title(item.get("title"), fallback="")
+                        if title:
+                            title += "（本地列表缓存）"
+                            break
+            title = title or "标题暂不可用"
+        return [f"当前对话：{title}", f"会话来源：{source}", f"会话账号：{selected_account['name']}"]
 
     def _available_model_options(self, session=None):
         if self._model_options is not None:
@@ -3454,7 +3494,7 @@ class MultiWechatCodexService:
                 "/提醒 on|off（/notify）设置后台完成提醒；/停止 等同 /interrupt",
                 "任务自动回执并固定目标；后台完成自动提醒；发送失败保留记录并在下次消息时补发。",
                 "菜单、查询、回执、提醒和重发均不调用模型。",
-                "/status 状态；/active 运行中的任务",
+                "/status 当前对话标题、Desktop/CLI 来源、所属账号及状态；/active 运行中的任务",
                 "/sessions [codex|claude|all] CLI 会话；/session 管理 CLI 会话",
                 "/session delete 3 4 5 批量删除预览；60 秒内再加 confirm 确认（管理员）",
                 "/d-projects 桌面项目；/d-sessions all 2 查看会话第 2 页",
@@ -3485,7 +3525,7 @@ class MultiWechatCodexService:
                 "自动回执、菜单、任务查询、后台提醒和结果重发不调用模型；实际任务由所选 Agent 执行。",
                 "未知或参数错误的 /命令会被本地拦截；排队任务不会因切换项目而改投。",
                 "结果与发送状态保存在 stateDir/tasks；下次消息自动补发最近一条发送失败的结果。",
-                "/status 查看当前工作区状态",
+                "/status 查看当前对话标题、Desktop/CLI 来源、所属账号及工作区状态",
                 "/reset 重置当前工作区当前 Agent 会话",
                 "/cancel 或 /interrupt 中断当前任务，保留当前会话",
                 "/interrupt <新任务> 中断当前任务，保留当前会话并改做新任务",
