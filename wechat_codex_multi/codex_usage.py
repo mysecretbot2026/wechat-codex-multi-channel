@@ -1,16 +1,20 @@
 import json
+import math
 import os
-import select
-import shutil
-import subprocess
-import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from .codex_app_server import AppServerProcess
+from .codex_runtime import resolve_codex_bin
 
-def read_codex_usage(codex_bin="codex", timeout_s=15, codex_home=""):
+
+def read_codex_usage(codex_bin="codex", timeout_s=15, codex_home="", prefer_app_server=False):
+    if prefer_app_server:
+        # Desktop credentials may live in the OS keychain. A fresh process reads
+        # the selected home's current login without reusing a catalog auth cache.
+        return _read_codex_usage_app_server(codex_bin=codex_bin, timeout_s=timeout_s, codex_home=codex_home)
     try:
         return _read_codex_usage_backend(codex_bin=codex_bin, timeout_s=timeout_s, codex_home=codex_home)
     except Exception as backend_err:
@@ -48,21 +52,14 @@ def _load_chatgpt_auth(codex_home=""):
 
 
 def _refresh_codex_auth(codex_bin="codex", timeout_s=15, codex_home=""):
-    binary = shutil.which(codex_bin) or codex_bin
-    env = os.environ.copy()
-    if codex_home:
-        env["CODEX_HOME"] = str(Path(os.path.expandvars(os.path.expanduser(str(codex_home)))).resolve())
-    subprocess.run(
-        [binary, "login", "status"],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=max(5, timeout_s),
-        check=True,
-    )
+    home = str(Path(os.path.expandvars(os.path.expanduser(str(codex_home)))).resolve()) if codex_home else ""
+    server = AppServerProcess(resolve_codex_bin(codex_bin), codex_home=home)
+    try:
+        info = server.request("account/read", {"refreshToken": True}, timeout_s=timeout_s) or {}
+        if not info.get("account"):
+            raise RuntimeError("所选 Codex 账号未登录，无法刷新令牌")
+    finally:
+        server.close()
 
 
 def _request_chatgpt_usage(access_token, timeout_s=15):
@@ -114,71 +111,25 @@ def _normalize_chatgpt_window(window):
 
 
 def _read_codex_usage_app_server(codex_bin="codex", timeout_s=15, codex_home=""):
-    binary = shutil.which(codex_bin) or codex_bin
-    env = os.environ.copy()
-    if codex_home:
-        env["CODEX_HOME"] = str(Path(os.path.expandvars(os.path.expanduser(str(codex_home)))).resolve())
-    messages = [
-        {
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {"name": "wechat-codex-multi", "title": None, "version": "0.1.0"},
-                "capabilities": {"experimentalApi": True},
-            },
-        },
-        {"method": "initialized"},
-        {"id": 2, "method": "account/rateLimits/read", "params": None},
-    ]
-    payload = "".join(json.dumps(message, separators=(",", ":")) + "\n" for message in messages)
-    process = subprocess.Popen(
-        [binary, "app-server", "--listen", "stdio://"],
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    assert process.stdin is not None
-    process.stdin.write(payload)
-    process.stdin.flush()
-    deadline = time.time() + timeout_s
-    stderr_chunks = []
+    binary = resolve_codex_bin(codex_bin, prefer_desktop=True)
+    home = str(Path(os.path.expandvars(os.path.expanduser(str(codex_home)))).resolve()) if codex_home else ""
+    server = AppServerProcess(binary, codex_home=home)
     try:
-        while time.time() < deadline:
-            streams = [s for s in (process.stdout, process.stderr) if s is not None]
-            readable, _, _ = select.select(streams, [], [], 0.5)
-            for stream in readable:
-                line = stream.readline()
-                if not line:
-                    continue
-                if stream is process.stderr:
-                    stderr_chunks.append(line)
-                    continue
-                try:
-                    message = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if message.get("id") == 2:
-                    if "error" in message:
-                        raise RuntimeError(json.dumps(message["error"], ensure_ascii=False))
-                    return message.get("result") or {}
-            if process.poll() is not None:
-                break
+        info = server.request("account/read", {"refreshToken": False}, timeout_s=timeout_s) or {}
+        account = info.get("account") or {}
+        if not account:
+            raise RuntimeError("所选 Codex 账号未登录，无法查询套餐用量")
+        if account.get("type") == "apiKey":
+            raise RuntimeError("所选 Codex 账号使用 API Key，无法查询 ChatGPT 套餐用量")
+        usage = dict(server.request("account/rateLimits/read", timeout_s=timeout_s) or {})
+        usage["account"] = account
+        return usage
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            process.kill()
-    error = "".join(stderr_chunks).strip()
-    raise RuntimeError(error or "Codex 没有返回用量信息")
+        server.close()
 
 
 def format_codex_usage(usage):
-    rate_limits = (usage or {}).get("rateLimits") or {}
+    rate_limits = _codex_rate_limits(usage or {})
     lines = ["Codex 用量："]
     _append_codex_usage_lines(lines, rate_limits, (usage or {}).get("account") or {})
     return "\n".join(lines)
@@ -199,20 +150,46 @@ def format_codex_usage_all(results):
             lines.append(f"读取失败：{error}")
             continue
         usage = result.get("usage") or {}
-        rate_limits = usage.get("rateLimits") or {}
+        rate_limits = _codex_rate_limits(usage)
         _append_codex_usage_lines(lines, rate_limits, usage.get("account") or {})
     return "\n".join(lines)
+
+
+def _codex_rate_limits(usage):
+    legacy = usage.get("rateLimits") or {}
+    buckets = usage.get("rateLimitsByLimitId") or {}
+    if buckets.get("codex"):
+        # The default single-bucket view can refer to a different metered model.
+        base = legacy if legacy.get("limitId") in {None, "codex"} else {}
+        return dict(base, **buckets["codex"])
+    return legacy
 
 
 def _append_codex_usage_lines(lines, rate_limits, account=None):
     account_line = _format_usage_account(account or {})
     if account_line:
         lines.append(f"登录账号：{account_line}")
-    plan = rate_limits.get("planType")
+    plan = rate_limits.get("planType") or (account or {}).get("planType")
     if plan:
         lines.append(f"套餐：{plan}")
-    _append_window(lines, "5 小时窗口", rate_limits.get("primary"))
-    _append_window(lines, "周窗口", rate_limits.get("secondary"))
+    is_pro = str(plan or "").strip().lower() == "pro"
+    if is_pro:
+        lines.append("5 小时限制：不适用（Pro）")
+    shown = False
+    for key, fallback in (("primary", "主窗口"), ("secondary", "次窗口")):
+        window = rate_limits.get(key)
+        if not window:
+            continue
+        duration = _finite_number(window.get("windowDurationMins"))
+        if is_pro and duration == 300:
+            # Older snapshots can still contain the retired Pro five-hour slot.
+            continue
+        if str(plan or "").lower() == "plus" and not duration:
+            fallback = "5 小时窗口" if key == "primary" else "周窗口"
+        _append_window(lines, _window_label(duration, fallback), window)
+        shown = True
+    if not shown:
+        lines.append("用量窗口：无数据")
     credits = rate_limits.get("credits") or {}
     if credits:
         lines.append(
@@ -226,18 +203,41 @@ def _append_codex_usage_lines(lines, rate_limits, account=None):
         lines.append(f"限额状态：{reached}")
 
 
+def _finite_number(value):
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _window_label(duration, fallback):
+    if not duration or duration <= 0:
+        return fallback
+    if duration == 10080:
+        return "周窗口"
+    if duration % 1440 == 0:
+        return f"{duration / 1440:g} 天窗口"
+    if duration % 60 == 0:
+        return f"{duration / 60:g} 小时窗口"
+    return f"{duration:g} 分钟窗口"
+
+
 def _append_window(lines, label, window):
-    if not window:
-        lines.append(f"{label}：无数据")
-        return
-    used = window.get("usedPercent")
-    duration = window.get("windowDurationMins")
+    used = _finite_number(window.get("usedPercent"))
+    duration = _finite_number(window.get("windowDurationMins"))
     resets_at = window.get("resetsAt")
-    lines.append(f"{label}：已用 {used}%")
-    if duration:
-        lines.append(f"窗口长度：{duration} 分钟")
+    lines.append(f"{label}：已用 {used:g}%" if used is not None else f"{label}：已用比例无数据")
+    if duration and duration > 0:
+        lines.append(f"窗口长度：{duration:g} 分钟")
     if resets_at:
-        lines.append(f"重置时间：{datetime.fromtimestamp(int(resets_at)).strftime('%Y-%m-%d %H:%M:%S')}")
+        try:
+            reset_time = datetime.fromtimestamp(int(resets_at)).strftime('%Y-%m-%d %H:%M:%S')
+        except (TypeError, ValueError, OverflowError, OSError):
+            reset_time = "未知"
+        lines.append(f"重置时间：{reset_time}")
 
 
 def _format_usage_account(account):

@@ -120,6 +120,10 @@ def load_config(path=None):
     if config_file.exists():
         loaded = json.loads(config_file.read_text(encoding="utf-8"))
     config = deep_merge(DEFAULT_CONFIG, loaded)
+    # An implicit main account must use the same login directory as the CLI.
+    # Explicit per-account homes remain authoritative.
+    if "accounts" not in (loaded.get("codex") or {}):
+        config["codex"]["accounts"] = []
     config["configFile"] = str(config_file)
     config["defaultAgent"] = default_agent(config)
     config["stateDir"] = expand_path(config["stateDir"])

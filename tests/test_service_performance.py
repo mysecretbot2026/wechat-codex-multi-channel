@@ -923,6 +923,25 @@ class ServicePerformanceTests(unittest.TestCase):
             self.assertIn("Codex 全部账号用量", sent[-1])
             self.assertIn("Claude 全部账号用量", sent[-1])
 
+    def test_usage_cli_uses_current_workspace_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = make_test_config(tmp)
+            config["codex"]["accounts"].append({"name": "backup", "codexHome": tmp + "/backup"})
+            service = MultiWechatCodexService(config)
+            self.addCleanup(service.codex.terminate_all)
+            self.addCleanup(service.executor.shutdown, wait=True)
+            self.addCleanup(service.command_executor.shutdown, wait=True)
+            account = {"accountId": "acct-1"}
+            base = service.state.conversation_key("acct-1", "user-1")
+            service.state.set_active_workspace(base, "other")
+            key = service.state.workspace_conversation_key(base, "other")
+            service.state.update_session(key, agent="codex", codexAccount="backup")
+            service._send_text = lambda *args: None
+            with patch("wechat_codex_multi.service.read_codex_usage", return_value={}) as read_usage:
+                routed = service._conversation_key_for_text(base, "/usage")
+                service._handle_message(account, "user-1", base, "/usage", routed)
+            read_usage.assert_called_once_with("codex", codex_home=tmp + "/backup")
+
     def test_usage_claude_api_command_reads_admin_usage_for_days(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = MultiWechatCodexService(make_test_config(tmp))

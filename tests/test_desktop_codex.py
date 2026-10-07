@@ -44,6 +44,7 @@ class FakeServer:
 
 class FakeRunner:
     def __init__(self):
+        self.bin = "/desktop/codex"
         self.server = FakeServer()
         self.lock = threading.RLock()
         self.contexts = {}
@@ -320,6 +321,45 @@ class DesktopCommandTests(unittest.TestCase):
         self.select_desktop_thread()
         self.command("/models")
         self.assertIn(("model/list", "backup"), self.fake.calls)
+
+    def test_usage_after_switching_to_desktop_uses_selected_thread_account(self):
+        self.service.config["codex"]["accounts"].append({"name": "backup", "codexHome": self.tmp.name + "/backup"})
+        self.command("/d-account backup")
+        run_key = self.select_desktop_thread()
+        # Browsing another account does not switch the selected thread's account.
+        self.command("/d-account main")
+        before = {key: self.service._get_session(key) for key in (self.key, run_key)}
+        with patch("wechat_codex_multi.service.read_codex_usage", return_value={
+            "account": {"email": "backup@example.com", "planType": "pro"},
+            "rateLimits": {"primary": {"usedPercent": 23, "windowDurationMins": 10080}},
+        }) as read_usage:
+            for command in ("/usage", "/usage codex"):
+                self.assertEqual(self.service._conversation_key_for_text(self.key, command), self.key)
+                text = self.command(command)
+                read_usage.assert_called_with(
+                    "/desktop/codex", codex_home=self.tmp.name + "/backup", prefer_app_server=True,
+                )
+                self.assertIn("backup@example.com", text)
+                self.assertIn("周窗口：已用 23%", text)
+                self.assertNotIn("5 小时窗口", text)
+        self.assertEqual({key: self.service._get_session(key) for key in before}, before)
+
+    def test_usage_on_pending_desktop_project_does_not_create_thread(self):
+        self.command("/d-project use 1")
+        before = self.service._get_session(self.key)
+        self.assertEqual(before["codexClient"], "desktop")
+        self.assertFalse(before["codexThreadId"])
+        with patch("wechat_codex_multi.service.read_codex_usage", return_value={}) as read_usage:
+            self.command("/usage")
+        read_usage.assert_called_once_with("/desktop/codex", codex_home=self.tmp.name, prefer_app_server=True)
+        self.assertEqual(self.service._get_session(self.key), before)
+
+    def test_usage_after_leaving_desktop_returns_to_cli_query(self):
+        self.select_desktop_thread()
+        self.command("/desktop off")
+        with patch("wechat_codex_multi.service.read_codex_usage", return_value={}) as read_usage:
+            self.command("/usage codex")
+        read_usage.assert_called_once_with("codex", codex_home=self.tmp.name)
 
     def test_short_desktop_commands(self):
         self.assertIn("手机控制助手", self.command("/d-projects"))

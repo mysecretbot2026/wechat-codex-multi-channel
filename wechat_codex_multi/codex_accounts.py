@@ -18,7 +18,7 @@ def normalize_codex_accounts(config):
         raw_accounts = [
             {
                 "name": codex.get("defaultAccount") or DEFAULT_CODEX_ACCOUNT,
-                "codexHome": codex.get("codexHome") or "~/.codex",
+                "codexHome": codex.get("codexHome") or os.environ.get("CODEX_HOME") or "~/.codex",
             }
         ]
     for raw in raw_accounts:

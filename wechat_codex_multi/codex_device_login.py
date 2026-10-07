@@ -1,15 +1,17 @@
-"""Run Codex's device-code login without sending the request through an agent."""
+"""Manage Codex CLI authentication without sending requests through an agent."""
 
 import base64
 import binascii
+import contextlib
 import json
 import os
 import re
-import shutil
 import signal
 import subprocess
 import threading
 from pathlib import Path
+
+from .codex_runtime import resolve_codex_bin
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -34,8 +36,8 @@ def cached_email(codex_home):
 def login_status(codex_bin, codex_home, timeout=10):
     env = os.environ.copy()
     env["CODEX_HOME"] = str(codex_home)
-    binary = shutil.which(codex_bin) or codex_bin
     try:
+        binary = resolve_codex_bin(codex_bin)
         result = subprocess.run(
             [binary, "login", "status"], env=env, capture_output=True,
             text=True, encoding="utf-8", errors="replace", timeout=timeout,
@@ -51,6 +53,60 @@ class CodexDeviceLoginManager:
         self.timeout_seconds = timeout_seconds
         self._lock = threading.Lock()
         self._processes = {}
+        self._logging_out = set()
+        self._active_runs = {}
+
+    @contextlib.contextmanager
+    def account_run(self, codex_home):
+        """Reserve the account before a task starts, excluding concurrent logout."""
+        home = str(Path(codex_home).expanduser().resolve())
+        with self._lock:
+            if home in self._logging_out:
+                raise RuntimeError("该 Codex 账号正在退出登录，请稍后重试。")
+            self._active_runs[home] = self._active_runs.get(home, 0) + 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                remaining = self._active_runs[home] - 1
+                if remaining:
+                    self._active_runs[home] = remaining
+                else:
+                    self._active_runs.pop(home)
+
+    def logout(self, codex_home, on_logged_out=None, timeout=10):
+        home = str(Path(codex_home).expanduser().resolve())
+        with self._lock:
+            if home in self._processes:
+                return False, "设备码登录正在进行中，请先取消登录后再退出。"
+            if self._active_runs.get(home):
+                return False, "当前有 Codex 任务运行，请任务结束后再退出登录。"
+            if home in self._logging_out:
+                return False, "正在退出登录，请稍后重试。"
+            self._logging_out.add(home)
+        try:
+            env = os.environ.copy()
+            env["CODEX_HOME"] = home
+            try:
+                binary = resolve_codex_bin(self.codex_bin)
+                result = subprocess.run(
+                    [binary, "logout"], env=env, stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=timeout,
+                )
+            except subprocess.TimeoutExpired:
+                return False, "Codex 退出登录超时，请检查登录状态后重试。"
+            except OSError as exc:
+                return False, f"Codex 退出登录失败：{exc}"
+            if result.returncode != 0:
+                details = (result.stderr or result.stdout).strip()
+                return False, f"Codex 退出登录失败：{details or f'退出码 {result.returncode}'}"
+            if on_logged_out:
+                on_logged_out()
+            return True, "已退出登录。"
+        finally:
+            with self._lock:
+                self._logging_out.discard(home)
 
     def is_running(self, codex_home):
         with self._lock:
@@ -61,9 +117,9 @@ class CodexDeviceLoginManager:
         home = str(Path(codex_home).expanduser().resolve())
         env = os.environ.copy()
         env["CODEX_HOME"] = home
-        binary = shutil.which(self.codex_bin) or self.codex_bin
+        binary = resolve_codex_bin(self.codex_bin)
         with self._lock:
-            if home in self._processes:
+            if home in self._processes or home in self._logging_out:
                 return False
             process = subprocess.Popen(
                 [binary, "login", "--device-auth"], env=env,
@@ -129,6 +185,8 @@ class CodexDeviceLoginManager:
                     identity = f"账号：{email}" if email else "账号邮箱未能从本地缓存读取，请在官方页面核对。"
                     message = f"Codex 登录成功。{identity}\nCODEX_HOME: {home}"
         finally:
+            with contextlib.suppress(Exception):
+                process.stdout.close()
             with self._lock:
                 if self._processes.get(home) is process:
                     self._processes.pop(home, None)

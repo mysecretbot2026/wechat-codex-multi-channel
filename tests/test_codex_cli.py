@@ -28,6 +28,11 @@ class FakeState:
 
 
 class CodexCliRunnerTests(unittest.TestCase):
+    def setUp(self):
+        resolver = patch("wechat_codex_multi.codex_cli.resolve_codex_bin", side_effect=lambda value: value)
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
     def test_accumulator_converts_generated_image_event_to_send_action(self):
         with tempfile.TemporaryDirectory() as codex_home:
             accumulator = CodexAccumulator("thread-1", codex_home=codex_home)

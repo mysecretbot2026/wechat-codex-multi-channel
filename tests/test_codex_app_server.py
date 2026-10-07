@@ -4,7 +4,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from wechat_codex_multi.codex_app_server import AppServerProcess, AppTurnState, CodexAppServerRunner
 from wechat_codex_multi.codex_cli import CodexCancelled
@@ -141,6 +141,19 @@ def make_config(tmp):
 
 
 class CodexAppServerPromptVersionTests(unittest.TestCase):
+    def test_authentication_failure_does_not_reset_cli_thread_or_create_new_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = FakeState()
+            runner = CodexAppServerRunner(make_config(tmp), state)
+            server = Mock()
+            server.request.side_effect = RuntimeError("workspace routing discovery unauthorized (401)")
+            context = runner._context("conversation-1", "thread-1")
+            with self.assertRaisesRegex(RuntimeError, "workspace routing discovery"):
+                runner._ensure_thread(server, context, "conversation-1", {"codexThreadId": "thread-1"},
+                                      tmp, "", "", "main", "version", "instructions")
+            self.assertEqual(state.reset_calls, [])
+            self.assertEqual([call.args[0] for call in server.request.call_args_list], ["thread/resume"])
+
     def test_resume_with_current_prompt_version_omits_base_instructions(self):
         with tempfile.TemporaryDirectory() as tmp:
             runner = CodexAppServerRunner(make_config(tmp), FakeState())

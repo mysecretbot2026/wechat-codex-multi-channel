@@ -23,14 +23,6 @@
       {
         "name": "main",
         "codexHome": "~/.codex"
-      },
-      {
-        "name": "backup",
-        "codexHome": "~/.codex-accounts/backup"
-      },
-      {
-        "name": "work",
-        "codexHome": "~/.codex-accounts/work"
       }
     ],
     "extraPrompt": ""

@@ -15,7 +15,7 @@ npm install
 cp config.example.json config.json
 ```
 
-先编辑 `config.json`：将 `codex.workingDirectory` 设为实际项目目录，检查 `codex.accounts` 中的账号目录。示例文件含 `main`、`backup`、`work`，这些目录需要分别登录；不使用的账号可以从数组中删除。
+先安装 Codex CLI（`npm install -g @openai/codex`），或使用本机已安装的桌面应用内置 Codex。编辑 `config.json`：将 `codex.workingDirectory` 设为实际项目目录，检查 `codex.accounts` 中的账号目录。示例文件只配置 `main`；需要多个账号时再添加独立目录，并在每个目录分别登录。
 
 添加第一个微信 Bot 账号，按终端提示扫码：
 
@@ -58,8 +58,8 @@ python3 -m wechat_codex_multi start
 | `stateDir` | 微信账号、会话和媒体的本地状态目录 |
 | `defaultAgent` | 新工作区默认使用 `codex` 或 `claude` |
 | `wechat.baseUrl`、`botType`、`routeTag` | 微信 Bot 接口设置；`routeTag` 非空时作为请求头发送 |
-| `codex.bin`、`claude.bin` | CLI 命令名或绝对路径 |
-| `codex.desktopBin` | 桌面会话 App Server 的可执行文件；macOS 默认优先使用 ChatGPT.app 内置的 Codex，与桌面版本保持一致 |
+| `codex.bin`、`claude.bin` | CLI 命令名或绝对路径；Codex 默认从 PATH、常见安装目录和桌面 App 中定位，不要复制其他机器的绝对路径 |
+| `codex.desktopBin` | 桌面会话 App Server 的可执行文件；macOS 默认查找系统及用户 Applications 下的 ChatGPT.app、Codex.app，兼容平铺与嵌套 CLI 路径；找不到内置程序时使用 `codex.bin` |
 | `codex.workingDirectory` | 默认项目目录；`claude.workingDirectory` 为空时沿用此目录 |
 | `codex.runner` | `exec` 或 `app-server`；默认 `exec` |
 | `codex.defaultAccount`、`codex.accounts` | 默认 Codex 账号和各账号的 `codexHome` |
@@ -223,6 +223,8 @@ macOS 桌面更新默认调用 App 自带的“检查更新”，微信只需发
 
 `/status` 顶部显示当前执行会话的标题、来源（Codex Desktop、Codex CLI 或 Claude CLI）及所属账号。仅用 `/d-account` 切换列表浏览账号不会改变状态里的会话归属。标题按当前账号和完整会话 ID 从本地元数据读取，桌面会话会复用已有的只读 `thread/read`；不创建、恢复会话，也不调用模型。标题变更在下次查询时读取；本地元数据不可用时会注明列表缓存或“标题暂不可用”。切换账号、新建或重置后的空会话显示“新会话（尚未创建）”。
 
+Codex 用量按服务端返回的窗口时长显示，不固定把主窗口当作 5 小时窗口。Pro 显示“5 小时限制：不适用”，并显示返回的周额度或其他窗口；缺少的窗口不会显示成 0%。切到 desktop 会话后，`/usage` 和 `/usage codex` 使用该会话所属账号的 `CODEX_HOME` 和桌面 Codex 程序，通过独立 App Server 查询当前登录与额度，支持系统钥匙串中的登录信息。查询不调用模型、不恢复 thread，也不会占用会话写锁。`/usage codex all` 仍按配置逐个查询账号。
+
 Claude 普通用量查询通过本机 Claude Code TUI 的 `/usage` 完成；组织级 `api` 查询是另一条路径。`ANTHROPIC_ADMIN_KEY` 可通过环境变量或 macOS Keychain 提供，Keychain service 默认是 `wechat-codex-multi.anthropic-admin-key`。相关超时、查询天数和 Keychain service 可在 `claude.*` 中配置。
 
 ### Agent、账号和模型
@@ -342,6 +344,7 @@ Codex 同一会话只能由一个 App Server 进程持有写锁。微信现在�
 | `/codex-login [账号名] [期望邮箱]` | 为配置中的 Codex 账号发起设备码登录 |
 | `/codex-login status [账号名]` | 查看 Codex CLI 登录状态和正在进行的设备码流程 |
 | `/codex-login cancel [账号名]` | 取消正在进行的设备码流程 |
+| `/codex-logout <账号名>` | 退出指定 Codex CLI 账号的登录；必须填写配置中的完整账号名 |
 | `/restart` | 重启后台服务；需有 launchd 等监护进程自动拉起 |
 
 `/accounts`、`/users` 可由允许访问 Bot 的用户查询；修改、登录和重启操作需要 `adminUsers`。如果你不希望普通用户看到账号列表，应只允许可信用户访问 Bot。终端也可运行 `python3 -m wechat_codex_multi rename-user <选择器> <新昵称>` 或 `delete-user <选择器>`。
@@ -374,6 +377,20 @@ CODEX_HOME="$HOME/.codex-accounts/backup" codex login status
 ```
 
 登录状态只说明本地 CLI 有凭据；如果实际请求仍返回 401，应在相同的 `CODEX_HOME` 重新登录。每个机器和账号目录应维护自己的新鲜授权，不要反复复制旧的 `auth.json` 覆盖已经刷新的文件。
+
+没有显式配置 `codex.accounts` 时，默认账号沿用 `CODEX_HOME` 环境变量（未设置时为 `~/.codex`）；显式配置的账号目录优先。只在桌面端登录或在别的目录登录，不代表所选账号目录已获得授权。凭据可以保存在文件或系统钥匙串中，不要求手动复制 `auth.json`。相关行为见 [OpenAI 官方认证文档](https://learn.chatgpt.com/docs/auth)。
+
+遇到 `workspace routing discovery unauthorized (401)`，服务仅在请求被工作区发现阶段拒绝时，通过官方 App Server `account/read`、`refreshToken: true` 刷新所选账号令牌并重试一次。CLI 已产生工具活动或回复、模型回合已经执行后失败时，不会自动重放。刷新失败会给出所选账号和重新登录命令，保留原会话。`codex login status` 不用于刷新令牌。接口说明见 [OpenAI App Server 文档](https://learn.chatgpt.com/docs/app-server)。
+
+要替换 `main` 的实际登录账号，管理员先发送退出命令，收到成功回复后再发起登录：
+
+```text
+/codex-logout main
+/codex-login main new-user@example.com
+/codex-login status main
+```
+
+退出命令直接调用指定 `CODEX_HOME` 下的 `codex logout`，不会调用模型。该账号在服务中有任务运行或设备码登录进行时会拒绝退出；退出期间也拒绝启动该账号的新任务或登录。成功后清理该账号的 App Server 登录缓存，后续登录完成也会刷新缓存。账号配置和本地会话历史保留，其他独立账号目录不受影响。共用该目录的本机 Codex 客户端也会受到登录态变化影响。
 
 ## 媒体
 
@@ -413,7 +430,7 @@ Agent 运行时会收到 `LOCAL_AGENT_MEDIA_OUTBOX`，因此通常不需要手�
 ./scripts/deploy_macos.sh
 ```
 
-常用选项：`--skip-account`、`--skip-npm`、`--no-start`、`--config /path/to/config.json`、`--venv /path/to/.venv`。脚本不会安装 Codex 或 Claude CLI，也不会覆盖已有配置。默认 launchd label 是 `com.wechat-codex-multi`；如果机器上已经用其他 label 运行本项目，先确认旧服务，避免同时启动两个轮询进程。可以设置 `WECHAT_CODEX_MULTI_LABEL` 使用现有 label。
+常用选项：`--skip-account`、`--skip-npm`、`--no-start`、`--config /path/to/config.json`、`--venv /path/to/.venv`。脚本不会安装 Codex 或 Claude CLI，也不会覆盖已有配置。部署时按配置检查默认 Codex 账号的登录状态，并将当前终端的 PATH（包括 nvm/npm 自定义安装目录）和已设置的 CODEX_HOME 写入 launchd 环境。默认 launchd label 是 `com.wechat-codex-multi`；如果机器上已经用其他 label 运行本项目，先确认旧服务，避免同时启动两个轮询进程。可以设置 `WECHAT_CODEX_MULTI_LABEL` 使用现有 label。
 
 ```bash
 launchctl print gui/$(id -u)/com.wechat-codex-multi
@@ -429,7 +446,9 @@ tail -f ~/Library/Logs/wechat-codex-multi/stderr.log
 | `/codex-login` 提示无权限 | 用微信 `/status` 返回的 `conversation` 找到自己消息对应的 `userId`，写入 `adminUsers` 并重启 |
 | `/codex-login` 找不到账号 | 先把账号名和 `codexHome` 加入 `codex.accounts`，重启后再发送命令 |
 | 设备码过期或未收到 | 重新发送 `/codex-login <账号名> <邮箱>`；确认 CLI 在服务的 `PATH` 内，查看服务日志 |
-| `workspace routing discovery unauthorized (401)` | 用 `/account` 确认实际选中的账号，再查对应 `CODEX_HOME` 的 `codex login status`；必要时重新设备码登录 |
+| `No such file or directory: .../ChatGPT.app/.../codex` | 更新服务并重启；旧桌面程序路径会自动重新定位。自定义路径须改成本机真实的 `codex.bin` / `codex.desktopBin`；完全未安装时先安装 Codex CLI |
+| 终端能运行 codex，后台提示找不到程序 | 更新后重新执行部署脚本，使 launchd 继承当前终端 PATH；也可在 `codex.bin` 配置 `command -v codex` 返回的绝对路径 |
+| `workspace routing discovery unauthorized (401)` | 自动刷新仍失败时，用 `/account` 确认账号，再由管理员发送 `/codex-login <账号名>`；终端登录必须设置该账号的 `CODEX_HOME`。`codex login status` 成功只代表本地存在凭据 |
 | refresh token already used | 在发生错误的那台机器、对应 `CODEX_HOME` 重新登录；停止用其他机器或旧备份的 `auth.json` 覆盖它 |
 | `/login` 没有微信二维码 | 确认已安装 npm 依赖；可在本机终端执行 `python3 -m wechat_codex_multi add-account` |
 | `/models` 查询失败 | 检查所选 CLI 是否已安装、可执行，以及账号登录状态；也可在配置中设置固定 `modelOptions` |

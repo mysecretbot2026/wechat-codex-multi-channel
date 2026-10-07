@@ -136,15 +136,26 @@ else
   log "Keeping existing config"
 fi
 
-if command -v codex >/dev/null 2>&1; then
-  if codex login status >/dev/null 2>&1; then
-    log "Codex CLI login looks available"
-  else
-    log "Codex CLI exists, but login status failed. Run: codex login"
-  fi
-else
-  log "codex command not found. Install and login Codex CLI before starting real traffic."
-fi
+"$VENV_PYTHON" - "$CONFIG_FILE" <<'PY'
+import sys
+from wechat_codex_multi.config import load_config
+from wechat_codex_multi.codex_accounts import get_codex_account
+from wechat_codex_multi.codex_device_login import login_status
+from wechat_codex_multi.codex_runtime import resolve_codex_bin
+
+config = load_config(sys.argv[1])
+account = get_codex_account(config)
+try:
+    binary = resolve_codex_bin(config["codex"].get("bin") or "codex")
+except OSError as error:
+    print(f"[deploy] {error}")
+else:
+    print(f"[deploy] Codex: {binary}; account: {account['name']}; CODEX_HOME: {account['codexHome']}")
+    logged_in, status = login_status(binary, account["codexHome"])
+    print(f"[deploy] Local Codex login: {status}")
+    if not logged_in:
+        print(f"[deploy] Login required: /codex-login {account['name']}")
+PY
 
 if command -v claude >/dev/null 2>&1; then
   if claude auth status --text >/dev/null 2>&1; then
@@ -182,7 +193,9 @@ mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
 log "Writing launchd plist: $PLIST_FILE"
 "$PYTHON_BIN" - "$PLIST_FILE" "$LABEL" "$VENV_PYTHON" "$PROJECT_DIR" "$CONFIG_FILE" "$LOG_DIR" <<'PY'
 import plistlib
+import os
 import sys
+from pathlib import Path
 
 plist_file, label, python_bin, project_dir, config_file, log_dir = sys.argv[1:]
 data = {
@@ -195,7 +208,11 @@ data = {
     ],
     "WorkingDirectory": project_dir,
     "EnvironmentVariables": {
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PATH": os.pathsep.join(dict.fromkeys(part for part in [
+            str(Path(python_bin).parent),
+            *os.environ.get("PATH", "").split(os.pathsep),
+            "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+        ] if part)),
         "WECHAT_CODEX_MULTI_CONFIG": config_file,
     },
     "RunAtLoad": True,
@@ -203,6 +220,8 @@ data = {
     "StandardOutPath": f"{log_dir}/stdout.log",
     "StandardErrorPath": f"{log_dir}/stderr.log",
 }
+if os.environ.get("CODEX_HOME"):
+    data["EnvironmentVariables"]["CODEX_HOME"] = os.environ["CODEX_HOME"]
 with open(plist_file, "wb") as fh:
     plistlib.dump(data, fh, sort_keys=False)
 PY

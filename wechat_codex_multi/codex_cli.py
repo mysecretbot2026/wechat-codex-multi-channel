@@ -1,7 +1,7 @@
 import json
+import contextlib
 import os
 import signal
-import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -9,6 +9,7 @@ from pathlib import Path
 from . import logging as log
 from .codex_accounts import default_codex_account, resolve_session_codex_account
 from .codex_models import resolve_session_model
+from .codex_runtime import is_workspace_auth_error, resolve_codex_bin
 from .media_outbox import media_outbox_path
 from .prompting import prompt_version
 
@@ -25,6 +26,7 @@ class CodexAccumulator:
         self.item_text = {}
         self.messages = []
         self.errors = []
+        self.has_tool_activity = False
 
     def handle(self, event):
         event_type = event.get("type")
@@ -34,7 +36,12 @@ class CodexAccumulator:
                 self.thread_id = thread_id
             return
         if event_type in {"item.started", "item.delta", "item.completed"}:
-            self._handle_item(event_type, event.get("item") or event)
+            item = event.get("item") or event
+            if isinstance(item, dict):
+                item_type = item.get("type") or item.get("item_type") or item.get("itemType")
+                if item_type not in {None, "", "agent_message", "reasoning"}:
+                    self.has_tool_activity = True
+            self._handle_item(event_type, item)
             return
         if event_type in {"turn.failed", "error"}:
             message = self._extract_error(event)
@@ -112,7 +119,7 @@ class CodexCliRunner:
         self.processes_lock = threading.Lock()
 
     def _resolve_bin(self):
-        return shutil.which(self.bin) or self.bin
+        return resolve_codex_bin(self.bin)
 
     def _base_args(self, cwd, model="", reasoning_effort=""):
         args = [self._resolve_bin(), "-C", str(cwd)]
@@ -281,7 +288,7 @@ class CodexCliRunner:
         except Exception:
             pass
 
-    def run(self, conversation_key, user_message, retry_on_resume_error=True):
+    def run(self, conversation_key, user_message, retry_on_resume_error=True, retry_on_auth_error=True):
         default_cwd = self.config["codex"]["workingDirectory"]
         session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))
         cwd = session.get("cwd") or default_cwd
@@ -396,10 +403,29 @@ class CodexCliRunner:
             if text and self._is_rollout_record_error(stderr or error):
                 log.warn(f"[codex] ignoring rollout record error after content was produced conversation={conversation_key}")
                 return text
+            if (retry_on_auth_error and not text and not accumulator.has_tool_activity
+                    and is_workspace_auth_error(error)):
+                from .codex_usage import _refresh_codex_auth
+
+                # Release the old process before reusing this conversation key.
+                # Keep the native thread and history for an authentication retry.
+                self._unregister_process(conversation_key, process)
+                try:
+                    _refresh_codex_auth(self._resolve_bin(), codex_home=codex_home)
+                except Exception as refresh_error:
+                    raise RuntimeError(f"{error}; 令牌刷新失败：{refresh_error}") from refresh_error
+                if self._consume_cancelled(conversation_key):
+                    raise CodexCancelled("Codex 已取消")
+                return self.run(conversation_key, user_message, retry_on_resume_error=retry_on_resume_error,
+                                retry_on_auth_error=False)
             if existing_thread_id and retry_on_resume_error and self._is_transient_resume_error(error):
                 log.warn(f"[codex] resume failed; resetting thread and retrying conversation={conversation_key}")
                 self.state.reset_session(conversation_key)
-                return self.run(conversation_key, user_message, retry_on_resume_error=False)
+                return self.run(conversation_key, user_message, retry_on_resume_error=False,
+                                retry_on_auth_error=retry_on_auth_error)
             raise RuntimeError(error or f"codex 返回非零退出码: {return_code}")
         finally:
             self._unregister_process(conversation_key, process)
+            for stream in (process.stdout, process.stderr):
+                with contextlib.suppress(Exception):
+                    stream.close()

@@ -15,6 +15,30 @@ from wechat_codex_multi.codex_models import (
 
 
 class CodexModelTests(unittest.TestCase):
+    def setUp(self):
+        resolver = patch("wechat_codex_multi.codex_models.resolve_codex_bin", side_effect=lambda value: value)
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
+    def test_model_discovery_refreshes_only_selected_home_on_routing_401(self):
+        first = subprocess.CompletedProcess([], 1, "", "workspace routing discovery unauthorized (401)")
+        second = subprocess.CompletedProcess([], 0, '{"models": []}', "")
+        with patch("wechat_codex_multi.codex_models.subprocess.run", side_effect=[first, second]) as run, \
+                patch("wechat_codex_multi.codex_usage._refresh_codex_auth") as refresh:
+            self.assertEqual(discover_model_options("selected-codex", codex_home="/selected/home"), [])
+        refresh.assert_called_once_with("selected-codex", codex_home="/selected/home", timeout_s=30)
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(all(call.kwargs["env"]["CODEX_HOME"] == "/selected/home" for call in run.call_args_list))
+
+    def test_model_discovery_does_not_loop_on_repeated_routing_401(self):
+        failure = subprocess.CompletedProcess([], 1, "", "workspace routing discovery unauthorized (401)")
+        with patch("wechat_codex_multi.codex_models.subprocess.run", return_value=failure) as run, \
+                patch("wechat_codex_multi.codex_usage._refresh_codex_auth") as refresh:
+            with self.assertRaisesRegex(RuntimeError, "workspace routing discovery"):
+                discover_model_options("selected-codex", codex_home="/selected/home")
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(refresh.call_count, 1)
+
     def test_desktop_inherits_native_settings_not_stale_cache_or_global_defaults(self):
         config = {"codex": {"model": "global-model", "reasoningEffort": "low"}}
         session = {"codexClient": "desktop", "codexModel": "stale-model", "codexReasoningEffort": "high"}

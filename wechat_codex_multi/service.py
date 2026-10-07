@@ -50,6 +50,7 @@ from .codex_cli import CodexCancelled, CodexCliRunner
 from .codex_device_login import CodexDeviceLoginManager, cached_email, login_status
 from .desktop_codex import DesktopCodexCatalog, project_for_thread
 from .codex_models import find_model_option, format_model_option, model_options, resolve_session_model
+from .codex_runtime import CodexAuthError, auth_error_message, desktop_codex_bin, is_codex_auth_error
 from .codex_usage import format_codex_usage, format_codex_usage_all, read_codex_usage
 from .codex_update import CodexUpdateManager, UPDATE_HELP, format_update_result, make_update_plan, parse_update_command
 from .config import PROJECT_DIR
@@ -140,14 +141,8 @@ class MultiWechatCodexService:
     def _create_desktop_runner(self, config):
         desktop_config = dict(config)
         desktop_config["codex"] = dict(config["codex"])
-        bundled_bin = Path(
-            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/"
-            "CodexCLI.app/Contents/MacOS/codex"
-        )
         desktop_config["codex"].update(
-            bin=config["codex"].get("desktopBin") or (
-                str(bundled_bin) if bundled_bin.is_file() else config["codex"].get("bin") or "codex"
-            ),
+            bin=desktop_codex_bin(config),
             bypassApprovalsAndSandbox=False,
             preserveExistingInstructions=True,
             model="",
@@ -430,6 +425,14 @@ class MultiWechatCodexService:
         except CodexCancelled:
             log.info(f"handler cancelled conversation={base_conversation_key}")
         except Exception as err:
+            if (is_codex_auth_error(err)
+                    and not isinstance(err, CodexAuthError)
+                    and resolve_session_agent(self.config, self._get_session(conversation_key)) == "codex"):
+                codex_account = resolve_session_codex_account(self.config, self._get_session(conversation_key))
+                err = CodexAuthError(
+                    err, codex_account.get("codexHome") or "", codex_account.get("name") or "",
+                    self.config["codex"].get("bin") or "codex",
+                )
             log.error(f"handler error conversation={base_conversation_key}: {err}")
             task_id = (getattr(self.task_context, "last_task_id", None)
                        or getattr(self.task_context, "received_task_id", None))
@@ -587,6 +590,7 @@ class MultiWechatCodexService:
             "/codex-accounts",
             "/codex",
             "/codex-login",
+            "/codex-logout",
             "/claude-accounts",
             "/claude",
             "/model",
@@ -904,6 +908,9 @@ class MultiWechatCodexService:
             return
         if command == "/codex-login" or command.startswith("/codex-login "):
             self._handle_codex_login(account, user_id, conversation_key, command)
+            return
+        if command and command.split(maxsplit=1)[0] == "/codex-logout":
+            self._handle_codex_logout(account, user_id, command)
             return
         if command == "/accounts":
             self._send_text(account, user_id, self._format_accounts())
@@ -1272,7 +1279,11 @@ class MultiWechatCodexService:
             if agent == "codex" and self.codex_device_login.is_running(
                     resolve_session_codex_account(self.config, session)["codexHome"]):
                 raise ValueError("该 Codex 账号正在登录，请完成登录后重新发送任务。")
-            with guard:
+            account_guard = (
+                self.codex_device_login.account_run(resolve_session_codex_account(self.config, session)["codexHome"])
+                if agent == "codex" else contextlib.nullcontext()
+            )
+            with guard, account_guard:
                 self._run_codex_and_reply_locked(account, user_id, conversation_key, text)
         except CodexCancelled:
             self.tasks.update(task_id, status="cancelled", finishedAt=time.time(),
@@ -1280,10 +1291,19 @@ class MultiWechatCodexService:
                                   "claudeSessionId" if agent == "claude" else "codexThreadId"))
             raise
         except Exception as err:
-            self.tasks.update(task_id, status="failed", finishedAt=time.time(), error=str(err), unread=True,
+            reported_error = err
+            if agent == "codex" and is_codex_auth_error(err) and not isinstance(err, CodexAuthError):
+                codex_account = resolve_session_codex_account(self.config, session)
+                reported_error = CodexAuthError(
+                    err, codex_account.get("codexHome") or "", codex_account.get("name") or "",
+                    self.config["codex"].get("bin") or "codex",
+                )
+            self.tasks.update(task_id, status="failed", finishedAt=time.time(), error=str(reported_error), unread=True,
                               sessionId=self._get_session(conversation_key).get(
                                   "claudeSessionId" if agent == "claude" else "codexThreadId"),
                               background=not self._conversation_is_selected(conversation_key))
+            if reported_error is not err:
+                raise reported_error from err
             raise
         finally:
             self.task_context.current_task_id = previous_task
@@ -2287,6 +2307,9 @@ class MultiWechatCodexService:
                 )
                 return index, {"account": codex_account, "usage": usage}
             except Exception as err:
+                if is_codex_auth_error(err):
+                    err = auth_error_message(err, codex_account.get("codexHome") or "",
+                                             codex_account.get("name") or "", codex_bin)
                 return index, {"account": codex_account, "error": str(err)}
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -2383,9 +2406,13 @@ class MultiWechatCodexService:
             if scope == "all":
                 return self._read_all_codex_usage()
             codex_account = resolve_session_codex_account(self.config, session)
+            desktop = session.get("codexClient") == "desktop"
+            codex_bin = self.desktop.runner.bin if desktop else self.config["codex"].get("bin") or "codex"
+            options = {"prefer_app_server": True} if desktop else {}
             usage = read_codex_usage(
-                self.config["codex"].get("bin") or "codex",
+                codex_bin,
                 codex_home=codex_account.get("codexHome") or "",
+                **options,
             )
             return format_codex_usage(usage)
         if scope == "all":
@@ -2921,6 +2948,50 @@ class MultiWechatCodexService:
             "\n".join(lines),
         )
 
+    def _refresh_codex_account(self, codex_account):
+        for agent in ["codex", "desktop"]:
+            runner = self.codex.runners.get(agent)
+            if runner and hasattr(runner, "close_account"):
+                runner.close_account(codex_account)
+        self._model_options = None
+        self.desktop_model_options_cache.clear()
+
+    def _handle_codex_logout(self, account, user_id, command):
+        if not self._is_admin(user_id):
+            self._send_text(account, user_id, "只有 adminUsers 可以远程退出 Codex CLI 登录。")
+            return
+        parts = command.split()
+        if len(parts) != 2:
+            self._send_text(account, user_id, "用法：/codex-logout <账号名>，例如 /codex-logout main")
+            return
+        # Require the exact configured name to avoid logging out an unintended account.
+        target = next((item for item in list_codex_accounts(self.config) if item["name"] == parts[1]), None)
+        if not target:
+            self._send_text(account, user_id, f"未知 Codex 账号：{parts[1]}。发送 /codex-accounts 查看可用账号。")
+            return
+        name = target["name"]
+        home = target["codexHome"]
+        if self.codex_device_login.is_running(home):
+            self._send_text(account, user_id,
+                            f"{name} 的设备码登录正在进行中，请先发送 /codex-login cancel {name} 后再退出登录。")
+            return
+        if self._codex_account_has_task(target):
+            self._send_text(account, user_id, f"{name} 当前有 Codex 任务运行中或排队中，请任务结束或停止后再退出登录。")
+            return
+        for run in self._active_runs():
+            if run.get("agent") != "codex":
+                continue
+            running_session = self._get_session(run.get("conversationKey"))
+            if resolve_session_codex_account(self.config, running_session).get("codexHome") == home:
+                self._send_text(account, user_id, f"{name} 当前有 Codex 任务运行，请任务结束后再退出登录。")
+                return
+        success, message = self.codex_device_login.logout(
+            home, on_logged_out=lambda: self._refresh_codex_account(target),
+        )
+        if success:
+            message += f"\n重新登录：/codex-login {name} 新账号邮箱"
+        self._send_text(account, user_id, f"Codex 账号 {name}：{message}")
+
     def _handle_codex_login(self, account, user_id, conversation_key, command):
         if not self._is_admin(user_id):
             self._send_text(account, user_id, "只有 adminUsers 可以远程登录 Codex CLI。")
@@ -2997,13 +3068,14 @@ class MultiWechatCodexService:
             self._send_text(account, user_id, "\n".join(lines))
 
         def on_done(message):
+            self._refresh_codex_account(target)
             self._send_text(account, user_id, f"Codex 账号 {name}：{message}")
 
         started = self.codex_device_login.start(home, on_code, on_done, expected_email=expected_email)
         if started:
             self._send_text(account, user_id, f"正在为 {name} 启动 Codex 设备码登录。登录地址和代码将单独发送。")
         else:
-            self._send_text(account, user_id, f"{name} 的设备码登录已在进行中。")
+            self._send_text(account, user_id, f"{name} 的登录或退出操作正在进行中，请稍后重试。")
 
     def _handle_claude_switch(self, account, user_id, conversation_key, selector):
         session = self._get_session(conversation_key)
@@ -3554,6 +3626,7 @@ class MultiWechatCodexService:
                 "新账号自动创建目录并写入 config.json，立即生效；/login <账号名> <邮箱> 为简写",
                 "手动新增 codex.accounts 也无需重启；其他配置、账号目录修改和删除需重启",
                 "/codex-login status|cancel [账号名] 查看或取消设备码登录（adminUsers only）",
+                "/codex-logout <账号名> 退出指定 Codex CLI 账号登录（adminUsers only）",
                 "/claude [编号|名称|next] 切到 Claude，可同时切账号",
                 "/model 查看或切换当前 Agent 的模型和 effort",
                 "桌面会话切模型不重置历史、下一轮生效；/model auto 恢复沿用会话设置",

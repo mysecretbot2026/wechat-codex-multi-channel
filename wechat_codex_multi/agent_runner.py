@@ -3,6 +3,7 @@ from .claude_cli import ClaudeCliRunner
 from .codex_accounts import default_codex_account
 from .codex_app_server import CodexAppServerRunner
 from .codex_cli import CodexCliRunner
+from .codex_runtime import desktop_codex_bin
 
 
 class AgentRunnerManager:
@@ -29,7 +30,8 @@ class AgentRunnerManager:
     def _default_desktop_factory(config, state_store):
         desktop_config = dict(config)
         desktop_config["codex"] = dict(config["codex"])
-        desktop_config["codex"].update(bypassApprovalsAndSandbox=False, preserveExistingInstructions=True)
+        desktop_config["codex"].update(bin=desktop_codex_bin(config), bypassApprovalsAndSandbox=False,
+                                       preserveExistingInstructions=True)
         return CodexAppServerRunner(desktop_config, state_store)
 
     def _default_cwd(self):

@@ -1,6 +1,5 @@
 import json
 import os
-import shutil
 import subprocess
 import threading
 from pathlib import Path
@@ -9,6 +8,7 @@ from . import logging as log
 from .codex_accounts import default_codex_account, resolve_session_codex_account
 from .codex_cli import CodexCancelled
 from .codex_models import resolve_session_model
+from .codex_runtime import is_codex_auth_error, is_workspace_auth_error, resolve_codex_bin
 from .prompting import prompt_version
 from .session_discovery import clean_title
 
@@ -107,6 +107,7 @@ class AppServerProcess:
         self.closed = False
         self.reader_thread = None
         self.lifecycle_lock = threading.RLock()
+        self.auth_refresh_lock = threading.RLock()
 
     def start(self):
         with self.lifecycle_lock:
@@ -125,7 +126,7 @@ class AppServerProcess:
         if self.codex_home:
             env["CODEX_HOME"] = self.codex_home
         self.process = subprocess.Popen(
-            [self.bin_path, "app-server", "--listen", "stdio://"],
+            [resolve_codex_bin(self.bin_path), "app-server", "--listen", "stdio://"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -190,6 +191,25 @@ class AppServerProcess:
             return request_id
 
     def request(self, method, params=None, timeout_s=120):
+        try:
+            return self._request_once(method, params, timeout_s)
+        except JsonRpcError as err:
+            # Routing discovery rejects the request before model/tool execution.
+            # Retry this specific preflight failure once; never replay a failed
+            # turn or an arbitrary authentication error after tools may have run.
+            if (not is_workspace_auth_error(err) or method == "initialize"
+                    or (method == "account/read" and (params or {}).get("refreshToken"))):
+                raise
+            with self.auth_refresh_lock:
+                try:
+                    info = self._request_once("account/read", {"refreshToken": True}, timeout_s) or {}
+                    if not info.get("account"):
+                        raise RuntimeError("Codex not logged in; cannot refresh workspace routing credentials")
+                except Exception as refresh_error:
+                    raise JsonRpcError(f"{err}; 令牌刷新失败：{refresh_error}") from refresh_error
+                return self._request_once(method, params, timeout_s)
+
+    def _request_once(self, method, params=None, timeout_s=120):
         self.start() if method != "initialize" else None
         request_id = self._next_request_id()
         event = threading.Event()
@@ -340,7 +360,7 @@ class CodexAppServerRunner:
         self.lock = threading.RLock()
 
     def _resolve_bin(self):
-        return shutil.which(self.bin) or self.bin
+        return resolve_codex_bin(self.bin, prefer_desktop=self.preserve_existing_instructions)
 
     def _server_key(self, codex_account):
         return codex_account.get("codexHome") or "__default__"
@@ -366,6 +386,13 @@ class CodexAppServerRunner:
 
     def request_for_account(self, codex_account, method, params=None, timeout_s=30):
         return self._server_for_account(codex_account).request(method, params, timeout_s=timeout_s)
+
+    def close_account(self, codex_account):
+        """Discard only this account's catalog process and cached credentials."""
+        with self.lock:
+            server = self.servers.pop(self._server_key(codex_account), None)
+        if server:
+            server.close()
 
     def _new_run_server(self, codex_account):
         return AppServerProcess(self._resolve_bin(), codex_home=codex_account.get("codexHome") or "")
@@ -497,6 +524,8 @@ class CodexAppServerRunner:
             except Exception as err:
                 log.warn(f"[app-server] resume failed conversation={conversation_key}: {err}")
                 server.unregister_context(context)
+                if is_codex_auth_error(err):
+                    raise
                 if "active writer" in str(err).lower():
                     raise RuntimeError(
                         "所选会话正被桌面 Codex 或其他客户端占用（active writer）。"

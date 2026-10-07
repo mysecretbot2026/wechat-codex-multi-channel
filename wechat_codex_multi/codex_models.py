@@ -1,7 +1,8 @@
 import json
 import os
-import shutil
 import subprocess
+
+from .codex_runtime import is_workspace_auth_error, resolve_codex_bin
 
 
 DEFAULT_MODEL_REASONING_LEVELS = [
@@ -63,7 +64,7 @@ def configured_model_options(config):
 
 
 def discover_model_options(codex_bin="codex", timeout_s=30, codex_home=""):
-    binary = shutil.which(codex_bin) or codex_bin
+    binary = resolve_codex_bin(codex_bin)
     env = os.environ.copy()
     if codex_home:
         env["CODEX_HOME"] = os.path.expanduser(str(codex_home))
@@ -78,6 +79,14 @@ def discover_model_options(codex_bin="codex", timeout_s=30, codex_home=""):
         timeout=timeout_s,
         check=False,
     )
+    if completed.returncode != 0 and is_workspace_auth_error(completed.stderr):
+        from .codex_usage import _refresh_codex_auth
+
+        _refresh_codex_auth(binary, codex_home=codex_home, timeout_s=timeout_s)
+        completed = subprocess.run(
+            [binary, "debug", "models"], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout_s, check=False,
+        )
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr.strip() or f"codex debug models 退出码 {completed.returncode}")
     data = json.loads(completed.stdout or "{}")
