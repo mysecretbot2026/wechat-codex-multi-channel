@@ -115,7 +115,8 @@ class CodexCliRunner:
         self.bypass = bool(config["codex"].get("bypassApprovalsAndSandbox", True))
         self.processes = set()
         self.process_by_conversation = {}
-        self.cancelled_conversations = set()
+        # Each run owns an event and its current child, including retry gaps.
+        self.active_executions = {}
         self.processes_lock = threading.Lock()
 
     def _resolve_bin(self):
@@ -189,21 +190,26 @@ class CodexCliRunner:
         value = str(error or "").lower()
         return "failed to record rollout items" in value and "thread" in value and "not found" in value
 
-    def _register_process(self, conversation_key, process):
+    def _register_process(self, conversation_key, process, cancelled=None):
         with self.processes_lock:
             self.processes.add(process)
             self.process_by_conversation[conversation_key] = process
+            if cancelled is not None:
+                self.active_executions[conversation_key][cancelled] = process
 
-    def _unregister_process(self, conversation_key, process):
+    def _unregister_process(self, conversation_key, process, cancelled=None):
         with self.processes_lock:
             self.processes.discard(process)
             if self.process_by_conversation.get(conversation_key) is process:
                 self.process_by_conversation.pop(conversation_key, None)
+            executions = self.active_executions.get(conversation_key, {})
+            if cancelled is not None and executions.get(cancelled) is process:
+                executions[cancelled] = None
 
     def is_running(self, conversation_key):
         with self.processes_lock:
             process = self.process_by_conversation.get(conversation_key)
-        return bool(process and process.poll() is None)
+            return bool(self.active_executions.get(conversation_key) or (process and process.poll() is None))
 
     def active_runs(self):
         default_cwd = self.config["codex"]["workingDirectory"]
@@ -230,23 +236,22 @@ class CodexCliRunner:
 
     def cancel(self, conversation_key, reset_session=True):
         with self.processes_lock:
-            process = self.process_by_conversation.get(conversation_key)
-            self.cancelled_conversations.add(conversation_key)
-        if process and process.poll() is None:
-            self._terminate_process(process)
+            executions = self.active_executions.get(conversation_key, {})
+            for cancelled in executions:
+                cancelled.set()
+            children = executions.values() if executions else [self.process_by_conversation.get(conversation_key)]
+            processes = {process for process in children if process and process.poll() is None}
+            accepted = bool(executions or processes)
             if reset_session:
                 self.state.reset_session(conversation_key)
-            return True
-        if reset_session:
-            self.state.reset_session(conversation_key)
-        return False
+        for process in processes:
+            self._terminate_process(process)
+        return accepted
 
-    def _consume_cancelled(self, conversation_key):
-        with self.processes_lock:
-            if conversation_key in self.cancelled_conversations:
-                self.cancelled_conversations.discard(conversation_key)
-                return True
-        return False
+    @staticmethod
+    def _check_cancelled(cancelled):
+        if cancelled.is_set():
+            raise CodexCancelled("Codex 已取消")
 
     def terminate_all(self):
         with self.processes_lock:
@@ -289,6 +294,23 @@ class CodexCliRunner:
             pass
 
     def run(self, conversation_key, user_message, retry_on_resume_error=True, retry_on_auth_error=True):
+        cancelled = threading.Event()
+        with self.processes_lock:
+            self.active_executions.setdefault(conversation_key, {})[cancelled] = None
+        try:
+            return self._run(conversation_key, user_message, cancelled,
+                             retry_on_resume_error=retry_on_resume_error, retry_on_auth_error=retry_on_auth_error)
+        finally:
+            # Finish and check under one lock so a late cancel cannot affect a later run.
+            with self.processes_lock:
+                executions = self.active_executions[conversation_key]
+                executions.pop(cancelled)
+                if not executions:
+                    self.active_executions.pop(conversation_key)
+                self._check_cancelled(cancelled)
+
+    def _run(self, conversation_key, user_message, cancelled, retry_on_resume_error=True, retry_on_auth_error=True):
+        self._check_cancelled(cancelled)
         default_cwd = self.config["codex"]["workingDirectory"]
         session = self.state.get_session(conversation_key, default_cwd, default_codex_account(self.config))
         cwd = session.get("cwd") or default_cwd
@@ -325,6 +347,7 @@ class CodexCliRunner:
         state_dir = getattr(self.state, "state_dir", None) or self.config.get("stateDir") or cwd
         env.pop("WECHAT_CODEX_MULTI_MEDIA_OUTBOX", None)
         env["LOCAL_AGENT_MEDIA_OUTBOX"] = str(media_outbox_path(state_dir, conversation_key))
+        self._check_cancelled(cancelled)
         process = subprocess.Popen(
             args,
             cwd=cwd,
@@ -338,7 +361,7 @@ class CodexCliRunner:
             bufsize=1,
             start_new_session=True,
         )
-        self._register_process(conversation_key, process)
+        self._register_process(conversation_key, process, cancelled)
         accumulator = CodexAccumulator(existing_thread_id, codex_home=codex_home)
         stderr_chunks = []
         stdout_errors = []
@@ -371,6 +394,8 @@ class CodexCliRunner:
         t2.start()
         try:
             try:
+                # Cancellation can arrive while Popen is creating the child.
+                self._check_cancelled(cancelled)
                 return_code = process.wait(timeout=self.timeout_ms / 1000)
             except subprocess.TimeoutExpired:
                 self._terminate_process(process)
@@ -381,20 +406,21 @@ class CodexCliRunner:
                 raise
             t1.join(timeout=2)
             t2.join(timeout=2)
-            if self._consume_cancelled(conversation_key):
-                raise CodexCancelled("Codex 已取消")
+            self._check_cancelled(cancelled)
             if stdout_errors:
                 raise RuntimeError(str(stdout_errors[-1]))
-            if accumulator.thread_id:
-                self.state.update_session(
-                    conversation_key,
-                    codexThreadId=accumulator.thread_id,
-                    cwd=cwd,
-                    codexAccount=codex_account_name,
-                    codexModel=selected_model,
-                    codexReasoningEffort=selected_reasoning,
-                    codexExecPromptVersion=current_prompt_version,
-                )
+            with self.processes_lock:
+                self._check_cancelled(cancelled)
+                if accumulator.thread_id:
+                    self.state.update_session(
+                        conversation_key,
+                        codexThreadId=accumulator.thread_id,
+                        cwd=cwd,
+                        codexAccount=codex_account_name,
+                        codexModel=selected_model,
+                        codexReasoningEffort=selected_reasoning,
+                        codexExecPromptVersion=current_prompt_version,
+                    )
             text = accumulator.text()
             if return_code == 0 and text:
                 return text
@@ -409,23 +435,25 @@ class CodexCliRunner:
 
                 # Release the old process before reusing this conversation key.
                 # Keep the native thread and history for an authentication retry.
-                self._unregister_process(conversation_key, process)
+                self._unregister_process(conversation_key, process, cancelled)
+                self._check_cancelled(cancelled)
                 try:
                     _refresh_codex_auth(self._resolve_bin(), codex_home=codex_home)
                 except Exception as refresh_error:
                     raise RuntimeError(f"{error}; 令牌刷新失败：{refresh_error}") from refresh_error
-                if self._consume_cancelled(conversation_key):
-                    raise CodexCancelled("Codex 已取消")
-                return self.run(conversation_key, user_message, retry_on_resume_error=retry_on_resume_error,
-                                retry_on_auth_error=False)
+                self._check_cancelled(cancelled)
+                return self._run(conversation_key, user_message, cancelled,
+                                 retry_on_resume_error=retry_on_resume_error, retry_on_auth_error=False)
             if existing_thread_id and retry_on_resume_error and self._is_transient_resume_error(error):
                 log.warn(f"[codex] resume failed; resetting thread and retrying conversation={conversation_key}")
-                self.state.reset_session(conversation_key)
-                return self.run(conversation_key, user_message, retry_on_resume_error=False,
-                                retry_on_auth_error=retry_on_auth_error)
+                with self.processes_lock:
+                    self._check_cancelled(cancelled)
+                    self.state.reset_session(conversation_key)
+                return self._run(conversation_key, user_message, cancelled, retry_on_resume_error=False,
+                                 retry_on_auth_error=retry_on_auth_error)
             raise RuntimeError(error or f"codex 返回非零退出码: {return_code}")
         finally:
-            self._unregister_process(conversation_key, process)
+            self._unregister_process(conversation_key, process, cancelled)
             for stream in (process.stdout, process.stderr):
                 with contextlib.suppress(Exception):
                     stream.close()

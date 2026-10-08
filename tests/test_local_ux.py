@@ -2,11 +2,12 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import test_desktop_codex as desktop_tests
 from test_service_performance import CapturingExecutor, FakeRunRunner, FakeSteerRunner, make_test_config
 from wechat_codex_multi.media_outbox import media_outbox_path, queue_media, read_media_outbox
+from wechat_codex_multi.codex_cli import CodexCliRunner
 from wechat_codex_multi.service import MultiWechatCodexService
 from wechat_codex_multi.task_journal import TaskJournal
 from wechat_codex_multi.wechat import ITEM_TEXT, MESSAGE_TYPE_USER
@@ -73,6 +74,28 @@ class LocalUxTests(unittest.TestCase):
         self.assertEqual(self.latest()["status"], "completed")
         self.assertEqual(self.sent[-1], "完成结果")
 
+    def test_idle_reset_then_cli_task_is_completed_and_delivered(self):
+        runner = CodexCliRunner(self.service.config, self.service.state)
+        self.service.codex = runner
+        child = Mock()
+        child.poll.return_value = 0
+        child.wait.return_value = 0
+        child.stdout = [
+            '{"type":"thread.started","thread_id":"new-thread"}\n',
+            '{"type":"item.completed","item":{"type":"agent_message","id":"message","text":"完成结果"}}\n',
+        ]
+        child.stderr = []
+        with patch.object(runner, "_resolve_bin", return_value="fixture-codex"), \
+                patch("wechat_codex_multi.codex_cli.subprocess.Popen", return_value=child):
+            self.command("/reset")
+            self.submit("重置后的新任务")
+            self.drain(self.service.notification_executor)
+            self.drain(self.service.executor)
+        self.assertEqual(self.latest()["status"], "completed")
+        self.assertTrue(self.latest()["hasOutput"])
+        self.assertEqual(self.latest()["sessionId"], "new-thread")
+        self.assertEqual(self.sent[-1], "完成结果")
+
     def test_queued_task_keeps_workspace_after_switch(self):
         for name in ("a", "b"):
             self.service.state.upsert_workspace(self.owner, name, self.tmp.name)
@@ -85,6 +108,160 @@ class LocalUxTests(unittest.TestCase):
         self.assertEqual(self.service.state.get_active_workspace(self.owner), "b")
         self.assertIn("后台任务", self.sent[-1])
         self.assertTrue(self.latest()["unread"])
+
+    def test_cancel_by_id_targets_another_workspace_without_switching(self):
+        self.service.state.upsert_workspace(self.owner, "background", self.tmp.name)
+        key = self.owner + ":background"
+        self.service.state.update_session(key, codexThreadId="keep-background-session")
+        self.submit("/ws run background 后台任务")
+        task = self.latest()
+        self.service.tasks.update(task["id"], status="running", startedAt=time.time())
+        cancelled = []
+        self.service.codex.cancel = lambda key, reset_session=True: cancelled.append((key, reset_session)) or True
+        self.service._append_pending_guidance(key, "旧任务的补充")
+        selected = self.service._conversation_lock(self.owner)
+        selected.acquire()
+        try:
+            self.submit("/停止 " + task["id"])
+            self.drain(self.service.command_executor)
+        finally:
+            selected.release()
+        self.assertEqual(cancelled, [(key, False)])
+        self.assertEqual(self.service.tasks.get(task["id"])["status"], "cancelled")
+        self.assertIn(task["id"], self.sent[-1])
+        self.assertFalse(self.service._pop_pending_guidance(key))
+        self.assertEqual(self.service.state.get_active_workspace(self.owner), "default")
+        self.assertEqual(self.service._get_session(key)["codexThreadId"], "keep-background-session")
+        self.assertFalse(self.runs)
+
+    def test_cancel_by_id_stops_queued_task_without_starting_a_replacement(self):
+        for command in ("/cancel", "/停止", "/取消", "/interrupt"):
+            with self.subTest(command=command):
+                self.submit("等待中的任务")
+                task = self.latest()
+                self.command(command + " [" + task["id"].upper() + "]")
+                self.drain(self.service.notification_executor)
+                self.drain(self.service.executor)
+                self.assertEqual(self.service.tasks.get(task["id"])["status"], "cancelled")
+                self.assertFalse(self.runs)
+        self.assertEqual(len(self.service.tasks.list(self.owner)), 4)
+
+    def test_invalid_or_foreign_task_id_does_not_cancel_current_task(self):
+        self.submit("当前任务")
+        current = self.latest()
+        foreign = self.service.tasks.create("bot-1:other-user", "bot-1:other-user", {}, "其他人的任务")
+        other_bot = self.service.tasks.create("bot-2:user-1", "bot-2:user-1", {}, "其他 Bot 的任务")
+        cancelled = []
+        self.service.codex.cancel = lambda key, reset_session=True: cancelled.append(key) or True
+        selectors = ["unknown", "abc", "f" * 12, "g" * 12, current["id"] + " extra",
+                     foreign["id"], other_bot["id"]]
+        for selector in selectors:
+            with self.subTest(selector=selector):
+                self.command("/cancel " + selector)
+                self.assertEqual(self.service.tasks.get(current["id"])["status"], "queued")
+                self.assertFalse(cancelled)
+                self.assertFalse(self.runs)
+        self.command("/停止 " + "g" * 12)
+        self.assertEqual(self.service.tasks.get(current["id"])["status"], "queued")
+        self.assertEqual(len(self.service.executor.submissions), 1)
+
+    def test_cancel_finished_task_does_not_touch_next_task_in_same_conversation(self):
+        for status in ("completed", "cancelled", "failed", "interrupted"):
+            with self.subTest(status=status):
+                old = self.service.tasks.create(self.owner, self.owner, {}, "旧任务")
+                self.service.tasks.update(old["id"], status=status, finishedAt=time.time())
+                self.submit("新任务")
+                current = self.latest()
+                with patch.object(self.service.codex, "cancel") as cancel:
+                    self.command("/cancel " + old["id"])
+                    cancel.assert_not_called()
+                self.assertIn("已结束", self.sent[-1])
+                self.assertEqual(self.service.tasks.get(current["id"])["status"], "queued")
+                self.command("/cancel " + current["id"])
+                self.drain(self.service.executor)
+
+    def test_cancel_queued_successor_does_not_cancel_running_predecessor(self):
+        self.submit("正在执行的旧任务")
+        old = self.latest()
+        self.service.tasks.update(old["id"], status="running", startedAt=time.time())
+        key = self.owner
+        successor = self.service.tasks.create(self.owner, key, self.service._task_session(key), "排队中的新任务")
+        self.service.active_task_ids[key] = successor["id"]
+        with patch.object(self.service.codex, "cancel") as cancel:
+            self.command("/cancel " + successor["id"])
+            cancel.assert_not_called()
+        self.assertEqual(self.service.tasks.get(old["id"])["status"], "running")
+        self.assertEqual(self.service.tasks.get(successor["id"])["status"], "cancelled")
+
+    def test_cancel_running_predecessor_keeps_queued_successor(self):
+        self.submit("正在执行的旧任务")
+        old = self.latest()
+        self.service.tasks.update(old["id"], status="running", startedAt=time.time())
+        successor = self.service.tasks.create(self.owner, self.owner, {}, "排队中的新任务")
+        self.service.active_task_ids[self.owner] = successor["id"]
+        with patch.object(self.service.codex, "cancel", return_value=True) as cancel:
+            self.command("/cancel " + old["id"])
+            cancel.assert_called_once_with(self.owner, reset_session=False)
+        self.assertEqual(self.service.tasks.get(old["id"])["status"], "cancelled")
+        self.assertEqual(self.service.tasks.get(successor["id"])["status"], "queued")
+
+    def test_cancellation_before_result_delivery_keeps_task_cancelled(self):
+        def run(key, text):
+            self.command("/cancel " + self.service.task_context.current_task_id)
+            return "不应发送的已取消结果"
+        self.service.codex.run = run
+        self.submit("在返回结果前停止")
+        self.drain(self.service.notification_executor)
+        self.drain(self.service.executor)
+        task = self.latest()
+        self.assertEqual(task["status"], "cancelled")
+        self.assertFalse(task["hasOutput"])
+        self.assertNotIn("不应发送的已取消结果", self.sent)
+
+    def test_active_task_query_lists_all_workspaces_and_ids_without_a_ten_item_limit(self):
+        active = []
+        for index in range(13):
+            workspace = f"project-{index}"
+            task = self.service.tasks.create(self.owner, self.owner + ":" + workspace,
+                                             {"agent": "claude" if index % 2 else "codex"},
+                                             f"活动任务 {index}", workspace)
+            if index % 2:
+                self.service.tasks.update(task["id"], status="running", startedAt=time.time())
+            active.append(task)
+        finished = self.service.tasks.create(self.owner, self.owner, {}, "已结束任务")
+        self.service.tasks.update(finished["id"], status="completed")
+        foreign = self.service.tasks.create("bot-1:foreign", "bot-1:foreign", {}, "其他用户任务")
+        for command in ("/任务 执行中", "/tasks active", "/任务 进行中"):
+            with self.subTest(command=command):
+                self.command(command)
+                output = self.sent[-1]
+                self.assertIn("共 13 项", output)
+                self.assertIn("排队中", output)
+                self.assertIn("执行中", output)
+                for task in active:
+                    self.assertIn(task["id"], output)
+                    self.assertIn(task["workspace"], output)
+                self.assertNotIn(finished["id"], output)
+                self.assertNotIn(foreign["id"], output)
+                self.assertFalse(self.runs)
+
+    def test_active_task_query_handles_empty_list_locally(self):
+        self.command("/tasks active")
+        self.assertIn("共 0 项", self.sent[-1])
+        self.assertIn("暂无记录", self.sent[-1])
+        self.assertFalse(self.runs)
+
+    def test_task_id_cancellation_does_not_stop_other_parallel_runs_in_same_conversation(self):
+        tasks = []
+        for title in ("并发任务一", "并发任务二"):
+            task = self.service.tasks.create(self.owner, self.owner, {}, title)
+            self.service.tasks.update(task["id"], status="running")
+            tasks.append(task)
+        with patch.object(self.service.codex, "cancel") as cancel:
+            self.command("/cancel " + tasks[0]["id"])
+            cancel.assert_not_called()
+        self.assertIn("无法单独定位", self.sent[-1])
+        self.assertEqual({self.service.tasks.get(task["id"])["status"] for task in tasks}, {"running"})
 
     def test_queued_session_cannot_be_replaced_and_can_be_cancelled(self):
         self.service.state.update_session(self.owner, codexThreadId="original-session")

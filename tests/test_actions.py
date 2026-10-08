@@ -37,8 +37,8 @@ class ActionTests(unittest.TestCase):
         text = "\n".join(
             [
                 "例如：",
-                "[[send_image:/Users/bot/.../xxx.png]]",
-                "Saved to: file:///Users/bot/.../xxx.png",
+                "[[send_image:/Users/you/.../xxx.png]]",
+                "Saved to: file:///Users/you/.../xxx.png",
             ]
         )
 

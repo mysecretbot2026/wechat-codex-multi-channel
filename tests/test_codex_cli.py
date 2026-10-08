@@ -162,14 +162,16 @@ class CodexCliRunnerTests(unittest.TestCase):
             process.stdout = []
             process.stderr = []
             process.poll.return_value = None
-            process.wait.side_effect = [0, 0]
 
-            with patch("wechat_codex_multi.codex_cli.subprocess.Popen", return_value=process):
+            with patch("wechat_codex_multi.codex_cli.subprocess.Popen", return_value=process) as popen:
                 runner = CodexCliRunner(config, state)
-                runner.cancelled_conversations.add("conversation-1")
-                with self.assertRaises(CodexCancelled):
-                    runner.run("conversation-1", "hello")
+                process.wait.side_effect = lambda timeout: runner.cancel("conversation-1", reset_session=False) and 0
+                with patch.object(runner, "_terminate_process") as terminate:
+                    with self.assertRaises(CodexCancelled):
+                        runner.run("conversation-1", "hello")
 
+            popen.assert_called_once()
+            terminate.assert_called_once_with(process)
             self.assertEqual(state.reset_keys, [])
 
     def test_run_sets_codex_home_for_selected_account(self):

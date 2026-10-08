@@ -416,7 +416,7 @@ class CodexAppServerRunner:
             "你可以生成本地图片、文件或视频，然后让当前通道发送。",
             "发送本地媒体时，在最终回复中单独写 [[send_image:/真实绝对路径]]、[[send_file:/真实绝对路径]] 或 [[send_video:/真实绝对路径]]。",
             "媒体标记路径必须是真实存在的本地绝对路径。",
-            "不要原样输出占位路径，例如 /absolute/path/to/image.png、/Users/bot/.../xxx.png 或 真实绝对路径。",
+            "不要原样输出占位路径，例如 /absolute/path/to/image.png、/Users/you/.../xxx.png 或 真实绝对路径。",
             "如果 Codex 生成图片后输出 Saved to: file:///Users/.../image.png，也可以直接保留这个 file:// 路径，当前通道会自动发送。",
             "这些标记会被当前通道解析并发送，用户不会看到标记文本。",
             "",

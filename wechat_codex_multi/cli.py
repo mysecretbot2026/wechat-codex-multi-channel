@@ -13,6 +13,7 @@ from .media_outbox import queue_media
 from .media_tool import run_media_generator
 from .service import MultiWechatCodexService
 from .state import StateStore
+from .task_journal import TaskJournal
 
 
 def ensure_account_session(state, config, account):
@@ -83,6 +84,15 @@ def status(args):
         "sessionCount": len(state.state.get("sessions") or {}),
     }
     print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def migrate_tasks(args):
+    config = load_config(args.config)
+    log.configure(config.get("logLevel"))
+    report = TaskJournal.migrate_legacy(config["stateDir"])
+    print(json.dumps(report, ensure_ascii=False, indent=2))
+    if report["skippedFiles"]:
+        raise SystemExit(1)
 
 
 def delete_account(args):
@@ -182,6 +192,9 @@ def main(argv=None):
 
     p = sub.add_parser("status", help="查看本地状态")
     p.set_defaults(func=status)
+
+    p = sub.add_parser("migrate-tasks", help="将旧 JSON 任务记录预迁移到 SQLite，不停止服务或改变执行状态")
+    p.set_defaults(func=migrate_tasks)
 
     p = sub.add_parser(
         "update", help="更新本机 Codex CLI 或触发桌面内置更新，不调用模型",

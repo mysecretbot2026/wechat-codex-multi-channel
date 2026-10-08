@@ -24,7 +24,7 @@ PLACEHOLDER_MEDIA_PATHS = {
     "本地图片绝对路径",
     "本地文件绝对路径",
     "本地视频绝对路径",
-    "/Users/bot/.../xxx.png",
+    "/Users/you/.../xxx.png",
 }
 
 

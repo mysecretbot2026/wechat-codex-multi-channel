@@ -568,9 +568,11 @@ class MultiWechatCodexService:
                 desktopModelOverride=run_session.get("desktopModelOverride") or {},
             )
 
-    @staticmethod
-    def _can_run_without_conversation_lock(text):
+    @classmethod
+    def _can_run_without_conversation_lock(cls, text):
         command = normalize_command(text)
+        if cls._task_cancel_selector(command) is not None:
+            return True
         first = command.split()[0] if command else ""
         if first == "/ws":
             parts = command.split(maxsplit=2)
@@ -825,22 +827,30 @@ class MultiWechatCodexService:
             self._send_text(account, user_id, f"后台完成提醒：{'开启' if enabled else '关闭'}。设置会保留到服务重启后。")
             return
         if first == "/tasks":
-            if selector not in {"", "unread", "未读"}:
-                self._send_text(account, user_id, "用法：/任务 或 /任务 未读")
+            selector = selector.lower()
+            active = selector in {"active", "执行中", "进行中"}
+            if selector not in {"", "unread", "未读"} and not active:
+                self._send_text(account, user_id, "用法：/任务、/任务 未读 或 /任务 执行中（/tasks active）")
                 return
-            records = self.tasks.list(base_key, limit=None)
-            if selector:
-                records = [item for item in records if item.get("unread")]
-            lines = ["最近任务：" if not selector else "未读任务结果："]
-            for item in records[:10]:
+            records = self.tasks.list(
+                base_key, limit=None if active else 10,
+                statuses=("queued", "running") if active else None,
+                unread=True if selector and not active else None,
+            )
+            lines = ([f"进行中的任务（全部工作区，共 {len(records)} 项）："] if active else
+                     ["最近任务：" if not selector else "未读任务结果："])
+            for item in records:
                 suffix = " · 未读" if item.get("unread") else ""
                 if item.get("deliveryError"):
                     suffix += " · 发送待重试"
                 lines.extend([f"[{item['id']}] {TASK_LABELS.get(item['status'], item['status'])}{suffix} · {task_elapsed(item)}",
-                              f"{item['workspace']} · {item['title']}"])
+                              f"{item['workspace']} · {self._agent_label(item['agent'])} · {item['title']}"])
             if not records:
                 lines.append("暂无记录。")
-            lines.append("查看：/结果 <任务ID>；补发：/重发 <任务ID>。均不重新执行任务。")
+            if active:
+                lines.append("取消：/停止 <任务ID> 或 /cancel <任务ID>，保留会话。")
+            else:
+                lines.append("查看：/结果 <任务ID>；补发：/重发 <任务ID>；全部进行中任务：/任务 执行中。")
             self._send_text(account, user_id, "\n".join(lines))
             return
         record = self.tasks.find(base_key, selector, output_only=first == "/resend" or not selector)
@@ -861,6 +871,45 @@ class MultiWechatCodexService:
         else:
             self._send_text(account, user_id, "\n".join(item["text"] for item in record["chunks"]) or "该结果仅包含附件。")
             self.tasks.update(record["id"], unread=False)
+
+    @staticmethod
+    def _task_cancel_selector(command):
+        parts = command.split(maxsplit=1)
+        if len(parts) < 2 or parts[0] not in {"/cancel", "/interrupt"}:
+            return None
+        selector = parts[1].strip()
+        # /interrupt <new task> keeps its existing meaning; ID-like arguments target a task.
+        token = selector.split()[0].strip("[]") if selector else ""
+        if parts[0] == "/cancel" or re.fullmatch(r"[A-Za-z0-9]{12}", token):
+            return selector
+        return None
+
+    def _handle_task_cancel(self, account, user_id, owner, selector):
+        if not re.fullmatch(r"(?:[a-fA-F0-9]{12}|\[[a-fA-F0-9]{12}\])", selector):
+            self._send_text(account, user_id,
+                            "请使用完整的 12 位任务 ID：/停止 <任务ID> 或 /cancel <任务ID>。\n"
+                            "发送 /任务 执行中 查看 ID；中断后改做新任务用 /interrupt <新任务>。")
+            return
+        task_id = selector.strip("[]").lower()
+        with self.task_guard:
+            task = self.tasks.get(task_id)
+            if not task or task.get("owner") != owner:
+                message = f"没有找到你的任务 [{task_id}]。发送 /任务 执行中 查看任务 ID。"
+            elif task["status"] not in {"queued", "running"}:
+                message = f"任务 [{task_id}] 已结束：{TASK_LABELS.get(task['status'], task['status'])}，无需取消。"
+            else:
+                conversation_key = task["conversationKey"]
+                others = [item for item in self.tasks.active()
+                          if item["conversationKey"] == conversation_key and item["id"] != task_id]
+                if task["status"] == "running" and any(item["status"] == "running" for item in others):
+                    message = "该会话存在多个并发执行，无法单独定位此任务；本次未取消。"
+                elif self._cancel_runner(conversation_key, reset_session=False, expected_task_id=task_id):
+                    if not others:
+                        self._clear_pending_guidance(conversation_key)
+                    message = f"已取消任务 [{task_id}] · {task['workspace']}，保留原会话。"
+                else:
+                    message = f"任务 [{task_id}] 状态已变化，请发送 /任务 执行中 查看最新状态。"
+        self._send_text(account, user_id, message)
 
     def _reject_target_change(self, conversation_key, command):
         parts = command.split()
@@ -896,6 +945,10 @@ class MultiWechatCodexService:
             return
         if first in {"/tasks", "/result", "/resend", "/notify"}:
             self._handle_task_command(account, user_id, base_conversation_key, command)
+            return
+        cancel_selector = self._task_cancel_selector(command)
+        if cancel_selector is not None:
+            self._handle_task_cancel(account, user_id, base_conversation_key, cancel_selector)
             return
         if self._reject_target_change(conversation_key, command):
             self._send_text(account, user_id, "该会话有任务运行中或排队中，请等待完成或发送 /停止 后再修改账号、模型、目录或会话。")
@@ -1384,7 +1437,9 @@ class MultiWechatCodexService:
             owner = self.state.conversation_key(account["accountId"], user_id)
             task_id = self.tasks.create(owner, conversation_key, self._get_session(conversation_key), "任务结果",
                                         self._workspace_name_from_key(owner, conversation_key))["id"]
-        with self._conversation_lock(f"{conversation_key}:delivery"):
+        with self._conversation_lock(f"{conversation_key}:delivery"), self.task_guard:
+            if self.tasks.get(task_id)["status"] == "cancelled":
+                raise CodexCancelled("任务已停止")
             claimed = self.tasks.claimed_media_ids(conversation_key)
             outbox = [item for item in read_media_outbox(media_outbox_path(self.state.state_dir, conversation_key))
                       if item["id"] not in claimed]
@@ -1484,12 +1539,10 @@ class MultiWechatCodexService:
 
     def _retry_local_deliveries(self, account, user_id, owner):
         try:
-            records = self.tasks.list(owner, limit=None)
-            failed = next((item for item in records if item.get("deliveryError") and item.get("hasOutput")), None)
+            failed = self.tasks.pending_delivery(owner)
             if failed:
                 self._send_task_output(account, user_id, failed["id"], report_error=False)
-            notice = next((item for item in records if item.get("background") and not item.get("notified")
-                           and item["status"] in {"completed", "failed"}), None)
+            notice = self.tasks.pending_notification(owner)
             if notice:
                 self._notify_background_task(account, user_id, notice)
         except Exception as err:
@@ -1503,9 +1556,12 @@ class MultiWechatCodexService:
             log.warn(f"local notice failed user={user_id}: {err}")
             return False
 
-    def _cancel_runner(self, conversation_key, reset_session=True):
+    def _cancel_runner(self, conversation_key, reset_session=True, expected_task_id=None):
         with self.task_guard:
-            task = self.tasks.get(self.active_task_ids.get(conversation_key))
+            task = self.tasks.get(expected_task_id or self.active_task_ids.get(conversation_key))
+            if expected_task_id and (not task or task.get("conversationKey") != conversation_key
+                                     or task["status"] not in {"queued", "running"}):
+                return False
             if task and task["status"] == "queued":
                 self.tasks.update(task["id"], status="cancelled", finishedAt=time.time())
                 if reset_session:
@@ -3561,7 +3617,8 @@ class MultiWechatCodexService:
             return "\n".join([
                 "常用命令：",
                 "菜单 或 /menu 中文编号菜单；/帮助 等同 /help",
-                "/任务（/tasks）查看任务；/任务 未读 查看未读结果",
+                "/任务（/tasks）查看任务；/任务 未读 查看未读结果；/任务 执行中 查看全部进行中任务及 ID",
+                "/停止 <任务ID> 或 /cancel <任务ID> 取消指定任务，保留会话",
                 "/结果 [任务ID]（/result）查看文字和附件；/重发 [任务ID]（/resend）只补发未成功内容",
                 "/提醒 on|off（/notify）设置后台完成提醒；/停止 等同 /interrupt",
                 "任务自动回执并固定目标；后台完成自动提醒；发送失败保留记录并在下次消息时补发。",
@@ -3588,6 +3645,7 @@ class MultiWechatCodexService:
                 "命令：",
                 "菜单 或 /menu 打开中文菜单，限时回复编号选择；/choose <编号> 或 /选择 <编号> 也可选择；0 退出",
                 "/任务 [unread|未读] 或 /tasks 查看自己的最近任务、排队状态、用时和未读结果",
+                "/任务 执行中 或 /tasks active 查看自己全部工作区的执行中、排队中任务及完整 ID",
                 "/结果 [任务ID|唯一前缀] 或 /result 查看结果及未发送附件，默认最近有结果的任务",
                 "/重发 [任务ID|唯一前缀] 或 /resend 只补发未成功的文字分片和附件，不重新执行任务",
                 "/提醒 [on|off|开启|关闭] 或 /notify 查看、设置后台完成提醒，重启后保留",
@@ -3596,10 +3654,11 @@ class MultiWechatCodexService:
                 "其他别名：/停止 /取消 /重置 /补充 <要求> /模型 /账号 /用量 /目录",
                 "自动回执、菜单、任务查询、后台提醒和结果重发不调用模型；实际任务由所选 Agent 执行。",
                 "未知或参数错误的 /命令会被本地拦截；排队任务不会因切换项目而改投。",
-                "结果与发送状态保存在 stateDir/tasks；下次消息自动补发最近一条发送失败的结果。",
+                "结果与发送状态保存在 stateDir/tasks.sqlite3；下次消息自动补发最近一条发送失败的结果。",
                 "/status 查看当前对话标题、Desktop/CLI 来源、所属账号及工作区状态",
                 "/reset 重置当前工作区当前 Agent 会话",
                 "/cancel 或 /interrupt 中断当前任务，保留当前会话",
+                "/停止 <12位任务ID> 或 /cancel <12位任务ID> 取消自己的指定任务，保留其会话，无需切换工作区",
                 "/interrupt <新任务> 中断当前任务，保留当前会话并改做新任务",
                 "/guide <补充要求> 在任务运行中追加引导；直接发普通消息也会追加",
                 "/usage 查看当前 Agent 用量",

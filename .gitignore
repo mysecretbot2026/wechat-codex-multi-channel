@@ -8,10 +8,30 @@ node_modules/
 *.log
 
 .env
+.env.*
+!.env.example
+!.env.template
 config.json
 *.accounts.lock
 .venv/
 venv/
+
+# Local credentials and task data, including SQLite WAL/SHM sidecars.
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+auth.json
+/.codex/
+/.codex-accounts/
+/.claude/
+/.wechat-codex-multi/
+/state.json
+/tasks/
+/backups/
+/inbound_media/
+/login_qr/
+/updates/
 
 .pytest_cache/
 .mypy_cache/

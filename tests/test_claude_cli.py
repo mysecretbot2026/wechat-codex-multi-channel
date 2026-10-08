@@ -256,13 +256,17 @@ class ClaudeCliRunnerTests(unittest.TestCase):
             process.stdout = []
             process.stderr = []
             process.poll.return_value = None
-            process.wait.side_effect = [0, 0]
 
-            with patch("wechat_codex_multi.claude_cli.subprocess.Popen", return_value=process):
+            with patch("wechat_codex_multi.claude_cli.subprocess.Popen", return_value=process) as popen:
                 runner = ClaudeCliRunner(config, state)
-                runner.cancelled_conversations.add("conversation-1")
-                with self.assertRaises(CodexCancelled):
-                    runner.run("conversation-1", "hello")
+                process.wait.side_effect = lambda timeout: runner.cancel("conversation-1", reset_session=False) and 0
+                with patch.object(runner, "_terminate_process") as terminate:
+                    with self.assertRaises(CodexCancelled):
+                        runner.run("conversation-1", "hello")
+
+            popen.assert_called_once()
+            terminate.assert_called_once_with(process)
+            self.assertEqual(state.reset_calls, [])
 
 
 if __name__ == "__main__":

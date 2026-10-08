@@ -27,15 +27,15 @@ class AccountRegistryTests(unittest.TestCase):
         self.registry = CodexAccountRegistry(self.config)
 
     def test_register_persists_account_and_creates_private_directory_idempotently(self):
-        account, created = self.registry.register("backup3")
+        account, created = self.registry.register("secondary")
         self.assertTrue(created)
         self.assertTrue(Path(account["codexHome"]).is_dir())
         self.assertEqual(Path(account["codexHome"]).stat().st_mode & 0o777, 0o700)
         disk = json.loads(self.file.read_text())
         self.assertEqual(disk["privateSetting"], self.raw["privateSetting"])
         self.assertEqual(disk["adminUsers"], ["admin"])
-        self.assertEqual(self.registry.register("backup3"), (account, False))
-        self.assertEqual([item["name"] for item in load_config(self.file)["codex"]["accounts"]], ["main", "backup3"])
+        self.assertEqual(self.registry.register("secondary"), (account, False))
+        self.assertEqual([item["name"] for item in load_config(self.file)["codex"]["accounts"]], ["main", "secondary"])
         self.assertFalse((Path(account["codexHome"]) / "auth.json").exists())
 
     def test_manual_addition_updates_shared_runner_list_but_other_settings_wait_for_restart(self):
@@ -52,7 +52,7 @@ class AccountRegistryTests(unittest.TestCase):
         original = copy.deepcopy(self.config["codex"]["accounts"])
         self.file.write_text("{")
         with self.assertRaises(ValueError):
-            self.registry.register("backup3")
+            self.registry.register("secondary")
         self.assertEqual(self.config["codex"]["accounts"], original)
         self.raw["codex"]["accounts"][0]["codexHome"] = self.tmp.name + "/other"
         self.file.write_text(json.dumps(self.raw))
@@ -83,7 +83,7 @@ class AccountRegistryTests(unittest.TestCase):
             except Exception as error:
                 errors.append(error)
         workers = [threading.Thread(target=register, args=(registries[i], name))
-                   for i, name in enumerate(("backup3", "backup4"))]
+                   for i, name in enumerate(("secondary", "tertiary"))]
         for worker in workers:
             worker.start()
         for worker in workers:
@@ -91,7 +91,7 @@ class AccountRegistryTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual({item["name"] for item in load_config(self.file)["codex"]["accounts"]},
-                         {"main", "backup3", "backup4"})
+                         {"main", "secondary", "tertiary"})
 
 
 class AccountHandoffTests(unittest.TestCase):
@@ -270,13 +270,13 @@ class AccountHandoffTests(unittest.TestCase):
     def test_login_registers_unknown_account_and_preserves_wechat_login_syntax(self):
         with patch.object(self.service.codex_device_login, "start", return_value=True) as start, \
                 patch("wechat_codex_multi.service.login_with_qr") as qr:
-            self.command("/login backup3 person@example.com")
+            self.command("/login secondary person@example.com")
         start.assert_called_once()
         self.assertEqual(start.call_args.kwargs["expected_email"], "person@example.com")
         qr.assert_not_called()
         disk = json.loads(self.file.read_text())
-        self.assertIn("backup3", [item["name"] for item in disk["codex"]["accounts"]])
-        self.assertTrue((Path(self.tmp.name) / "new-homes" / "backup3").is_dir())
+        self.assertIn("secondary", [item["name"] for item in disk["codex"]["accounts"]])
+        self.assertTrue((Path(self.tmp.name) / "new-homes" / "secondary").is_dir())
         self.assertEqual(normalize_command("/login 微信昵称"), "/login 微信昵称")
         self.assertEqual(normalize_command("/login"), "/login")
         self.assertFalse(self.runs)
@@ -284,11 +284,11 @@ class AccountHandoffTests(unittest.TestCase):
     def test_login_status_cancel_and_nonadmin_never_create_accounts(self):
         before = self.file.read_text()
         with patch.object(self.service.codex_device_login, "start") as start:
-            self.command("/codex-login backup3 person@example.com", user="user-2")
-            self.command("/codex-login status backup3")
-            self.command("/codex-login cancel backup3")
+            self.command("/codex-login secondary person@example.com", user="user-2")
+            self.command("/codex-login status secondary")
+            self.command("/codex-login cancel secondary")
             self.command("/codex-login ../escape person@example.com")
-            self.command("/codex-login backup3 not-an-email")
+            self.command("/codex-login secondary not-an-email")
         self.assertEqual(self.file.read_text(), before)
         start.assert_not_called()
 
@@ -337,7 +337,7 @@ class AccountHandoffTests(unittest.TestCase):
     def test_overspecified_login_alias_does_not_create_a_wechat_bot(self):
         with patch.object(self.service.codex_device_login, "start") as start, \
                 patch("wechat_codex_multi.service.login_with_qr") as qr:
-            self.command("/login backup3 person@example.com unexpected")
+            self.command("/login secondary person@example.com unexpected")
         start.assert_not_called()
         qr.assert_not_called()
         self.assertIn("用法", self.sent[-1])
